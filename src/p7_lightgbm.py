@@ -40,7 +40,7 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 
 from src.p7_constantes import (
     NUM_THREADS,
-    DATA_DIRECTORY,
+    DATA_BASE,
     SUBMISSION_SUFIX,
     INSTALLMENTS_LAST_K_TREND_PERIODS,
     GENERATE_SUBMISSION_FILES,
@@ -1326,6 +1326,49 @@ def chunk_groups(groupby_object, chunk_size):
             group_chunk_, index_chunk_ = group_chunk.copy(), index_chunk.copy()
             group_chunk, index_chunk = [], []
             yield index_chunk_, group_chunk_
+
+
+def get_data(path=DATA_BASE, debug=False, reduce_mem=True):
+    num_rows = 30_000 if debug else None
+    # num_rows = 60_000 if debug else None
+    if debug:
+        print(f"DEBUG num_rows={num_rows}")
+    with timer("application_train and application_test"):
+        df = get_train_test(path, num_rows=num_rows)
+        print("Application dataframe shape: ", df.shape)
+    with timer("Bureau and bureau_balance data"):
+        bureau_df = get_bureau(path, num_rows=num_rows)
+        df = pd.merge(df, bureau_df, on="SK_ID_CURR", how="left")
+        print("Bureau dataframe shape: ", bureau_df.shape)
+        del bureau_df
+        gc.collect()
+    with timer("previous_application"):
+        prev_df = get_previous_applications(path, num_rows)
+        df = pd.merge(df, prev_df, on="SK_ID_CURR", how="left")
+        print("Previous dataframe shape: ", prev_df.shape)
+        del prev_df
+        gc.collect()
+    with timer("previous applications balances"):
+        pos = get_pos_cash(path, num_rows)
+        df = pd.merge(df, pos, on="SK_ID_CURR", how="left")
+        print("Pos-cash dataframe shape: ", pos.shape)
+        del pos
+        gc.collect()
+        ins = get_installment_payments(path, num_rows)
+        df = pd.merge(df, ins, on="SK_ID_CURR", how="left")
+        print("Installments dataframe shape: ", ins.shape)
+        del ins
+        gc.collect()
+        cc = get_credit_card(path, num_rows)
+        df = pd.merge(df, cc, on="SK_ID_CURR", how="left")
+        print("Credit card dataframe shape: ", cc.shape)
+        del cc
+        gc.collect()
+    # Add ratios and groupby between different tables
+    df = add_ratios_features(df)
+    if reduce_mem:
+        df = reduce_memory(df)
+    return df
 
 
 def reduce_memory(df):

@@ -13,7 +13,7 @@ DATA_DIR = "data/"
 # Répertoire pour les données d'origines
 DATA_BASE = "data/base/"
 # Répertoire pour sauvegarder les data travaillées (sauvegardes intermédiaires)
-DATA_PKL_DIR = "data/interim/"
+DATA_INTERIM = "data/interim/"
 # Répertoire pour sauvegarder les données complètement nettoyées
 DATA_CLEAN_DIR = "data/cleaned/"
 
