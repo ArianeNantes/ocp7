@@ -23,7 +23,7 @@ import time
 import numpy as np
 import pandas as pd
 import re
-from contextlib import contextmanager
+
 import multiprocessing as mp
 from functools import partial
 from scipy.stats import kurtosis, iqr, skew
@@ -52,6 +52,7 @@ from src.p7_constantes import (
     LIGHTGBM_PARAMS,
     MODEL_DIR,
 )
+from src.p7_util import timer
 
 # ------------------------- CONFIGURATIONS -------------------------
 
@@ -1126,13 +1127,6 @@ def get_credit_card(path, num_rows=None):
 
 
 # ------------------------- UTILITY FUNCTIONS -------------------------
-
-
-@contextmanager
-def timer(name):
-    t0 = time.time()
-    yield
-    print("{} - done in {:.0f}s".format(name, time.time() - t0))
 
 
 def group(df_to_agg, prefix, aggregations, aggregate_by="SK_ID_CURR"):
