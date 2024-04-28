@@ -19,6 +19,8 @@ DATA_CLEAN_DIR = "data/cleaned/"
 
 PRETRAINED_MODEL_DIR = "pretrained_model/"
 
+URI_LOCAL = "http://127.0.0.1:8080"
+
 # Répertoires contenant les images de train et de test
 IMG_TRAIN = "data/cleaned/img_train/"
 IMG_TEST = "data/cleaned/img_test/"
