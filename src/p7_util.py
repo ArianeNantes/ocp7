@@ -14,7 +14,8 @@ from contextlib import contextmanager
 def timer(name):
     t0 = time.time()
     yield
-    print("{} - done in {:.0f}s".format(name, time.time() - t0))
+    duration = format_time(time.time() - t0)
+    print(f"{name} - duration : {duration} (hh:mm:ss)")
 
 
 # Fonction reprise de https://mccormickml.com/2019/07/22/BERT-fine-tuning/#31-bert-tokenizer
