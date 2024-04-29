@@ -32,24 +32,51 @@ import seaborn as sns
 import warnings
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
+
 from src.p7_constantes import (
     NUM_THREADS,
     DATA_BASE,
+    DATA_INTERIM,
     MODEL_DIR,
-    # SUBMISSION_SUFIX,
-    INSTALLMENTS_LAST_K_TREND_PERIODS,
-    GENERATE_SUBMISSION_FILES,
-    STRATIFIED_KFOLD,
-    RANDOM_SEED,
-    NUM_FOLDS,
-    EARLY_STOPPING,
-    # [TODO] modifier ce ne sont pas des contstantes mais des params
-    LIGHTGBM_PARAMS,
+    # GENERATE_SUBMISSION_FILES,
+    # STRATIFIED_KFOLD,
+    # RANDOM_SEED,
+    # NUM_FOLDS,
+    # EARLY_STOPPING,
 )
 
 from src.p7_util import timer
 
+
 SUBMISSION_SUFIX = "_simple_debug"
+
+CONFIG_SIMPLE = {
+    "data_filepath": os.path.join(DATA_INTERIM, "all_data_simple_kernel_ohe.csv"),
+    "debug": True,
+    "generate_submission_files": True,
+    "submission_filepath": os.path.join(MODEL_DIR, "lightgbm_simple/submission.csv"),
+    "num_threads": NUM_THREADS,
+    "stratified_kfold": True,
+    "num_folds": 10,
+    "early_stopping": 100,
+    "random_seed": 1001,
+}
+
+# LightGBM parameters found by Bayesian optimization for kernel simple_features
+LIGHTGBM_PARAMS_SIMPLE = {
+    "n_estimators": 10000,
+    "learning_rate": 0.02,
+    "num_leaves": 34,
+    "colsample_bytree": 0.9497036,
+    "subsample": 0.8715623,
+    "max_depth": 8,
+    "reg_alpha": 0.041545473,
+    "reg_lambda": 0.0735294,
+    "min_split_gain": 0.0222415,
+    "min_child_weight": 39.3259775,
+    "silent": -1,
+    "verbose": -1,
+}
 
 
 # One-hot encoding for categorical columns with get_dummies
@@ -326,13 +353,17 @@ def credit_card_balance(num_rows=None, nan_as_category=True):
 
 # LightGBM GBDT with KFold or Stratified KFold
 # Parameters from Tilii kernel: https://www.kaggle.com/tilii7/olivier-lightgbm-parameters-by-bayesian-opt/code
-def kfold_lightgbm(df, num_folds, stratified=False, debug=False):
+def kfold_lightgbm_simple(config=CONFIG_SIMPLE):
+    df = pd.read_csv(config["data_filepath"])
     # Ajout pour error : [LightGBM] [Fatal] Do not support special JSON characters in feature name.
     df = df.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
 
     # Divide in training/validation and test data
     train_df = df[df["TARGET"].notnull()]
     test_df = df[df["TARGET"].isnull()]
+    if config["debug"]:
+        train_df = train_df.head(10_000)
+        test_df = test_df.head(1000)
     print(
         "Starting LightGBM. Train shape: {}, test shape: {}".format(
             train_df.shape, test_df.shape
@@ -341,10 +372,18 @@ def kfold_lightgbm(df, num_folds, stratified=False, debug=False):
     del df
     gc.collect()
     # Cross validation model
-    if stratified:
-        folds = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=1001)
+    if config["stratified_kfold"]:
+        folds = StratifiedKFold(
+            n_splits=config["num_folds"],
+            shuffle=True,
+            random_state=config["random_seed"],
+        )
     else:
-        folds = KFold(n_splits=num_folds, shuffle=True, random_state=1001)
+        folds = KFold(
+            n_splits=config["num_folds"],
+            shuffle=True,
+            random_state=config["random_seed"],
+        )
     # Create arrays and dataframes to store results
     oof_preds = np.zeros(train_df.shape[0])
     sub_preds = np.zeros(test_df.shape[0])
@@ -368,21 +407,11 @@ def kfold_lightgbm(df, num_folds, stratified=False, debug=False):
         )
 
         # LightGBM parameters found by Bayesian optimization
-        clf = LGBMClassifier(
-            nthread=4,
-            n_estimators=10000,
-            learning_rate=0.02,
-            num_leaves=34,
-            colsample_bytree=0.9497036,
-            subsample=0.8715623,
-            max_depth=8,
-            reg_alpha=0.041545473,
-            reg_lambda=0.0735294,
-            min_split_gain=0.0222415,
-            min_child_weight=39.3259775,
-            silent=-1,
-            verbose=-1,
-        )
+        params = {
+            "random_state": config["random_seed"],
+            "nthread": config["num_threads"],
+        }
+        clf = LGBMClassifier(**{**params, **LIGHTGBM_PARAMS_SIMPLE})
 
         clf.fit(
             train_x,
@@ -390,7 +419,7 @@ def kfold_lightgbm(df, num_folds, stratified=False, debug=False):
             eval_set=[(train_x, train_y), (valid_x, valid_y)],
             eval_metric="auc",
             # verbose=200,
-            callbacks=[lgb.early_stopping(stopping_rounds=EARLY_STOPPING)],
+            callbacks=[lgb.early_stopping(stopping_rounds=config["early_stopping"])],
         )
 
         oof_preds[valid_idx] = clf.predict_proba(
@@ -417,15 +446,17 @@ def kfold_lightgbm(df, num_folds, stratified=False, debug=False):
 
     print("Full AUC score %.6f" % roc_auc_score(train_df["TARGET"], oof_preds))
     # Write submission file and plot feature importance
-    if not debug:
+    if not config["debug"]:
         test_df["TARGET"] = sub_preds
-        test_df[["SK_ID_CURR", "TARGET"]].to_csv(submission_file_name, index=False)
+        test_df[["SK_ID_CURR", "TARGET"]].to_csv(
+            config["submission_filepath"], index=False
+        )
     display_importances(feature_importance_df)
     return feature_importance_df
 
 
 # Cette fonction provient du kernell full
-def kfold_lightgbm_sklearn(data, categorical_feature=None):
+"""def kfold_lightgbm_sklearn(data, categorical_feature=None):
     # Ajout pour error : [LightGBM] [Fatal] Do not support special JSON characters in feature name.
     data = data.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
 
@@ -463,7 +494,7 @@ def kfold_lightgbm_sklearn(data, categorical_feature=None):
 
         params = {"random_state": RANDOM_SEED, "nthread": NUM_THREADS}
         # [TODO : modifier l'appel à la constante globale LIGHTGBM_PARAM]
-        clf = LGBMClassifier(**{**params, **LIGHTGBM_PARAMS})
+        clf = LGBMClassifier(**{**params, **LIGHTGBM_PARAMS_SIMPLE})
 
         if not categorical_feature:
             clf.fit(
@@ -550,7 +581,7 @@ def kfold_lightgbm_sklearn(data, categorical_feature=None):
             ),
             index=False,
         )
-    return mean_importance
+    return mean_importance"""
 
 
 # Display/plot feature importance
@@ -608,18 +639,21 @@ def get_simple_data(debug=True):
         print("Credit card balance df shape:", cc.shape)
 
         # df = df.join(cc, how="left", on="SK_ID_CURR")
-        df = df.merge(cc, how="left", left_on="SK_ID_CURR", right_on="SK_ID_CURR")
-        """print("DEBUG")
-        # [DEBUG]
-        object_features = list(cc.select_dtypes(include="object").columns)
-        print()
-        print("features object dans cc après merge", object_features)
-        object_features = list(df.select_dtypes(include="object").columns)
-        print()
-        print("features object dans df après merge", object_features)"""
-
+        df = df.merge(cc, how="left", on="SK_ID_CURR")
         del cc
         gc.collect()
+        if "Unnamed: 0" in df.columns:
+            df = df.drop("Unnamed: 0", axis=1)
+    return df
+
+
+"""def lgbm_feature_importance_simple(config=CONFIG_SIMPLE):
+    with timer("Run LightGBM with kfold"):
+        num_rows = 10000 if config["debug"] else None
+        df = pd.read_csv(config["data_filepath"], nrows=num_rows)
+
+        feat_importance = kfold_lightgbm(df, config)
+    return feat_importance"""
 
 
 def main(debug=False):
@@ -656,9 +690,7 @@ def main(debug=False):
         del cc
         gc.collect()
     with timer("Run LightGBM with kfold"):
-        feat_importance = kfold_lightgbm(
-            df, num_folds=10, stratified=False, debug=debug
-        )
+        feat_importance = kfold_lightgbm_simple(df, config=CONFIG_SIMPLE)
         # feat_importance = kfold_lightgbm_sklearn(df)
         print(feat_importance)
 
@@ -667,4 +699,4 @@ if __name__ == "__main__":
     submission_file_name = "submission_kernel_simple.csv"
     with timer("Full model run"):
         main(debug=False)
-        # get_data(debug=True)
+        # get_simple_data(debug=True)
