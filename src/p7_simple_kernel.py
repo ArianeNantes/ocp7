@@ -31,6 +31,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
 
+from src.p7_file import make_dir
+
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 from src.p7_constantes import (
@@ -51,11 +53,15 @@ from src.p7_util import timer
 SUBMISSION_SUFIX = "_simple_debug"
 
 CONFIG_SIMPLE = {
-    "debug": True,
+    "debug": False,
     "nan_as_cat": True,
-    "data_filepath": os.path.join(DATA_INTERIM, "all_data_simple_kernel_ohe.csv"),
+    "data_output_dir": DATA_INTERIM,
+    "data_filename": "all_data_simple_kernel_ohe.csv",
     "generate_submission_files": True,
-    "submission_filepath": os.path.join(MODEL_DIR, "lightgbm_simple/submission.csv"),
+    "model_dir": MODEL_DIR,
+    "model_subdir": "light_simple/",
+    "importance_filename": "feature_importance_in_folds.csv",
+    "submission_filename": "lightgbm_simple_submission.csv",
     "num_threads": NUM_THREADS,
     "stratified_kfold": True,
     "num_folds": 10,
@@ -78,6 +84,20 @@ LIGHTGBM_PARAMS_SIMPLE = {
     "silent": -1,
     "verbose": -1,
 }
+
+
+def make_data_dir(config=CONFIG_SIMPLE):
+    make_dir(config["data_output_dir"])
+    return
+
+
+def make_model_dir(config=CONFIG_SIMPLE):
+    to_make = [
+        config["model_dir"],
+        os.path.join(config["model_dir"], config["model_subdir"]),
+    ]
+    make_dir(to_make)
+    return
 
 
 # One-hot encoding for categorical columns with get_dummies
@@ -116,6 +136,7 @@ def application_train_test(num_rows=None, nan_as_category=True):
     df["DAYS_EMPLOYED"].replace(365243, np.nan, inplace=True)
 
     # Some simple new features (percentages)
+    # [TODO] Renommer ces RATIOS calculés
     df["DAYS_EMPLOYED_PERC"] = df["DAYS_EMPLOYED"] / df["DAYS_BIRTH"]
     df["INCOME_CREDIT_PERC"] = df["AMT_INCOME_TOTAL"] / df["AMT_CREDIT"]
     df["INCOME_PER_PERSON"] = df["AMT_INCOME_TOTAL"] / df["CNT_FAM_MEMBERS"]
@@ -356,8 +377,11 @@ def credit_card_balance(num_rows=None, nan_as_category=True):
 
 # LightGBM GBDT with KFold or Stratified KFold
 # Parameters from Tilii kernel: https://www.kaggle.com/tilii7/olivier-lightgbm-parameters-by-bayesian-opt/code
-def kfold_lightgbm_simple(config=CONFIG_SIMPLE):
-    df = pd.read_csv(config["data_filepath"])
+def kfold_lightgbm_simple(df=None, config=CONFIG_SIMPLE):
+    make_model_dir(config)
+    if df is None:
+        data_filepath = os.path.join(config["data_output_dir"], config["data_filename"])
+        df = pd.read_csv(data_filepath)
     if "Unnamed: 0" in df.columns:
         df = df.drop("Unnamed: 0", axis=1)
     # Ajout pour error : [LightGBM] [Fatal] Do not support special JSON characters in feature name.
@@ -448,14 +472,20 @@ def kfold_lightgbm_simple(config=CONFIG_SIMPLE):
         )
         del clf, train_x, train_y, valid_x, valid_y
         gc.collect()
-
     print("Full AUC score %.6f" % roc_auc_score(train_df["TARGET"], oof_preds))
-    # Write submission file and plot feature importance
-    if not config["debug"]:
+
+    # write importance
+    path_model = os.path.join(config["model_dir"], config["model_subdir"])
+    importance_filepath = os.path.join(path_model, config["importance_filename"])
+    feature_importance_df.to_csv(importance_filepath, index=False)
+    print("Importance saved in", importance_filepath)
+
+    # Write submission file
+    if config["generate_submission_files"]:
+        submission_filepath = os.path.join(path_model, config["submission_filename"])
         test_df["TARGET"] = sub_preds
-        test_df[["SK_ID_CURR", "TARGET"]].to_csv(
-            config["submission_filepath"], index=False
-        )
+        test_df[["SK_ID_CURR", "TARGET"]].to_csv(submission_filepath, index=False)
+        print("Submission saved in", submission_filepath)
     # display_importances(feature_importance_df)
     return feature_importance_df
 
@@ -590,7 +620,7 @@ def kfold_lightgbm_simple(config=CONFIG_SIMPLE):
 
 
 # On a modifié cette fonction car elle trie l'importance sur le meilleur fold et non pas sur l'importance moyenne
-def display_importances_old(feature_importance_df_):
+"""def display_importances_old(feature_importance_df_):
     cols = (
         feature_importance_df_[["feature", "importance"]]
         .groupby("feature")
@@ -610,6 +640,7 @@ def display_importances_old(feature_importance_df_):
     plt.title("LightGBM Features (avg over folds)")
     plt.tight_layout()
     plt.savefig("lgbm_importances01.png")
+"""
 
 
 # Display/plot feature importance
@@ -656,6 +687,7 @@ def display_importances(feature_importance_in_folds, top=40, sort_by_name=False)
 
 
 def get_simple_data(config=CONFIG_SIMPLE):
+    make_data_dir(config["data_output_dir"])
     num_rows = 10000 if config["debug"] else None
     nan_as_category = config["nan_as_cat"]
 
@@ -694,6 +726,17 @@ def get_simple_data(config=CONFIG_SIMPLE):
         gc.collect()
         if "Unnamed: 0" in df.columns:
             df = df.drop("Unnamed: 0", axis=1)
+    # write data
+    data_filepath = os.path.join(config["data_output_dir"], config["data_filename"])
+    df.to_csv(data_filepath, index=False)
+    print("Data saved in", data_filepath)
+    return df
+
+
+def add_ext_source_1_known(df):
+    df["EXT_SOURCE_1_KNOWN"] = df["EXT_SOURCE_1"].apply(
+        lambda x: False if np.isnan(x) else True
+    )
     return df
 
 
