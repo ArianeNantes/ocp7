@@ -51,8 +51,9 @@ from src.p7_util import timer
 SUBMISSION_SUFIX = "_simple_debug"
 
 CONFIG_SIMPLE = {
-    "data_filepath": os.path.join(DATA_INTERIM, "all_data_simple_kernel_ohe.csv"),
     "debug": True,
+    "nan_as_cat": True,
+    "data_filepath": os.path.join(DATA_INTERIM, "all_data_simple_kernel_ohe.csv"),
     "generate_submission_files": True,
     "submission_filepath": os.path.join(MODEL_DIR, "lightgbm_simple/submission.csv"),
     "num_threads": NUM_THREADS,
@@ -89,7 +90,7 @@ def one_hot_encoder(df, nan_as_category=True):
 
 
 # Preprocess application_train.csv and application_test.csv
-def application_train_test(num_rows=None, nan_as_category=False):
+def application_train_test(num_rows=None, nan_as_category=True):
     # Read data and merge
     train = pd.read_csv(
         os.path.join(DATA_BASE, "application_train.csv"), nrows=num_rows
@@ -104,6 +105,8 @@ def application_train_test(num_rows=None, nan_as_category=False):
     df = df[df["CODE_GENDER"] != "XNA"]
 
     # Categorical features with Binary encode (0 or 1; two categories)
+    # FLAG_OW_CAR et FLAG_OWN_REALTY n'ont aucune valeur manquante et nous avons retiré celles de CODE_GENDER,
+    # Nous n'aurons donc pas de valeur négative avec pd.factorize
     for bin_feature in ["CODE_GENDER", "FLAG_OWN_CAR", "FLAG_OWN_REALTY"]:
         df[bin_feature], uniques = pd.factorize(df[bin_feature])
     # Categorical features with One-Hot encode
@@ -355,6 +358,8 @@ def credit_card_balance(num_rows=None, nan_as_category=True):
 # Parameters from Tilii kernel: https://www.kaggle.com/tilii7/olivier-lightgbm-parameters-by-bayesian-opt/code
 def kfold_lightgbm_simple(config=CONFIG_SIMPLE):
     df = pd.read_csv(config["data_filepath"])
+    if "Unnamed: 0" in df.columns:
+        df = df.drop("Unnamed: 0", axis=1)
     # Ajout pour error : [LightGBM] [Fatal] Do not support special JSON characters in feature name.
     df = df.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
 
@@ -451,7 +456,7 @@ def kfold_lightgbm_simple(config=CONFIG_SIMPLE):
         test_df[["SK_ID_CURR", "TARGET"]].to_csv(
             config["submission_filepath"], index=False
         )
-    display_importances(feature_importance_df)
+    # display_importances(feature_importance_df)
     return feature_importance_df
 
 
@@ -584,8 +589,8 @@ def kfold_lightgbm_simple(config=CONFIG_SIMPLE):
     return mean_importance"""
 
 
-# Display/plot feature importance
-def display_importances(feature_importance_df_):
+# On a modifié cette fonction car elle trie l'importance sur le meilleur fold et non pas sur l'importance moyenne
+def display_importances_old(feature_importance_df_):
     cols = (
         feature_importance_df_[["feature", "importance"]]
         .groupby("feature")
@@ -607,35 +612,80 @@ def display_importances(feature_importance_df_):
     plt.savefig("lgbm_importances01.png")
 
 
-def get_simple_data(debug=True):
-    num_rows = 10000 if debug else None
-    df = application_train_test(num_rows)
+# Display/plot feature importance
+def display_importances(feature_importance_in_folds, top=40, sort_by_name=False):
+    mean_importance = (
+        feature_importance_in_folds.drop("fold", axis=1)
+        .groupby("feature")
+        .agg(
+            importance_mean=("importance", "mean"),
+            importance_std=("importance", "std"),
+        )
+        .sort_values(by="importance_mean", ascending=False)
+    )
+
+    best_importance = mean_importance.head(top)
+    if sort_by_name:
+        best_importance = best_importance.sort_values(by="feature")
+
+    fig = plt.figure(figsize=(8, 10))
+    barplot = sns.barplot(
+        x="importance_mean",
+        y="feature",
+        data=best_importance,
+    )
+
+    # Récupérer les coordonnées des barres du barplot
+    x_positions = [bar.get_width() for bar in barplot.patches]
+    y_positions = [bar.get_y() + bar.get_height() / 2 for bar in barplot.patches]
+
+    # Ajouter les barres d'erreur
+    plt.errorbar(
+        x=x_positions,
+        y=y_positions,
+        # data=best_importance,
+        xerr=[best_importance["importance_std"], best_importance["importance_std"]],
+        fmt="none",  # Aucun marqueur pour les points de données
+        # capsize=5,  # Taille des barres à l'extrémité des lignes d'erreur
+        color="black",  # Couleur des barres d'erreur
+    )
+
+    fig.suptitle(f"Top {top} Most important LightGBM Features (avg over folds)\n")
+    plt.tight_layout()
+    plt.savefig("lgbm_importances01.png")
+
+
+def get_simple_data(config=CONFIG_SIMPLE):
+    num_rows = 10000 if config["debug"] else None
+    nan_as_category = config["nan_as_cat"]
+
+    df = application_train_test(num_rows, nan_as_category)
     with timer("Process bureau and bureau_balance"):
-        bureau = bureau_and_balance(num_rows)
+        bureau = bureau_and_balance(num_rows, nan_as_category)
         print("Bureau df shape:", bureau.shape)
         df = df.join(bureau, how="left", on="SK_ID_CURR")
         del bureau
         gc.collect()
     with timer("Process previous_applications"):
-        prev = previous_applications(num_rows)
+        prev = previous_applications(num_rows, nan_as_category)
         print("Previous applications df shape:", prev.shape)
         df = df.join(prev, how="left", on="SK_ID_CURR")
         del prev
         gc.collect()
     with timer("Process POS-CASH balance"):
-        pos = pos_cash(num_rows)
+        pos = pos_cash(num_rows, nan_as_category)
         print("Pos-cash balance df shape:", pos.shape)
         df = df.join(pos, how="left", on="SK_ID_CURR")
         del pos
         gc.collect()
     with timer("Process installments payments"):
-        ins = installments_payments(num_rows)
+        ins = installments_payments(num_rows, nan_as_category)
         print("Installments payments df shape:", ins.shape)
         df = df.join(ins, how="left", on="SK_ID_CURR")
         del ins
         gc.collect()
     with timer("Process credit card balance"):
-        cc = credit_card_balance(num_rows)
+        cc = credit_card_balance(num_rows, nan_as_category)
         print("Credit card balance df shape:", cc.shape)
 
         # df = df.join(cc, how="left", on="SK_ID_CURR")
