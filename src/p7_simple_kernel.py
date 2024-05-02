@@ -502,7 +502,7 @@ def kfold_lightgbm_simple(df=None, config=CONFIG_SIMPLE):
 
 # Display/plot feature importance
 def display_importances(
-    mean_importance, top=40, sort_by_name=False, config=CONFIG_SIMPLE
+    mean_importance, top=40, sort_by_name=False, save_img=True, config=CONFIG_SIMPLE
 ):
     best_importance = mean_importance.head(top)
     if sort_by_name:
@@ -540,11 +540,12 @@ def display_importances(
     fig.suptitle(f"Top {top} Most important LightGBM Features (avg over folds)\n")
     plt.tight_layout()
 
-    path_model = os.path.join(config["model_dir"], config["model_subdir"])
-    figname = os.path.splitext(config["importance_filename"])[0] + ".png"
-    importance_figpath = os.path.join(path_model, figname)
-    print("Importance saved in", importance_figpath)
-    plt.savefig(importance_figpath)
+    if save_img:
+        path_model = os.path.join(config["model_dir"], config["model_subdir"])
+        figname = os.path.splitext(config["importance_filename"])[0] + ".png"
+        importance_figpath = os.path.join(path_model, figname)
+        print("Importance saved in", importance_figpath)
+        plt.savefig(importance_figpath)
 
 
 def get_simple_data(config=CONFIG_SIMPLE):
