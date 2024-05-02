@@ -17,19 +17,11 @@ DATA_INTERIM = "data/interim/"
 # Répertoire pour sauvegarder les données complètement nettoyées
 DATA_CLEAN_DIR = "data/cleaned/"
 
-PRETRAINED_MODEL_DIR = "pretrained_model/"
+MODEL_DIR = "models/"
 
 LOCAL_URI = "http://127.0.0.1:8080"
 LOCAL_HOST = "http://127.0.0.1"
 LOCAL_PORT = "8080"
-
-# Répertoires contenant les images de train et de test
-IMG_TRAIN = "data/cleaned/img_train/"
-IMG_TEST = "data/cleaned/img_test/"
-IMG_VAL = "data/cleaned/img_val/"
-
-MODEL_DIR = "models/"
-
 
 # Style et palette de base SNS pour les plots
 STYLE = "whitegrid"  # Style de base pour graphiques sns
@@ -38,7 +30,6 @@ PALETTE_LOW = "muted"  # Diagrammes en barres etc.
 
 # GENERAL CONFIGURATIONS
 NUM_THREADS = 16
-
 
 # LIGHTGBM CONFIGURATION AND HYPER-PARAMETERS
 GENERATE_SUBMISSION_FILES = True
