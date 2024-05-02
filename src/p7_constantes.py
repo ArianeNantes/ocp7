@@ -35,12 +35,8 @@ PALETTE_HIGH = "cool"  # graphiques avec cmap - différences de couleurs intense
 PALETTE_LOW = "muted"  # Diagrammes en barres etc.
 
 # GENERAL CONFIGURATIONS
-NUM_THREADS = 8
-# DATA_DIRECTORY = "../input/"
-DATA_DIRECTORY = "data/base/"
-SUBMISSION_SUFIX = "_model2_04"
-# INSTALLMENTS TREND PERIODS
-INSTALLMENTS_LAST_K_TREND_PERIODS = [12, 24, 60, 120]
+NUM_THREADS = 16
+
 
 # LIGHTGBM CONFIGURATION AND HYPER-PARAMETERS
 GENERATE_SUBMISSION_FILES = True
@@ -50,21 +46,3 @@ NUM_FOLDS = 10
 # NUM_FOLDS = 5
 EARLY_STOPPING = 100
 # EARLY_STOPPING = 50
-
-# [TODO] Modifier ça , ce ne sont pas des constantes
-LIGHTGBM_PARAMS = {
-    "boosting_type": "goss",
-    "n_estimators": 10000,
-    "learning_rate": 0.005134,
-    "num_leaves": 54,
-    "max_depth": 10,
-    "subsample_for_bin": 240000,
-    "reg_alpha": 0.436193,
-    "reg_lambda": 0.479169,
-    "colsample_bytree": 0.508716,
-    "min_split_gain": 0.024766,
-    "subsample": 1,
-    "is_unbalance": False,
-    "silent": -1,
-    "verbose": -1,
-}

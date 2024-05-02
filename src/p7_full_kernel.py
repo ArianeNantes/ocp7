@@ -40,21 +40,21 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 from src.p7_constantes import (
     NUM_THREADS,
     DATA_BASE,
-    SUBMISSION_SUFIX,
-    INSTALLMENTS_LAST_K_TREND_PERIODS,
     GENERATE_SUBMISSION_FILES,
     STRATIFIED_KFOLD,
     RANDOM_SEED,
     NUM_FOLDS,
     EARLY_STOPPING,
-    # [TODO] modifier ce ne sont pas des contstantes mais des params
-    LIGHTGBM_PARAMS,
     MODEL_DIR,
 )
 from src.p7_util import timer
 
+SUBMISSION_SUFIX = "_full_04"
+
 # ------------------------- CONFIGURATIONS -------------------------
 
+# INSTALLMENTS TREND PERIODS
+INSTALLMENTS_LAST_K_TREND_PERIODS = [12, 24, 60, 120]
 
 # AGGREGATIONS
 BUREAU_AGG = {
@@ -309,6 +309,27 @@ CREDIT_CARD_TIME_AGG = {
     "LIMIT_USE": ["max", "mean"],
 }
 
+LIGHTGBM_PARAMS_FULL = {
+    "boosting_type": "goss",
+    "n_estimators": 10000,
+    "learning_rate": 0.005134,
+    "num_leaves": 54,
+    "max_depth": 10,
+    # Number of samples for constructing bins
+    "subsample_for_bin": 240000,
+    "reg_alpha": 0.436193,
+    "reg_lambda": 0.479169,
+    "colsample_bytree": 0.508716,
+    "min_split_gain": 0.024766,
+    "subsample": 1,
+    # The 'balanced' mode uses the values of y to automatically adjust weights inversely proportional to class frequencies in the input data
+    # as n_samples / (n_classes * np.bincount(y)).
+    # If None, all classes are supposed to have weight one.
+    # Note, that these weights will be multiplied with sample_weight (passed through the fit method) if sample_weight is specified.
+    "is_unbalance": False,
+    "silent": -1,
+    "verbose": -1,
+}
 
 """if __name__ == "__main__":
     pd.set_option("display.max_rows", 60)
@@ -406,8 +427,7 @@ def kfold_lightgbm_sklearn(data, categorical_feature=None):
         valid_x, valid_y = df[predictors].iloc[valid_idx], df["TARGET"].iloc[valid_idx]
 
         params = {"random_state": RANDOM_SEED, "nthread": NUM_THREADS}
-        # [TODO : modifier l'appel à la constante globale LIGHTGBM_PARAM]
-        clf = LGBMClassifier(**{**params, **LIGHTGBM_PARAMS})
+        clf = LGBMClassifier(**{**params, **LIGHTGBM_PARAMS_FULL})
 
         if not categorical_feature:
             clf.fit(
