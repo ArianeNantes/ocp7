@@ -15,7 +15,7 @@ def timer(name):
     t0 = time.time()
     yield
     duration = format_time(time.time() - t0)
-    print(f"{name} - duration : {duration} (hh:mm:ss)")
+    print(f"{name} - duration (hh:mm:ss) : {duration}")
 
 
 # Fonction reprise de https://mccormickml.com/2019/07/22/BERT-fine-tuning/#31-bert-tokenizer
