@@ -32,6 +32,7 @@ import seaborn as sns
 import warnings
 
 from src.p7_file import make_dir
+from src.p7_regex import sel_var
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
@@ -87,7 +88,7 @@ LIGHTGBM_PARAMS_SIMPLE = {
 
 
 def make_data_dir(config=CONFIG_SIMPLE):
-    make_dir(config["data_output_dir"])
+    make_dir(directories_to_make=[config["data_output_dir"]])
     return
 
 
@@ -382,8 +383,8 @@ def kfold_lightgbm_simple(df=None, config=CONFIG_SIMPLE):
     if df is None:
         data_filepath = os.path.join(config["data_output_dir"], config["data_filename"])
         df = pd.read_csv(data_filepath)
-    if "Unnamed: 0" in df.columns:
-        df = df.drop("Unnamed: 0", axis=1)
+    """if "Unnamed: 0" in df.columns:
+        df = df.drop("Unnamed: 0", axis=1)"""
     # Ajout pour error : [LightGBM] [Fatal] Do not support special JSON characters in feature name.
     df = df.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
 
@@ -487,7 +488,7 @@ def kfold_lightgbm_simple(df=None, config=CONFIG_SIMPLE):
     # write importance
     path_model = os.path.join(config["model_dir"], config["model_subdir"])
     importance_filepath = os.path.join(path_model, config["importance_filename"])
-    mean_importance.to_csv(importance_filepath, index=False)
+    mean_importance.to_csv(importance_filepath, index=True)
     print("Importance saved in", importance_filepath)
 
     # Write submission file
@@ -549,7 +550,7 @@ def display_importances(
 
 
 def get_simple_data(config=CONFIG_SIMPLE):
-    make_data_dir(config["data_output_dir"])
+    make_data_dir(config)
     num_rows = 10000 if config["debug"] else None
     nan_as_category = config["nan_as_cat"]
 
@@ -586,8 +587,12 @@ def get_simple_data(config=CONFIG_SIMPLE):
         df = df.merge(cc, how="left", on="SK_ID_CURR")
         del cc
         gc.collect()
-        if "Unnamed: 0" in df.columns:
-            df = df.drop("Unnamed: 0", axis=1)
+
+        to_drop = sel_var(df.columns, "Unnamed")
+        if to_drop:
+            df = df.drop(to_drop, axis=1)
+        df = df.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
+
     # write data
     data_filepath = os.path.join(config["data_output_dir"], config["data_filename"])
     df.to_csv(data_filepath, index=False)
