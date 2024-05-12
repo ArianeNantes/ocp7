@@ -129,10 +129,16 @@ def application(num_rows=None, nan_as_category=True):
     # Categorical features with Binary encode (0 or 1; two categories)
     # FLAG_OW_CAR et FLAG_OWN_REALTY n'ont aucune valeur manquante
     # Nous n'aurons donc pas de valeur négative avec pd.factorize
-    for bin_feature in ["CODE_GENDER", "FLAG_OWN_CAR", "FLAG_OWN_REALTY"]:
+    for bin_feature in [
+        "CODE_GENDER",
+        "FLAG_OWN_CAR",
+        "FLAG_OWN_REALTY",
+        "EMERGENCYSTATE_MODE",
+    ]:
         df[bin_feature], uniques = pd.factorize(df[bin_feature])
-    # CODE_GENDER a 4 NaN
+    # CODE_GENDER et EMERGENCYSTATE_MODE ont des NaN
     df["CODE_GENDER"].replace(-1, np.nan, inplace=True)
+    df["EMERGENCYSTATE_MODE"].replace(-1, np.nan, inplace=True)
 
     # Categorical features with One-Hot encode
     df, cat_cols = one_hot_encoder(df, nan_as_category)
