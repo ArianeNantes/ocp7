@@ -26,7 +26,7 @@ import time
 from contextlib import contextmanager
 from lightgbm import LGBMClassifier
 from sklearn.metrics import roc_auc_score, roc_curve
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
 import warnings
@@ -37,13 +37,14 @@ from src.p7_regex import sel_var
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
 from src.p7_constantes import (
+    DATA_CLEAN_DIR,
     NUM_THREADS,
     DATA_BASE,
     DATA_INTERIM,
     MODEL_DIR,
+    RANDOM_SEED,
     # GENERATE_SUBMISSION_FILES,
     # STRATIFIED_KFOLD,
-    # RANDOM_SEED,
     # NUM_FOLDS,
     # EARLY_STOPPING,
 )
@@ -110,8 +111,8 @@ def one_hot_encoder(df, nan_as_category=True):
     return df, new_columns
 
 
-# Preprocess application_train.csv and application_test.csv
-def application_train_test(num_rows=None, nan_as_category=True):
+# Preprocess application_train.csv
+def application(num_rows=None, nan_as_category=True):
     # Read data, on ne lit pas application_test. Nous recrérons un jeu de test avec target
     df = pd.read_csv(os.path.join(DATA_BASE, "application_train.csv"), nrows=num_rows)
     print("Data samples: {}".format(len(df)))
@@ -550,7 +551,9 @@ def get_simple_data(config=CONFIG_SIMPLE):
     num_rows = 10000 if config["debug"] else None
     nan_as_category = config["nan_as_cat"]
 
-    df = application_train_test(num_rows, nan_as_category)
+    with timer("Process Application"):
+        df = application(num_rows, nan_as_category)
+        print("Application df shape:", df.shape)
     with timer("Process bureau and bureau_balance"):
         bureau = bureau_and_balance(num_rows, nan_as_category)
         print("Bureau df shape:", bureau.shape)
@@ -590,10 +593,37 @@ def get_simple_data(config=CONFIG_SIMPLE):
         df = df.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
 
     # write data
+    print("write data")
     data_filepath = os.path.join(config["data_output_dir"], config["data_filename"])
     df.to_csv(data_filepath, index=False)
     print("Data saved in", data_filepath)
-    return df
+    X = df.drop("TARGET", axis=1)
+    y = df["TARGET"]
+    del df
+    gc.collect()
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=RANDOM_SEED, stratify=y
+    )
+    del X, y
+    gc.collect()
+
+    test = pd.concat([X_test, y_test], axis=1)
+    del X_test, y_test
+    gc.collect()
+    test_path = os.path.join(DATA_CLEAN_DIR, "test.csv")
+    test.to_csv(test_path, index=False)
+    print(f"Test shape : {test.shape}, saved in {test_path}")
+    del test, test_path
+    gc.collect()
+
+    train = pd.concat([X_train, y_train], axis=1)
+    del X_train, y_train
+    gc.collect()
+    train_path = os.path.join(DATA_CLEAN_DIR, "train.csv")
+    train.to_csv(train_path, index=False)
+    print(f"Train shape : {train.shape}, saved in {train_path}")
+    return train
 
 
 def add_ext_source_1_known(df):
@@ -612,7 +642,7 @@ def add_ext_source_1_known(df):
     return feat_importance"""
 
 
-def main(debug=False):
+"""def main(debug=False):
     num_rows = 10000 if debug else None
     df = application_train_test(num_rows)
     with timer("Process bureau and bureau_balance"):
@@ -655,4 +685,4 @@ if __name__ == "__main__":
     submission_file_name = "submission_kernel_simple.csv"
     with timer("Full model run"):
         main(debug=False)
-        # get_simple_data(debug=True)
+        # get_simple_data(debug=True)"""
