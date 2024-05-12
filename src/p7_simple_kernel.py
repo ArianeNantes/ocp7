@@ -603,8 +603,8 @@ def get_simple_data(config=CONFIG_SIMPLE):
     # write data
     print("write data")
     data_filepath = os.path.join(config["data_output_dir"], config["data_filename"])
-    df.to_csv(data_filepath, index=False)
-    print("Data saved in", data_filepath)
+    # df.to_csv(data_filepath, index=False)
+    # print("Data saved in", data_filepath)
     X = df.drop("TARGET", axis=1)
     y = df["TARGET"]
     del df
@@ -619,19 +619,17 @@ def get_simple_data(config=CONFIG_SIMPLE):
     test = pd.concat([X_test, y_test], axis=1)
     del X_test, y_test
     gc.collect()
-    test_path = os.path.join(DATA_CLEAN_DIR, "test.csv")
+    test_path = os.path.join(config["data_output_dir"], "test.csv")
     test.to_csv(test_path, index=False)
     print(f"Test shape : {test.shape}, saved in {test_path}")
-    del test, test_path
-    gc.collect()
 
     train = pd.concat([X_train, y_train], axis=1)
     del X_train, y_train
     gc.collect()
-    train_path = os.path.join(DATA_CLEAN_DIR, "train.csv")
+    train_path = os.path.join(config["data_output_dir"], "train.csv")
     train.to_csv(train_path, index=False)
     print(f"Train shape : {train.shape}, saved in {train_path}")
-    return train
+    return train, test
 
 
 def add_ext_source_1_known(df):
