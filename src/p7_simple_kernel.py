@@ -112,17 +112,12 @@ def one_hot_encoder(df, nan_as_category=True):
 
 # Preprocess application_train.csv and application_test.csv
 def application_train_test(num_rows=None, nan_as_category=True):
-    # Read data and merge
-    train = pd.read_csv(
-        os.path.join(DATA_BASE, "application_train.csv"), nrows=num_rows
-    )
-    test = pd.read_csv(os.path.join(DATA_BASE, "application_test.csv"), nrows=num_rows)
-    print("Train samples: {}, test samples: {}".format(len(train), len(test)))
-    df = pd.concat([train, test], ignore_index=True)
-    del train, test
-    gc.collect()
+    # Read data, on ne lit pas application_test. Nous recrérons un jeu de test avec target
+    df = pd.read_csv(os.path.join(DATA_BASE, "application_train.csv"), nrows=num_rows)
+    print("Data samples: {}".format(len(df)))
 
     # Optional: Remove 4 applications with XNA CODE_GENDER (train set)
+    # Les valeurs manquantes sont toutes des Non defaut
     df = df[df["CODE_GENDER"] != "XNA"]
 
     # Categorical features with Binary encode (0 or 1; two categories)
@@ -133,8 +128,10 @@ def application_train_test(num_rows=None, nan_as_category=True):
     # Categorical features with One-Hot encode
     df, cat_cols = one_hot_encoder(df, nan_as_category)
 
-    # NaN values for DAYS_EMPLOYED: 365.243 -> nan
+    # NaN values for DAYS_EMPLOYED: 365_243 -> nan (équivaut à 1_000 ans)
     df["DAYS_EMPLOYED"].replace(365243, np.nan, inplace=True)
+    # NaN values for DAYS_LAST_PHONE_CHANGE: 0 -> nan
+    df["DAYS_LAST_PHONE_CHANGE"].replace(0, np.nan, inplace=True)
 
     # Some simple new features (percentages)
     # [TODO] Renommer ces RATIOS calculés
@@ -143,7 +140,6 @@ def application_train_test(num_rows=None, nan_as_category=True):
     df["INCOME_PER_PERSON"] = df["AMT_INCOME_TOTAL"] / df["CNT_FAM_MEMBERS"]
     df["ANNUITY_INCOME_PERC"] = df["AMT_ANNUITY"] / df["AMT_INCOME_TOTAL"]
     df["PAYMENT_RATE"] = df["AMT_ANNUITY"] / df["AMT_CREDIT"]
-    gc.collect()
     return df
 
 
