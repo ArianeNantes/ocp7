@@ -3,6 +3,7 @@ import logging
 import re
 import os
 import gc
+import time
 import joblib
 import lightgbm as lgb
 import optuna
@@ -13,9 +14,21 @@ import mlflow
 import pandas as pd
 from sklearn.model_selection import cross_val_score, cross_validate
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import confusion_matrix, make_scorer, f1_score, recall_score
+from sklearn.metrics import (
+    roc_auc_score,
+    confusion_matrix,
+    roc_curve,
+    classification_report,
+    precision_recall_curve,
+    f1_score,
+    accuracy_score,
+    balanced_accuracy_score,
+    recall_score,
+    precision_score,
+)
 
 from src.p7_constantes import DATA_INTERIM, DATA_BASE, MODEL_DIR
+from src.p7_constantes import NUM_THREADS
 from src.p7_constantes import LOCAL_HOST, LOCAL_PORT
 from src.p7_util import timer, clean_ram
 from src.p7_file import make_dir
@@ -35,26 +48,22 @@ CONFIG_SEARCH = {
     "model_type": "lightgbm",
     "subdir": "light_simple/",
     "data_dir": DATA_INTERIM,
-    "train_filename": "all_data_simple_kernel_ohe.csv",
+    "train_filename": "train.csv",
     "feature_importance_filename": "feature_importance.csv",
     "n_predictors": 20,
     "moo_objective": False,
     "metric": "weighted_recall",
-    "n_trials": 20,
+    "n_trials": 40,
 }
 
 
 def get_train(config=CONFIG_SEARCH):
     # On charge le train avec toutes les features
-    df = pd.read_csv(os.path.join(DATA_INTERIM, config["train_filename"]))
-    to_drop = sel_var(df.columns, "Unnamed")
+    train = pd.read_csv(os.path.join(DATA_INTERIM, config["train_filename"]))
+    to_drop = sel_var(train.columns, "Unnamed")
     if to_drop:
-        df = df.drop(to_drop, axis=1)
-    df = df.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
-    train = df[df["TARGET"].notnull()]
-    del df
-    del to_drop
-    gc.collect()
+        train = train.drop(to_drop, axis=1)
+    train = train.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
 
     print("Forme de train.csv :", train.shape)
     return train
@@ -76,7 +85,7 @@ def get_sorted_features_by_importance(config=CONFIG_SEARCH):
 
 
 def build_experiment(
-    n_rows,
+    X,
     experiment_name=None,
     experiment_description=None,
     experiment_tags=None,
@@ -85,14 +94,9 @@ def build_experiment(
     if not experiment_name:
         # Si le nom de l'expérience n'est pas fourni en param, on le crée
         data_filepath = os.path.join(config["data_dir"], config["train_filename"])
-        importance_filepath = os.path.join(
-            MODEL_DIR, config["subdir"], config["feature_importance_filename"]
-        )
-        predictors = pd.read_csv(importance_filepath).index.tolist()[
-            : config["n_predictors"]
-        ]
+        n_rows, n_cols = X.shape
 
-        experiment_name = f"{config['subdir'][:-1]}_{len(predictors)}x{n_rows}_{config['n_trials']}trials"
+        experiment_name = f"{config['subdir'][:-1]}_{n_cols}x{n_rows}_{config['metric']}_{config['n_trials']}trials"
         print("experiment_name", experiment_name)
 
     if not experiment_description:
@@ -105,6 +109,7 @@ def build_experiment(
         experiment_tags = {
             "model": "lightgbm",
             "task": "hyperparam",
+            "metric": config["metric"],
             "mlflow.note.content": experiment_description,
         }
 
@@ -128,16 +133,45 @@ def build_experiment(
 
 
 def build_parent_run_name(config=CONFIG_SEARCH):
-    run_name = f"{config['model_type']}_single_{config['metric']}_{config['n_predictors']}_best"
-    run_description = f"Single objective - métrique {config['metric']} - all data kernel simple - {config['n_predictors']}"
+    run_name = f"{config['model_type']}_single_{config['metric']}_best"
+    run_description = (
+        f"Single objective - métrique {config['metric']} - all data kernel simple"
+    )
     return run_name, run_description
 
 
-def lgbm_single_objective(data, optimize_boosting_type=True, config=CONFIG_SEARCH):
+"""def lgb_single_objective(trial):
+    with mlflow.start_run(nested=True):
+        # On définit les hyperparamètres
+        params = {
+            "boosting_type": trial.suggest_categorical(
+                "boosting_type", ["dart", "gbdt"]
+            ),
+            "lambda_l1": trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),
+            "lambda_l2": trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 2, 256),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.4, 1.0),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.4, 1.0),
+            "bagging_freq": trial.suggest_int("bagging_freq", 1, 7),
+            "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
+            "learning_rate": trial.suggest_float(
+                "learning_rate", 0.0001, 0.5, log=True
+            ),
+            "max_bin": trial.suggest_int("max_bin", 128, 512, step=32),
+            "n_estimators": trial.suggest_int("n_estimators", 40, 400, step=20),
+            
+        }
+
+        other_params = {}
+
+    return"""
+
+
+def sk_single_objective(X, y, optimize_boosting_type=True, config=CONFIG_SEARCH):
     # Nécessite l'installation optuna-integration
     def _objective(trial):
         parent_run_name, parent_run_description = build_parent_run_name(config=config)
-        child_run_name = f"T_{trial._trial_id}"
+        child_run_name = f"N_{trial.number}"
         with mlflow.start_run(run_name=child_run_name, nested=True):
             if optimize_boosting_type:
                 boosting_type = trial.suggest_categorical(
@@ -159,7 +193,7 @@ def lgbm_single_objective(data, optimize_boosting_type=True, config=CONFIG_SEARC
             n_estimators = trial.suggest_int("n_estimators", 40, 400, step=20)
 
             hyperparams = {
-                "optimize_boosting_type": optimize_boosting_type,
+                "boosting_type": boosting_type,
                 "lambda_l1": lambda_l1,
                 "lambda_l2": lambda_l2,
                 "num_leaves": num_leaves,
@@ -183,17 +217,25 @@ def lgbm_single_objective(data, optimize_boosting_type=True, config=CONFIG_SEARC
             # On n'utilise pas cross_val_score pour des problèmes de RAM
             # scores = cross_val_score(model, X, y, scoring="f1_macro", cv=5)
             folds = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            auc_scores = []
+            accuracy_scores = []
+            balanced_accuracy_scores = []
             f1_scores = []
+            recall_scores = []
             weighted_recall_scores = []
+            precision_scores = []
+            balanced_precision_scores = []
+            fit_durations = []
 
-            for n_fold, (train_idx, valid_idx) in enumerate(
-                folds.split(data, data["TARGET"])
-            ):
-                train_x, train_y = data.iloc[train_idx], data["TARGET"].iloc[train_idx]
-                valid_x, valid_y = data.iloc[valid_idx], data["TARGET"].iloc[valid_idx]
+            for n_fold, (train_idx, valid_idx) in enumerate(folds.split(X, y)):
+                X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+                X_val, y_val = X.iloc[valid_idx], y.iloc[valid_idx]
 
                 model = lgb.LGBMClassifier(
-                    force_row_wise=True,
+                    # force_row_wise=True,
+                    force_col_wise=True,
+                    objective="binary",
+                    is_unbalanced=False,
                     boosting_type=boosting_type,
                     n_estimators=n_estimators,
                     lambda_l1=lambda_l1,
@@ -208,36 +250,60 @@ def lgbm_single_objective(data, optimize_boosting_type=True, config=CONFIG_SEARC
                     callbacks=[pruning_callback],
                     verbose=-1,
                 )
-
+                t0_fit = time.time()
                 model.fit(
-                    train_x,
-                    train_y,
-                    eval_set=[(train_x, train_y), (valid_x, valid_y)],
-                    eval_metric="f1_macro",
+                    X_train,
+                    y_train,
+                    # eval_set=[(X_train, y_train), (X_val, y_val)],
+                    eval_set=(X_val, y_val),
+                    eval_metric=config["metric"],
                 )
+                fit_durations.append(time.time() - t0_fit)
 
-                pred_y = model.predict(valid_x)
-                f1_scores.append(f1_score(valid_y, pred_y))
+                pred_y = model.predict_proba(X_val)[:, 1]
+                auc_scores.append(roc_auc_score(y_val, y_score=pred_y))
+
+                pred_y = model.predict(X_val)
+                f1_scores.append(f1_score(y_val, pred_y))
+                recall_scores.append(recall_score(y_val, pred_y))
                 weighted_recall_scores.append(
-                    recall_score(valid_y, pred_y, average="weighted")
+                    recall_score(y_val, pred_y, average="weighted")
                 )
-            mean_f1_scores = np.mean(f1_scores)
-            mean_weighted_recall_scores = np.mean(weighted_recall_scores)
+                accuracy_scores.append(accuracy_score(y_val, pred_y))
+                balanced_accuracy_scores.append(balanced_accuracy_score(y_val, pred_y))
+                precision_scores.append(precision_score(y_val, pred_y, zero_division=0))
+                balanced_precision_scores.append(balanced_accuracy_score(y_val, pred_y))
+                del X_train
+                del y_train
+                del X_val
+                del y_val
+                del model
+                gc.collect()
 
-            """dic_metrics = {
-                "f1_score": mean_f1_scores,
-                "weighted_recall_score": mean_weighted_recall_scores,
+            # Fin d'un trial
+            del folds
+            gc.collect()
+            dic_metrics = {
+                "auc": np.mean(auc_scores),
+                "f1": np.mean(f1_scores),
+                "weighted_recall": np.mean(weighted_recall_scores),
+                "recall": np.mean(recall_scores),
+                "accuracy": np.mean(accuracy_scores),
+                "balanced_accuracy": np.mean(balanced_accuracy_scores),
+                "precision": np.mean(precision_scores),
+                "balanced_precision": np.mean(balanced_precision_scores),
+                "fit_duration": np.mean(fit_durations),
             }
-            """
-            mlflow.log_metric("f1_score", mean_f1_scores)
-            mlflow.log_metric("weighted_recall", mean_weighted_recall_scores)
+            for k, v in dic_metrics.items():
+                mlflow.log_metric(k, v)
             mlflow.log_params(hyperparams)
-        return mean_weighted_recall_scores
+
+        return dic_metrics[config["metric"]]
 
     return _objective
 
 
-def lgbm_single_search(data, experiment_name=None, config=CONFIG_SEARCH):
+def sk_single_search(X, y, experiment_name=None, config=CONFIG_SEARCH):
     # Use the fluent API to set the tracking uri and the active experiment
     mlflow.set_tracking_uri(f"{LOCAL_HOST}:{LOCAL_PORT}")
 
@@ -253,13 +319,12 @@ def lgbm_single_search(data, experiment_name=None, config=CONFIG_SEARCH):
         # Voir : https://github.com/optuna/optuna/wiki/Benchmarks-with-Kurobako
         # reduction_factor contrôle combien de trials sont proposés dans chaque Halving Round
         pruner = optuna.pruners.HyperbandPruner(
-            min_resource=10, max_resource=400, reduction_factor=3
+            min_resource=10, max_resource=300, reduction_factor=3
         )
 
         # On active l'expérience
-        n_rows = data.shape[0]
         experiment_id = build_experiment(
-            n_rows=n_rows, experiment_name=experiment_name, config=config
+            X=X, experiment_name=experiment_name, config=config
         )
         experiment_metadata = mlflow.set_experiment(experiment_id=experiment_id)
         print(f"Experience '{experiment_metadata.name}' activée")
@@ -283,12 +348,12 @@ def lgbm_single_search(data, experiment_name=None, config=CONFIG_SEARCH):
 
             # gc appelle le garbage collector après chaque trial
             study.optimize(
-                lgbm_single_objective(
-                    data=data, optimize_boosting_type=True, config=config
+                sk_single_objective(
+                    X=X, y=y, optimize_boosting_type=True, config=config
                 ),
                 n_trials=config["n_trials"],
                 gc_after_trial=True,
-                n_jobs=-1,
+                n_jobs=NUM_THREADS,
             )
 
             best_params = study.best_trial.params
@@ -335,7 +400,7 @@ def weight_f1(y_true, y_pred, weight_fn=10):
 
 
 # Créer une métrique personnalisée à partir de la fonction de perte
-custom_f1 = make_scorer(weight_f1, greater_is_better=True)
+# custom_f1 = make_scorer(weight_f1, greater_is_better=True)
 
 """
 La fonction _objectif est appelée une fois pour chaque essai (trial).
