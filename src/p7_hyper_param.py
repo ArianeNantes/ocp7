@@ -7,6 +7,7 @@ import time
 import joblib
 import lightgbm as lgb
 import optuna
+from optuna.storages import JournalStorage, JournalFileStorage
 import plotly
 import kaleido
 import mlflow
@@ -35,12 +36,17 @@ from src.p7_file import make_dir
 from src.p7_regex import sel_var
 from src.p7_constantes import MODEL_DIR, DATA_INTERIM
 from src.p7_constantes import LOCAL_HOST, LOCAL_PORT
+from src.p7_simple_kernel import (
+    get_batch_size,
+    get_memory_consumed,
+    get_available_memory,
+)
 
-print("mlflow", mlflow.__version__)
+"""print("mlflow", mlflow.__version__)
 print("optuna", optuna.__version__)
 print("numpy", np.__version__)
 print("plotly", plotly.__version__)
-print("kaleido", kaleido.__version__)
+print("kaleido", kaleido.__version__)"""
 
 
 CONFIG_SEARCH = {
@@ -84,7 +90,55 @@ def get_sorted_features_by_importance(config=CONFIG_SEARCH):
     return sorted_features_by_importance
 
 
+# Coinstruit le nom de l'expérience ou l'active en fonction d'un numéro, pas en fonction de la forme des data
 def build_experiment(
+    num,
+    experiment_name=None,
+    experiment_description=None,
+    experiment_tags=None,
+    config=CONFIG_SEARCH,
+):
+    if not experiment_name:
+        # Si le nom de l'expérience n'est pas fourni en param, on le crée
+        data_filepath = os.path.join(config["data_dir"], config["train_filename"])
+
+        experiment_name = f"{config['subdir'][:-1]}_{config['metric']}_{config['n_trials']}trials_{num}"
+        print("experiment_name", experiment_name)
+
+    if not experiment_description:
+        experiment_description = (
+            f"Recherche d'hyperparamètres pour le modèle {config['subdir'][:-1]}, impact du nombre de features\n"
+            "Recherche Bayesienne - mono objectif - Hyperband"
+        )
+
+    if not experiment_tags:
+        experiment_tags = {
+            "model": "lightgbm",
+            "task": "hyperparam",
+            "metric": config["metric"],
+            "mlflow.note.content": experiment_description,
+        }
+
+    # On vérifie si l'expérience existe déjà
+    existing_experiment = mlflow.get_experiment_by_name(experiment_name)
+
+    if existing_experiment:
+        print(f"WARNING : L'expérience '{experiment_name}' existe déjà")
+        experiment_id = existing_experiment.experiment_id
+
+    else:
+        print(f"Création de l'expérience '{experiment_name}'")
+        experiment_id = mlflow.create_experiment(
+            experiment_name,
+            # artifact_location=os.path.join(MODEL_DIR, subdir).as_uri(),
+            artifact_location=os.path.join(MODEL_DIR, config["subdir"]),
+            tags=experiment_tags,
+        )
+
+    return experiment_id
+
+
+def build_experiment_old(
     X,
     experiment_name=None,
     experiment_description=None,
@@ -227,7 +281,7 @@ def sk_single_objective(X, y, optimize_boosting_type=True, config=CONFIG_SEARCH)
             balanced_precision_scores = []
             fit_durations = []
 
-            for n_fold, (train_idx, valid_idx) in enumerate(folds.split(X, y)):
+            for i_fold, (train_idx, valid_idx) in enumerate(folds.split(X, y)):
                 X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
                 X_val, y_val = X.iloc[valid_idx], y.iloc[valid_idx]
 
@@ -303,9 +357,17 @@ def sk_single_objective(X, y, optimize_boosting_type=True, config=CONFIG_SEARCH)
     return _objective
 
 
-def sk_single_search(X, y, experiment_name=None, config=CONFIG_SEARCH):
+def sk_single_search(X, y, num, experiment_name=None, config=CONFIG_SEARCH):
     # Use the fluent API to set the tracking uri and the active experiment
     mlflow.set_tracking_uri(f"{LOCAL_HOST}:{LOCAL_PORT}")
+    # Pour la journalisation sous windows, cela pose un problème de privilège :
+    # Voir : https://optuna.readthedocs.io/en/stable/reference/generated/optuna.storages.JournalStorage.html
+    file_path = "./journal_optuna.log"
+    lock_obj = optuna.storages.JournalFileOpenLock(file_path)
+
+    storage = optuna.storages.JournalStorage(
+        optuna.storages.JournalFileStorage(file_path, lock_obj=lock_obj),
+    )
 
     with timer("Optimize hyperparameters"):
         # Utilise l'algorithme d'optimisation TPE (Tree-structured Parzen Estimator) comme méthode d'échantillonnage
@@ -324,7 +386,7 @@ def sk_single_search(X, y, experiment_name=None, config=CONFIG_SEARCH):
 
         # On active l'expérience
         experiment_id = build_experiment(
-            X=X, experiment_name=experiment_name, config=config
+            num, experiment_name=experiment_name, config=config
         )
         experiment_metadata = mlflow.set_experiment(experiment_id=experiment_id)
         print(f"Experience '{experiment_metadata.name}' activée")
@@ -343,7 +405,7 @@ def sk_single_search(X, y, experiment_name=None, config=CONFIG_SEARCH):
                 sampler=sampler,
                 pruner=pruner,
                 study_name=f"study_{experiment_metadata.name}",
-                # storage=os.path.join(MODEL_DIR, subdir)
+                storage=storage,
             )
 
             # gc appelle le garbage collector après chaque trial
