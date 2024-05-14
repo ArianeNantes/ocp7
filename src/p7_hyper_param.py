@@ -7,7 +7,7 @@ import time
 import joblib
 import lightgbm as lgb
 import optuna
-from optuna.storages import JournalStorage, JournalFileStorage
+from optuna.storages import JournalStorage, JournalFileStorage, RDBStorage
 import plotly
 import kaleido
 import mlflow
@@ -357,10 +357,12 @@ def sk_single_objective(X, y, optimize_boosting_type=True, config=CONFIG_SEARCH)
     return _objective
 
 
-def sk_single_search(X, y, num, experiment_name=None, config=CONFIG_SEARCH):
+def sk_single_search(
+    X, y, num, experiment_name=None, by_10_trials=False, config=CONFIG_SEARCH
+):
     # Use the fluent API to set the tracking uri and the active experiment
     mlflow.set_tracking_uri(f"{LOCAL_HOST}:{LOCAL_PORT}")
-    # Pour la journalisation sous windows, cela pose un problème de privilège :
+    """# Pour la journalisation sous windows, cela pose un problème de privilège :
     # Voir : https://optuna.readthedocs.io/en/stable/reference/generated/optuna.storages.JournalStorage.html
     file_path = "./journal_optuna.log"
     lock_obj = optuna.storages.JournalFileOpenLock(file_path)
@@ -368,7 +370,7 @@ def sk_single_search(X, y, num, experiment_name=None, config=CONFIG_SEARCH):
     storage = optuna.storages.JournalStorage(
         optuna.storages.JournalFileStorage(file_path, lock_obj=lock_obj),
     )
-
+    """
     with timer("Optimize hyperparameters"):
         # Utilise l'algorithme d'optimisation TPE (Tree-structured Parzen Estimator) comme méthode d'échantillonnage
         # Il s'agit de l'algo qui génère les valeurs des hyperparams lors de chaque essai d'optimisation
@@ -400,23 +402,32 @@ def sk_single_search(X, y, num, experiment_name=None, config=CONFIG_SEARCH):
             # description du run
             mlflow.set_tag("mlflow.note.content", parent_run_description)
 
+            study_name = f"study_{experiment_metadata.name}"
             study = optuna.create_study(
                 direction="maximize",
                 sampler=sampler,
                 pruner=pruner,
-                study_name=f"study_{experiment_metadata.name}",
-                storage=storage,
+                study_name=study_name,
+                # storage=storage,
             )
 
-            # gc appelle le garbage collector après chaque trial
-            study.optimize(
-                sk_single_objective(
-                    X=X, y=y, optimize_boosting_type=True, config=config
-                ),
-                n_trials=config["n_trials"],
-                gc_after_trial=True,
-                n_jobs=NUM_THREADS,
-            )
+            # S'il est demandé de réaliser l'étude par paquets de 10 trials (nécessaire si le dataset est trop gros),
+            # On optimise plusieurs études de 10 trials
+            n_trials = config["n_trials"]
+            n_studies = 1
+            if by_10_trials:
+                n_studies = n_trials // 10
+                n_trials = 10
+
+            for i in range(n_studies):
+                study.optimize(
+                    sk_single_objective(
+                        X=X, y=y, optimize_boosting_type=True, config=config
+                    ),
+                    n_trials=n_trials,
+                    gc_after_trial=True,  # On appelle le garbage collector après chaque trial
+                    n_jobs=NUM_THREADS,
+                )
 
             best_params = study.best_trial.params
             best_score = study.best_trial.value
