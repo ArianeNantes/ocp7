@@ -1,13 +1,16 @@
 import numpy as np
 import logging
 import re
+import requests
 import os
 import gc
 import time
 import joblib
 from joblib import Parallel, delayed
-import multiprocessing as mp
-import threading
+import subprocess
+import psycopg2
+from psycopg2 import OperationalError
+
 import inspect
 import lightgbm as lgb
 import optuna
@@ -97,6 +100,7 @@ class ExperimentSearch:
         self.num = num
         self.continue_if_exist = False
         self.optimize_boosting_type = True
+        self.uri_mlflow = f"{LOCAL_HOST}:{PORT_MLFLOW}"
         # Attributs à construire obligatoirement avec initialisation
 
         self.name = ""
@@ -111,6 +115,50 @@ class ExperimentSearch:
         self.initialized = False
         self.parent_run_id = None
 
+    def check_postgresql_server(
+        self,
+        host="localhost",
+        port=PORT_POSTGRE,
+        dbname="optuna_db",
+        user=USER_POSTGRE,
+        password=PASSWORD_POSTGRE,
+    ):
+        try:
+            connection = psycopg2.connect(
+                host=host, port=port, dbname=dbname, user=user, password=password
+            )
+            connection.close()
+            print("La connexion Postgresql est OK")
+        except OperationalError as e:
+            self.initialized = False
+            print(
+                "La connexion PostgreSQL a échoué. Vérifier que le service est démarré"
+            )
+            print(
+                "Pour démarrer le service, vous pouvez utiliser la méthode experiment.start_postresql_server()"
+            )
+            print("Error:", e)
+
+    def check_mlflow_server(self):
+        # Use the fluent API to set the tracking uri and the active experiment
+        mlflow.set_tracking_uri(self.uri_mlflow)
+        try:
+            response = requests.get(self.uri_mlflow)
+            if response.status_code == 200:
+                print("Le serveur MLFlow est Ok")
+            else:
+                print(
+                    "La connexion MLFlow a échoué. Status code:",
+                    response.status_code,
+                )
+        except requests.exceptions.RequestException as e:
+            self.initialized = False
+            print("La connexion MLFlow a échoué. Vérifiez que le serveur est démarré.")
+            print(
+                "Pour le démarrer, vous pouver utiliser experiment.start_mlflow_server()"
+            )
+            print("Error:", e)
+
     def check_services(self):
         """print(
             "# [TODO] Vérifier que les services sont démarrés (serveur mlflow et postgresql)"
@@ -118,8 +166,6 @@ class ExperimentSearch:
             #mlflow server --host 127.0.0.1 --port 8080
 
         )"""
-        # Démarrer un serveur mlflow local en ligne de commande :
-        # mlflow server --host 127.0.0.1 --port 8080
 
         # Use the fluent API to set the tracking uri and the active experiment
         mlflow.set_tracking_uri(f"{LOCAL_HOST}:{PORT_MLFLOW}")
