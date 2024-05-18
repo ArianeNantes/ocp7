@@ -5,15 +5,21 @@ import os
 import gc
 import time
 import joblib
+from joblib import Parallel, delayed
+import multiprocessing as mp
+import threading
+import inspect
 import lightgbm as lgb
 import optuna
 from optuna.storages import JournalStorage, JournalFileStorage, RDBStorage
 import plotly
 import kaleido
 import mlflow
+import mlflow.pyfunc
+from mlflow.tracking import MlflowClient
 
 import pandas as pd
-from sklearn.model_selection import cross_val_score, cross_validate
+from sklearn.model_selection import cross_val_score, cross_validate, train_test_split
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import (
     roc_auc_score,
@@ -28,214 +34,384 @@ from sklearn.metrics import (
     precision_score,
 )
 
-from src.p7_constantes import DATA_INTERIM, DATA_BASE, MODEL_DIR
 from src.p7_constantes import NUM_THREADS
-from src.p7_constantes import LOCAL_HOST, LOCAL_PORT
-from src.p7_util import timer, clean_ram
+from src.p7_util import timer, clean_ram, format_time
 from src.p7_file import make_dir
 from src.p7_regex import sel_var
-from src.p7_constantes import MODEL_DIR, DATA_INTERIM
-from src.p7_constantes import LOCAL_HOST, LOCAL_PORT
+from src.p7_constantes import MODEL_DIR, DATA_INTERIM, MAX_SIZE_PARA
+from src.p7_constantes import (
+    LOCAL_HOST,
+    PORT_MLFLOW,
+    PORT_POSTGRE,
+    PASSWORD_POSTGRE,
+    USER_POSTGRE,
+)
 from src.p7_simple_kernel import (
     get_batch_size,
     get_memory_consumed,
     get_available_memory,
 )
 
-"""print("mlflow", mlflow.__version__)
-print("optuna", optuna.__version__)
-print("numpy", np.__version__)
-print("plotly", plotly.__version__)
-print("kaleido", kaleido.__version__)"""
 
+class ExperimentSearch:
+    def __init__(
+        self,
+        input_dir=DATA_INTERIM,
+        train_filename="train.csv",
+        predictors_name="features_sorted_by_importance.pkl",
+        frac_sample=0.5,
+        n_predictors=None,
+        output_dir=MODEL_DIR,
+        task="search",
+        model_name="lgbm",
+        sampling="None",
+        objective_name="binary",
+        metric="auc",
+        dic_metrics={"auc"},
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.HyperbandPruner(
+            min_resource=10, max_resource=400, reduction_factor=3
+        ),
+        storage=RDBStorage(
+            f"postgresql://{USER_POSTGRE}:{PASSWORD_POSTGRE}@localhost:{PORT_POSTGRE}/optuna_db"
+        ),
+        num=0,
+    ):
+        self.input_dir = input_dir
+        self.train_filename = train_filename
+        self.predictors_name = predictors_name
+        self.n_predictors = n_predictors
+        self.frac_sample = frac_sample
+        self.output_dir = output_dir
+        self.task = task
+        self.model_name = model_name
+        self.sampling = sampling
+        self.objective_name = objective_name
+        self.metric = metric
+        self.dic_metrics = dic_metrics
+        self.direction = direction
+        self.sampler = sampler
+        self.pruner = pruner
+        self.storage = storage
+        self.num = num
+        self.continue_if_exist = False
+        self.optimize_boosting_type = True
+        # Attributs à construire obligatoirement avec initialisation
 
-CONFIG_SEARCH = {
-    "model_dir": MODEL_DIR,
-    "model_type": "lightgbm",
-    "subdir": "light_simple/",
-    "data_dir": DATA_INTERIM,
-    "train_filename": "train.csv",
-    "feature_importance_filename": "feature_importance.csv",
-    "n_predictors": 20,
-    "moo_objective": False,
-    "metric": "weighted_recall",
-    "n_trials": 40,
-}
+        self.name = ""
+        self.study_name = ""
+        self.description = ""
+        self.tags = {}
+        self.X = None
+        self.y = None
+        self.random_state = 42
+        self.mlflow_id = None
+        self.study = None
+        self.initialized = False
+        self.parent_run_id = None
 
+    def check_services(self):
+        """print(
+            "# [TODO] Vérifier que les services sont démarrés (serveur mlflow et postgresql)"
+            #Démarrer un serveur mlflow local en ligne de commande :
+            #mlflow server --host 127.0.0.1 --port 8080
 
-def get_train(config=CONFIG_SEARCH):
-    # On charge le train avec toutes les features
-    train = pd.read_csv(os.path.join(DATA_INTERIM, config["train_filename"]))
-    to_drop = sel_var(train.columns, "Unnamed")
-    if to_drop:
-        train = train.drop(to_drop, axis=1)
-    train = train.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
+        )"""
+        # Démarrer un serveur mlflow local en ligne de commande :
+        # mlflow server --host 127.0.0.1 --port 8080
 
-    print("Forme de train.csv :", train.shape)
-    return train
+        # Use the fluent API to set the tracking uri and the active experiment
+        mlflow.set_tracking_uri(f"{LOCAL_HOST}:{PORT_MLFLOW}")
+        return
 
+    def check_directories(self):
+        """print(
+            "# [TODO] Vérifier que les directories sont ok et les créer si nécessaire"
+        )"""
+        if not os.path.exists(self.output_dir):
+            os.mkdir(self.output_dir)
+        return
 
-def get_sorted_features_by_importance(config=CONFIG_SEARCH):
-    sorted_features_by_importance = (
-        pd.read_csv(
-            os.path.join(
-                config["model_dir"],
-                config["subdir"],
-                config["feature_importance_filename"],
+    def init_name(
+        self,
+        model_name=None,
+        objective_name=None,
+        num=None,
+        verbose=True,
+        continue_if_exist=False,
+    ):
+        if model_name:
+            self.model_name = model_name
+        if objective_name:
+            self.objective_name = objective_name
+        if num:
+            self.num = num
+        if continue_if_exist is not None:
+            self.continue_if_exist = continue_if_exist
+
+        root_name = f"{self.task}_{self.model_name}_{self.objective_name}"
+        name = root_name + f"_{self.num:03}"
+
+        # On vérifie si l'expérience existe déjà dans mlflow
+        existing_experiment = mlflow.get_experiment_by_name(name)
+
+        # Si on autorise le chargement d'une expérience qui existe déjà
+        detail = " (nouvelle)"
+        if self.continue_if_exist:
+            if existing_experiment:
+                detail = " déjà existante"
+
+        # Si on n'autorise pas un nom d'expérience qui existe déjà, on augmente le numéro jusqu'à une qui n'existe pas
+        else:
+            while existing_experiment:
+                self.num += 1
+                num_str = f"_{self.num:03}"
+                name = root_name + num_str
+                existing_experiment = mlflow.get_experiment_by_name(name)
+                detail = " (nouvelle - numéro augmenté)"
+            self.name = name
+
+        if verbose:
+            print(f"Nom de l'expérience{detail} : {self.name}")
+
+        return name, existing_experiment
+
+    # Appeler cette fonc après init_name
+    def init_description(
+        self,
+        objective_name=None,
+        metric=None,
+        add_description="",
+        add_tags={},
+        verbose=True,
+    ):
+        if objective_name:
+            self.objective_name = objective_name
+        if metric:
+            self.metric = metric
+
+        main_description = (
+            f"Recherche bayesienne d'hyperparamètres pour modèle {self.model_name}"
+        )
+        main_tags = {
+            "task": self.task,
+            "model": self.model_name,
+            "objective": self.objective_name,
+            "metric": self.metric,
+            "num": f"{self.num:03}",
+        }
+        description = main_description
+        tags = main_tags
+        if add_description:
+            description = main_description + "\n" + add_description
+        if add_tags:
+            for k, v in add_tags.items():
+                tags[k] = v
+
+        self.description = description
+        self.tags = tags
+
+        if verbose:
+            print(f"Description de '{self.name}' :")
+            print(self.description)
+            print("Tags :")
+            for k, v in self.tags.items():
+                print(f"\t'{k}' : {v}")
+        return self.description, self.tags
+
+    # Lecture des données AVANT resampling de type smote etc.
+    def init_data(
+        self,
+        frac_sample=None,
+        input_dir=None,
+        train_filename=None,
+        predictors_name=None,
+        n_predictors=None,
+        verbose=True,
+    ):
+        if frac_sample:
+            self.frac_sample = frac_sample
+        if input_dir:
+            self.input_dir = input_dir
+        if train_filename:
+            self.train_filename = train_filename
+        if predictors_name:
+            self.predictors_name = predictors_name
+        if n_predictors:
+            self.n_predictors = n_predictors
+        if frac_sample:
+            self.frac_sample = float(frac_sample)
+            # [TODO] Pas tags mais fonc add_tags qui ajoute des tags à une expérience déjà créée ou initialisée
+            self.tags[frac_sample] = f"{frac_sample:0%}"
+
+        ##################### Lecture de toutes les données de train (=avec target ET déjà partagé pour laisser un test.csv)
+        if verbose:
+            print(
+                f"Chargement des données. n_predictors={self.n_predictors}, frac_sample={self.frac_sample}"
             )
+
+        all_train = pd.read_csv(os.path.join(self.input_dir, self.train_filename))
+        to_drop = sel_var(all_train.columns, "Unnamed", verbose=False)
+        if to_drop:
+            all_train = all_train.drop(to_drop, axis=1)
+        all_train = all_train.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
+
+        ##################### Réduction du nombre de colonnes
+        reduction_predictor = f"Tous les prédicteurs, "
+        # On lit les predicteurs du Kernel simple triés par ordre d'importance
+        all_predictors = joblib.load(os.path.join(self.input_dir, self.predictors_name))
+
+        # Si le nombre de prédicteurs n'est pas précisé (None) ou s'il dépasse, on les prends tous
+        # sinon on réduira le nombre de colonnes
+        if not self.n_predictors or self.n_predictors > len(all_predictors):
+            self.n_predictors = len(all_predictors)
+        if len(all_predictors) > self.n_predictors:
+            reduction_predictor = "Après réduction des prédicteurs, "
+
+        X, y = (
+            all_train[all_predictors[: self.n_predictors]],
+            all_train["TARGET"],
         )
-        .set_index("feature")
-        .index.tolist()
-    )
-    return sorted_features_by_importance
+        self.X = X
+        self.y = y
 
+        if verbose:
+            print("Forme initiale de X :", all_train[all_predictors].shape)
+            print(
+                f"{reduction_predictor}forme de X : {self.X.shape}, conso mémoire : {get_memory_consumed(self.X, verbose=False):.0f} Mo"
+            )
+        del all_train, all_predictors
+        gc.collect()
 
-# Coinstruit le nom de l'expérience ou l'active en fonction d'un numéro, pas en fonction de la forme des data
-def build_experiment(
-    num,
-    experiment_name=None,
-    experiment_description=None,
-    experiment_tags=None,
-    config=CONFIG_SEARCH,
-):
-    if not experiment_name:
-        # Si le nom de l'expérience n'est pas fourni en param, on le crée
-        data_filepath = os.path.join(config["data_dir"], config["train_filename"])
+        ##################### Réduction du nombre de lignes (avant under_sampling)
+        row_reduction = "Toutes les lignes, "
+        if self.frac_sample < 1.0:
+            X_sampled, _, y_sampled, _ = train_test_split(
+                X,
+                y,
+                train_size=self.frac_sample,
+                random_state=self.random_state,
+                stratify=y,
+            )
+            self.X = X_sampled
+            self.y = y_sampled
+            row_reduction = (
+                f"Après réduction des lignes (échantillon {self.frac_sample:.0%}), "
+            )
+        if verbose:
+            memory_consumed_mb = get_memory_consumed(self.X, verbose=False)
+            print(
+                f"{row_reduction}forme de X : {self.X.shape}, conso mémoire {memory_consumed_mb:.0f} Mo"
+            )
 
-        experiment_name = f"{config['subdir'][:-1]}_{config['metric']}_{config['n_trials']}trials_{num}"
-        print("experiment_name", experiment_name)
+        ##################### Warning taille memoire
+        mem_consumed = get_memory_consumed(self.X, verbose=False)
+        if mem_consumed > MAX_SIZE_PARA:
+            print(
+                f"WARNING: X est trop gros ({mem_consumed:.0f} > {MAX_SIZE_PARA} Mo) pour une réelle parallélisation des threads"
+            )
+        return self.X, self.y
 
-    if not experiment_description:
-        experiment_description = (
-            f"Recherche d'hyperparamètres pour le modèle {config['subdir'][:-1]}, impact du nombre de features\n"
-            "Recherche Bayesienne - mono objectif - Hyperband"
+    # Appeler init_data avant cette fonc
+    def init_resampling(self):
+        # [TODO] Implémenter le resampling ex smote
+        return
+
+    # Appeler init_name avant cette fonc, et check_service (pg doit être démarré)
+    def create_or_load_study(
+        self,
+        objective_name=None,
+        direction=None,
+        storage=None,
+        sampler=None,
+        pruner=None,
+    ):
+        if objective_name:
+            self.objective_name = objective_name
+        if direction:
+            self.direction = direction
+        if storage:
+            self.storage = storage
+        if sampler:
+            self.sampler = sampler
+        if pruner:
+            self.pruner = pruner
+
+        study = optuna.create_study(
+            study_name=self.name,
+            direction=self.direction,
+            sampler=self.sampler,
+            pruner=self.pruner,
+            storage=self.storage,
+            load_if_exists=True,
         )
+        self.study = study
+        return self.study
 
-    if not experiment_tags:
-        experiment_tags = {
-            "model": "lightgbm",
-            "task": "hyperparam",
-            "metric": config["metric"],
-            "mlflow.note.content": experiment_description,
-        }
+    def init_config(self, verbose=True, **kwargs):
+        # La liste des paramètres possibles à passer dans kwargs sont
+        # les attributs qui ne sont pas protégés ni privés et qui ne sont pas des méthodes
+        public_attributes = [
+            a
+            for a in dir(self)
+            if not a.startswith("_")
+            and not a.startswith("__")
+            and not callable(getattr(self, a))
+        ]
 
-    # On vérifie si l'expérience existe déjà
-    existing_experiment = mlflow.get_experiment_by_name(experiment_name)
+        valid_args = [arg for arg in kwargs.keys() if arg in public_attributes]
+        invalid_args = [arg for arg in kwargs.keys() if arg not in valid_args]
 
-    if existing_experiment:
-        print(f"WARNING : L'expérience '{experiment_name}' existe déjà")
-        experiment_id = existing_experiment.experiment_id
+        # On met à jour les paramètres qui sont autorisés
+        for k in valid_args:
+            v = kwargs[k]
+            self.__setattr__(k, v)
 
-    else:
-        print(f"Création de l'expérience '{experiment_name}'")
-        experiment_id = mlflow.create_experiment(
-            experiment_name,
-            # artifact_location=os.path.join(MODEL_DIR, subdir).as_uri(),
-            artifact_location=os.path.join(MODEL_DIR, config["subdir"]),
-            tags=experiment_tags,
-        )
+        if verbose:
+            print(f"Les paramètres {valid_args} ont été mis à jour")
+        if invalid_args:
+            print(
+                f"Les paramètres {invalid_args} ne sont pas valides. Liste des paramètres possibles :"
+            )
+            # [TODO] Trier par ordre alhabétique ?
+            print(public_attributes)
 
-    return experiment_id
+        # On ne veut pas ré-initialiser les data pour rien (la lecture est longue)
+        # donc on récupère les arguments de kwargs qui sont aussi dans la signature de init_data
+        # on n'exécute init_data que si les df X ou y sont vides ou si des arguments de data ont été passés dans kwargs, même s'ils ne sont pas différents d'avant
+        data_signature = inspect.signature(self.init_data)
+        data_args = [param.name for param in data_signature.parameters.values()]
+        data_args_to_init = [a for a in kwargs.keys() if k in data_args]
+        if self.X is None or self.y is None or data_args_to_init:
+            self.init_data()
+        self.init_name()
+        self.init_description()
+        self.check_directories()
+        self.check_services()
 
+        if invalid_args:
+            return False
+        else:
+            self.initialized = True
+            return self.initialized
 
-def build_experiment_old(
-    X,
-    experiment_name=None,
-    experiment_description=None,
-    experiment_tags=None,
-    config=CONFIG_SEARCH,
-):
-    if not experiment_name:
-        # Si le nom de l'expérience n'est pas fourni en param, on le crée
-        data_filepath = os.path.join(config["data_dir"], config["train_filename"])
-        n_rows, n_cols = X.shape
+    # Appeler les init avant les create
+    def create_or_load(self):
+        id_experiment = self.create_or_load_experiment()
+        study = self.create_or_load_study()
+        return id_experiment, study
 
-        experiment_name = f"{config['subdir'][:-1]}_{n_cols}x{n_rows}_{config['metric']}_{config['n_trials']}trials"
-        print("experiment_name", experiment_name)
-
-    if not experiment_description:
-        experiment_description = (
-            f"Recherche d'hyperparamètres pour le modèle {config['subdir'][:-1]}, impact du nombre de features\n"
-            "Recherche Bayesienne - mono objectif - Hyperband"
-        )
-
-    if not experiment_tags:
-        experiment_tags = {
-            "model": "lightgbm",
-            "task": "hyperparam",
-            "metric": config["metric"],
-            "mlflow.note.content": experiment_description,
-        }
-
-    # On vérifie si l'expérience existe déjà
-    existing_experiment = mlflow.get_experiment_by_name(experiment_name)
-
-    if existing_experiment:
-        print(f"WARNING : L'expérience '{experiment_name}' existe déjà")
-        experiment_id = existing_experiment.experiment_id
-
-    else:
-        print(f"Création de l'expérience '{experiment_name}'")
-        experiment_id = mlflow.create_experiment(
-            experiment_name,
-            # artifact_location=os.path.join(MODEL_DIR, subdir).as_uri(),
-            artifact_location=os.path.join(MODEL_DIR, config["subdir"]),
-            tags=experiment_tags,
-        )
-
-    return experiment_id
-
-
-def build_parent_run_name(config=CONFIG_SEARCH):
-    run_name = f"{config['model_type']}_single_{config['metric']}_best"
-    run_description = (
-        f"Single objective - métrique {config['metric']} - all data kernel simple"
-    )
-    return run_name, run_description
-
-
-"""def lgb_single_objective(trial):
-    with mlflow.start_run(nested=True):
-        # On définit les hyperparamètres
-        params = {
-            "boosting_type": trial.suggest_categorical(
-                "boosting_type", ["dart", "gbdt"]
-            ),
-            "lambda_l1": trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),
-            "lambda_l2": trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),
-            "num_leaves": trial.suggest_int("num_leaves", 2, 256),
-            "feature_fraction": trial.suggest_float("feature_fraction", 0.4, 1.0),
-            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.4, 1.0),
-            "bagging_freq": trial.suggest_int("bagging_freq", 1, 7),
-            "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
-            "learning_rate": trial.suggest_float(
-                "learning_rate", 0.0001, 0.5, log=True
-            ),
-            "max_bin": trial.suggest_int("max_bin", 128, 512, step=32),
-            "n_estimators": trial.suggest_int("n_estimators", 40, 400, step=20),
-            
-        }
-
-        other_params = {}
-
-    return"""
-
-
-def sk_single_objective(X, y, optimize_boosting_type=True, config=CONFIG_SEARCH):
-    # Nécessite l'installation optuna-integration
-    def _objective(trial):
-        parent_run_name, parent_run_description = build_parent_run_name(config=config)
-        child_run_name = f"N_{trial.number}"
-        with mlflow.start_run(run_name=child_run_name, nested=True):
-            if optimize_boosting_type:
-                boosting_type = trial.suggest_categorical(
-                    "boosting_type", ["dart", "gbdt"]
-                )
-            else:
-                boosting_type = "gbdt"
+    def objective_lgb(self, trial):
+        # parent_run_name = "best"
+        # Attention les n° de trial ne correspondent pas à ceux fournis en logging stdout
+        with mlflow.start_run(
+            experiment_id=self.mlflow_id, run_name=f"{trial.number}", nested=True
+        ):
+            boosting_type = trial.suggest_categorical("boosting_type", ["dart", "gbdt"])
             lambda_l1 = (trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),)
             lambda_l2 = (trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),)
-            num_leaves = (trial.suggest_int("num_leaves", 2, 256),)
+            num_leaves = (trial.suggest_int("num_leaves", 8, 256),)
             feature_fraction = (trial.suggest_float("feature_fraction", 0.4, 1.0),)
             bagging_fraction = (trial.suggest_float("bagging_fraction", 0.4, 1.0),)
             bagging_freq = (trial.suggest_int("bagging_freq", 1, 7),)
@@ -262,7 +438,7 @@ def sk_single_objective(X, y, optimize_boosting_type=True, config=CONFIG_SEARCH)
 
             # 'binary' est la métrique d'erreur
             pruning_callback = optuna.integration.LightGBMPruningCallback(
-                trial, "binary"
+                trial, self.objective_name
             )
 
             # Pour intégration optuna mlflow avec nested runs voir :
@@ -270,7 +446,9 @@ def sk_single_objective(X, y, optimize_boosting_type=True, config=CONFIG_SEARCH)
 
             # On n'utilise pas cross_val_score pour des problèmes de RAM
             # scores = cross_val_score(model, X, y, scoring="f1_macro", cv=5)
-            folds = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+            folds = StratifiedKFold(
+                n_splits=5, shuffle=True, random_state=self.random_state
+            )
             auc_scores = []
             accuracy_scores = []
             balanced_accuracy_scores = []
@@ -281,14 +459,16 @@ def sk_single_objective(X, y, optimize_boosting_type=True, config=CONFIG_SEARCH)
             balanced_precision_scores = []
             fit_durations = []
 
-            for i_fold, (train_idx, valid_idx) in enumerate(folds.split(X, y)):
-                X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
-                X_val, y_val = X.iloc[valid_idx], y.iloc[valid_idx]
+            for i_fold, (train_idx, valid_idx) in enumerate(
+                folds.split(self.X, self.y)
+            ):
+                X_train, y_train = self.X.iloc[train_idx], self.y.iloc[train_idx]
+                X_val, y_val = self.X.iloc[valid_idx], self.y.iloc[valid_idx]
 
                 model = lgb.LGBMClassifier(
                     # force_row_wise=True,
                     force_col_wise=True,
-                    objective="binary",
+                    objective=self.objective_name,
                     is_unbalanced=False,
                     boosting_type=boosting_type,
                     n_estimators=n_estimators,
@@ -310,7 +490,7 @@ def sk_single_objective(X, y, optimize_boosting_type=True, config=CONFIG_SEARCH)
                     y_train,
                     # eval_set=[(X_train, y_train), (X_val, y_val)],
                     eval_set=(X_val, y_val),
-                    eval_metric=config["metric"],
+                    eval_metric=self.metric,
                 )
                 fit_durations.append(time.time() - t0_fit)
 
@@ -351,125 +531,68 @@ def sk_single_objective(X, y, optimize_boosting_type=True, config=CONFIG_SEARCH)
             for k, v in dic_metrics.items():
                 mlflow.log_metric(k, v)
             mlflow.log_params(hyperparams)
+        return dic_metrics[self.metric]
 
-        return dic_metrics[config["metric"]]
+    def objective_reg(self):
+        print("[TODO] objective pour reg log")
+        return
 
-    return _objective
-
-
-def sk_single_search(
-    X, y, num, experiment_name=None, by_10_trials=False, config=CONFIG_SEARCH
-):
-    # Use the fluent API to set the tracking uri and the active experiment
-    mlflow.set_tracking_uri(f"{LOCAL_HOST}:{LOCAL_PORT}")
-    """# Pour la journalisation sous windows, cela pose un problème de privilège :
-    # Voir : https://optuna.readthedocs.io/en/stable/reference/generated/optuna.storages.JournalStorage.html
-    file_path = "./journal_optuna.log"
-    lock_obj = optuna.storages.JournalFileOpenLock(file_path)
-
-    storage = optuna.storages.JournalStorage(
-        optuna.storages.JournalFileStorage(file_path, lock_obj=lock_obj),
-    )
-    """
-    with timer("Optimize hyperparameters"):
-        # Utilise l'algorithme d'optimisation TPE (Tree-structured Parzen Estimator) comme méthode d'échantillonnage
-        # Il s'agit de l'algo qui génère les valeurs des hyperparams lors de chaque essai d'optimisation
-        # Ici il est utilisé en conjonction avec le pruning Hyperband
-        # => Le sampler choisit les params à essayer, le pruner les arrête prématurément si non performants
-        sampler = optuna.samplers.TPESampler()
-
-        # Optuna a réalisé plusieurs études empiriques avec différents algorithmes de pruning.
-        # Empiriquement, l'algorithme Hyperband a donné les meilleurs résultats
-        # Voir : https://github.com/optuna/optuna/wiki/Benchmarks-with-Kurobako
-        # reduction_factor contrôle combien de trials sont proposés dans chaque Halving Round
-        pruner = optuna.pruners.HyperbandPruner(
-            min_resource=10, max_resource=300, reduction_factor=3
+    def run_trials(self, n_trials=20, n_jobs=1):
+        self.study.optimize(
+            self.objective_lgb, n_trials=n_trials, n_jobs=n_jobs, gc_after_trial=True
         )
 
-        # On active l'expérience
-        experiment_id = build_experiment(
-            num, experiment_name=experiment_name, config=config
+    def run_parallel(self, n_workers=8, n_trials_per_worker=10):
+        Parallel(n_jobs=n_workers)(
+            delayed(self.run_trials)(n_trials_per_worker, 1) for _ in range(n_workers)
         )
-        experiment_metadata = mlflow.set_experiment(experiment_id=experiment_id)
-        print(f"Experience '{experiment_metadata.name}' activée")
 
-        # On crèe une run MLFlow
-        parent_run_name, parent_run_description = build_parent_run_name(config=config)
+    def track_best_run(self):
+        # find the best run, log its metrics as the final metrics of this run.
+        # client = MlflowClient()
 
-        with mlflow.start_run(
-            experiment_id=experiment_id, run_name=parent_run_name, nested=True
-        ) as run:
-            # description du run
-            mlflow.set_tag("mlflow.note.content", parent_run_description)
+        # Récupération de tous les runs de l'experiment
+        runs = mlflow.search_runs(experiment_ids=[self.mlflow_id])
+        print("len(runs)", len(runs), "type", type(runs))
+        # print(runs)
 
-            study_name = f"study_{experiment_metadata.name}"
-            study = optuna.create_study(
-                direction="maximize",
-                sampler=sampler,
-                pruner=pruner,
-                study_name=study_name,
-                # storage=storage,
-            )
+        # On enlève le parent
+        # nested_runs = [run for run in runs if run.run_name != "best"]
+        # print(runs.columns)
+        nested_runs = runs[runs["tags.mlflow.parentRunId"].notnull()].sort_values(
+            by=f"metrics.{self.metric}", ascending=False
+        )
+        best_run = nested_runs.head(1)
+        print("len(nested_runs)", nested_runs.shape)
 
-            # S'il est demandé de réaliser l'étude par paquets de 10 trials (nécessaire si le dataset est trop gros),
-            # On optimise plusieurs études de 10 trials
-            n_trials = config["n_trials"]
-            n_studies = 1
-            if by_10_trials:
-                n_studies = n_trials // 10
-                n_trials = 10
+        # parent_run_name = "best"
+        """runs = client.search_runs(
+            [self.mlflow_id], f"tags.mlflow.parentRunName == 'best'"
+        )"""
 
-            for i in range(n_studies):
-                study.optimize(
-                    sk_single_objective(
-                        X=X, y=y, optimize_boosting_type=True, config=config
-                    ),
-                    n_trials=n_trials,
-                    gc_after_trial=True,  # On appelle le garbage collector après chaque trial
-                    n_jobs=NUM_THREADS,
-                )
+        # Filtrer les runs qui ont le run parent désiré
+        # nested_runs = runs[runs["tags.mlflow.parentRunName"] == parent_run_name]
+        # nested_runs = [runs[runs["tags.mlflow.parentRunId"]] == self.parent_run_id]
 
-            best_params = study.best_trial.params
-            best_score = study.best_trial.value
-            mlflow.log_params(best_params)
+        """best_metric = 0
 
-            fig = optuna.visualization.plot_parallel_coordinate(
-                study,
-                params=["boosting_type", "num_leaves", "learning_rate", "n_estimators"],
-            )
-            im_dir = os.path.join(config["model_dir"], config["subdir"])
-            # fig.write_image(file=os.path.join(im_dir, "single_parallel_coordinates.png"), format="png", scale=6)
-            fig.write_html(os.path.join(im_dir, "single_parallel_coordinates.html"))
-            fig = optuna.visualization.plot_param_importances(study)
-            # fig.write_image(file=os.path.join(im_dir, "single_hyperparam_importance.png"), format="png", scale=1)
-            fig.write_html(os.path.join(im_dir, "single_hyperparam_importance.html"))
+        for r in nested_runs:
+            if r.data.metrics[self.metric] > best_metric:
+                best_run = r
+        if best_run:
+            print("Metrics du best", best_run.data.metrics)
+        else:
+            print("best run non trouvé")"""
 
-            mlflow.log_params(best_params)
-            mlflow.log_metric(config["metric"], best_score)
-            mlflow.log_artifact(
-                os.path.join(im_dir, "single_parallel_coordinates.html")
-            )
-            mlflow.log_artifact(
-                os.path.join(im_dir, "single_hyperparam_importance.html")
-            )
-            # mlflow.log_artifact(os.path.join(im_dir, "single_hyperparam_importance.png"))
-        # Force mlflow à terminer le run même s'il y a une erreur dedans
-        mlflow.end_run()
-    return study
-
-
-# Pénalise les Faux Negatifs dans le F1 Score
-def weight_f1(y_true, y_pred, weight_fn=10):
-    _, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    # fn = Nombre de faux négatifs (oubli de prédire un défaut)
-    # fp = Nombre de faux positifs (défaut prédit à tort)
-
-    # f1 standard = 2 * tp / (2 * tp + fp + fn)
-
-    # weighted_f1 = 2 * tp / (2 * tp + weight_fn * fn  + (1 - weight_fn) * fp)
-    weighted_f1 = 2 * tp / (2 * tp + (weight_fn * fn + fp) / weight_fn)
-
-    return weighted_f1
+        """mlflow.set_tag("best_run", best_run.info.run_id)
+        mlflow.log_metrics(
+            {
+                f"train_{metric}": best_val_train,
+                f"val_{metric}": best_val_valid,
+                f"test_{metric}": best_val_test,
+            }
+        )"""
+        return best_run
 
 
 # Créer une métrique personnalisée à partir de la fonction de perte
