@@ -171,6 +171,26 @@ class ExperimentSearch:
         mlflow.set_tracking_uri(f"{LOCAL_HOST}:{PORT_MLFLOW}")
         return
 
+    def start_mlflow_server(self, host="127.0.0.1", port="8080"):
+        cmd = [
+            "mlflow",
+            "server",
+            # "--backend-store-uri", backend_store_uri,
+            # "--default-artifact-root", default_artifact_root,
+            "--host",
+            host,
+            "--port",
+            port,
+        ]
+        env = os.environ.copy()
+        # Start the MLflow server
+        process = subprocess.Popen(
+            cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        # Allow some time for the server to start
+        time.sleep(5)
+        return process
+
     def check_directories(self):
         """print(
             "# [TODO] Vérifier que les directories sont ok et les créer si nécessaire"
@@ -246,6 +266,7 @@ class ExperimentSearch:
             "objective": self.objective_name,
             "metric": self.metric,
             "num": f"{self.num:03}",
+            "db": "optuna",
         }
         description = main_description
         tags = main_tags
@@ -363,6 +384,33 @@ class ExperimentSearch:
     def init_resampling(self):
         # [TODO] Implémenter le resampling ex smote
         return
+
+    # Appeler init_expriment_name avant cette fonc et check service
+    def create_or_load_experiment(self, verbose=True):
+
+        tags = self.tags
+        tags["mlflow.note.content"] = self.description
+
+        # On vérifie si l'expérience existe déjà
+        existing_experiment = mlflow.get_experiment_by_name(self.name)
+
+        load_or_create = "Création de "
+        if existing_experiment:
+            experiment_id = existing_experiment.experiment_id
+            load_or_create = "Chargement de "
+        else:
+            experiment_id = mlflow.create_experiment(
+                self.name,
+                artifact_location=self.output_dir,
+                tags=tags,
+            )
+        self.mlflow_id = experiment_id
+        if verbose:
+            print(
+                f"{load_or_create}l'expérience MLFlow '{self.name}', ID = {self.mlflow_id}"
+            )
+        # self.create_parent_run()
+        return self.mlflow_id
 
     # Appeler init_name avant cette fonc, et check_service (pg doit être démarré)
     def create_or_load_study(
@@ -574,6 +622,10 @@ class ExperimentSearch:
                 "balanced_precision": np.mean(balanced_precision_scores),
                 "fit_duration": np.mean(fit_durations),
             }
+
+            # Pour logguer les métriques additionnelles dans optuna_db :
+            # trial.set_user_attr("constraint", [c0])
+
             for k, v in dic_metrics.items():
                 mlflow.log_metric(k, v)
             mlflow.log_params(hyperparams)
@@ -583,16 +635,69 @@ class ExperimentSearch:
         print("[TODO] objective pour reg log")
         return
 
-    def run_trials(self, n_trials=20, n_jobs=1):
+    def create_parent_run(self):
+        # On crée un run parent qui va contenir tous les runs (un run enfant par trial)
+        parent_run = mlflow.start_run(
+            experiment_id=self.mlflow_id,
+            run_name="Study",
+            tags=self.tags,
+            # description="Résultats de la recherche d'hyperparamètres",
+        )
+        self.parent_run_id = parent_run.info.run_id
+        mlflow.end_run()
+
+    def run_trials(self, n_trials=20, n_jobs=8, verbose=True):
+        t0 = time.time()
+        if verbose:
+            print(f"Optimisation {n_trials} trials...")
+
         self.study.optimize(
             self.objective_lgb, n_trials=n_trials, n_jobs=n_jobs, gc_after_trial=True
         )
+        duration = time.time() - t0
+        if verbose:
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(duration))
 
-    def run_parallel(self, n_workers=8, n_trials_per_worker=10):
+    def create_best_run(self):
+        with mlflow.start_run(
+            experiment_id=self.mlflow_id,
+            run_name=f"T_{self.study.best_trial.number}_best_of_{len(self.study.get_trials())}_trials",
+        ):
+            mlflow.log_params(self.study.best_trial.params)
+            mlflow.log_metric(self.metric, self.study.best_trial.value)
+            fig = optuna.visualization.plot_param_importances(self.study)
+            fig.write_html(os.path.join(self.output_dir, "hyperparam_importance.html"))
+            mlflow.log_artifact(
+                os.path.join(self.output_dir, "hyperparam_importance.html")
+            )
+            fig = optuna.visualization.plot_parallel_coordinate(
+                self.study,
+                params=["boosting_type", "n_estimators", "num_leaves", "learning_rate"],
+            )
+            fig.write_html(os.path.join(self.output_dir, "parallel_coordinate.html"))
+            mlflow.log_artifact(
+                os.path.join(self.output_dir, "parallel_coordinate.html")
+            )
+            fig = optuna.visualization.plot_optimization_history(self.study)
+            fig.write_html(os.path.join(self.output_dir, "optimization_history.html"))
+            mlflow.log_artifact(
+                os.path.join(self.output_dir, "optimization_history.html")
+            )
+
+    def run_parallel(self, n_workers=8, n_trials_per_worker=10, verbose=True):
+        t0 = time.time()
+        if verbose:
+            print(f"Optimisation {n_trials_per_worker * n_workers} trials...")
+
         Parallel(n_jobs=n_workers)(
             delayed(self.run_trials)(n_trials_per_worker, 1) for _ in range(n_workers)
         )
+        duration = time.time() - t0
 
+        if verbose:
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(duration))
+
+    # Inutile, on va plutôt faire un run parent
     def track_best_run(self):
         # find the best run, log its metrics as the final metrics of this run.
         # client = MlflowClient()
