@@ -23,6 +23,7 @@ import re
 import gc
 import os
 import time
+import psutil
 from contextlib import contextmanager
 from lightgbm import LGBMClassifier
 from sklearn.metrics import roc_auc_score, roc_curve
@@ -401,15 +402,11 @@ def kfold_lightgbm_simple(df=None, config=CONFIG_SIMPLE):
 
     # Divide in training/validation and test data
     train_df = df[df["TARGET"].notnull()]
-    test_df = df[df["TARGET"].isnull()]
+    # test_df = df[df["TARGET"].isnull()]
     if config["debug"]:
         train_df = train_df.head(10_000)
-        test_df = test_df.head(1000)
-    print(
-        "Starting LightGBM. Train shape: {}, test shape: {}".format(
-            train_df.shape, test_df.shape
-        )
-    )
+        # test_df = test_df.head(1000)
+    print("Starting LightGBM. Train shape: {}".format(train_df.shape))
     del df
     gc.collect()
     # Cross validation model
@@ -427,7 +424,7 @@ def kfold_lightgbm_simple(df=None, config=CONFIG_SIMPLE):
         )
     # Create arrays and dataframes to store results
     oof_preds = np.zeros(train_df.shape[0])
-    sub_preds = np.zeros(test_df.shape[0])
+    # sub_preds = np.zeros(test_df.shape[0])
     feature_importance_df = pd.DataFrame()
     feats = [
         f
@@ -466,10 +463,10 @@ def kfold_lightgbm_simple(df=None, config=CONFIG_SIMPLE):
         oof_preds[valid_idx] = clf.predict_proba(
             valid_x, num_iteration=clf.best_iteration_
         )[:, 1]
-        sub_preds += (
+        """sub_preds += (
             clf.predict_proba(test_df[feats], num_iteration=clf.best_iteration_)[:, 1]
             / folds.n_splits
-        )
+        )"""
 
         fold_importance_df = pd.DataFrame()
         fold_importance_df["feature"] = feats
@@ -505,8 +502,8 @@ def kfold_lightgbm_simple(df=None, config=CONFIG_SIMPLE):
     # Write submission file
     if config["generate_submission_files"]:
         submission_filepath = os.path.join(path_model, config["submission_filename"])
-        test_df["TARGET"] = sub_preds
-        test_df[["SK_ID_CURR", "TARGET"]].to_csv(submission_filepath, index=False)
+        # test_df["TARGET"] = sub_preds
+        # test_df[["SK_ID_CURR", "TARGET"]].to_csv(submission_filepath, index=False)
         print("Submission saved in", submission_filepath)
     # display_importances(feature_importance_df)
     return mean_importance
@@ -601,10 +598,12 @@ def get_simple_data(config=CONFIG_SIMPLE):
         del cc
         gc.collect()
 
-        to_drop = sel_var(df.columns, "Unnamed")
+        to_drop = sel_var(df.columns, "Unnamed", verbose=False)
         if to_drop:
             df = df.drop(to_drop, axis=1)
         df = df.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
+    with timer("Remplacement des valeurs infinies par NaN"):
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     # write data
     print("write data")
@@ -616,8 +615,11 @@ def get_simple_data(config=CONFIG_SIMPLE):
     del df
     gc.collect()
 
+    # Pour la compétition, le jeu de test initial ne comporte pas de Target.
+    # Nous ne pouvons donc pas l'utiliser.
+    # Nous nous réservons donc nouveau un jeu de test parmi le jeu de train initial.
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=RANDOM_SEED, stratify=y
+        X, y, test_size=0.25, random_state=RANDOM_SEED, stratify=y
     )
     del X, y
     gc.collect()
@@ -643,6 +645,112 @@ def add_ext_source_1_known(df):
         lambda x: False if np.isnan(x) else True
     )
     return df
+
+
+def reduce_memory(df):
+    """iterate through all the columns of a dataframe and modify the data type
+    to reduce memory usage.
+    """
+    start_mem = df.memory_usage().sum() / 1024**2
+    print("Memory usage of dataframe is {:.2f} MB".format(start_mem))
+
+    for col in df.columns:
+        col_type = df[col].dtype
+        if col_type != bool:
+            if col_type != object:
+                c_min = df[col].min()
+                c_max = df[col].max()
+                if str(col_type)[:3] == "int":
+                    if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                        df.loc[:, col] = df.loc[:, col].astype(np.int8)
+                    elif (
+                        c_min > np.iinfo(np.int16).min
+                        and c_max < np.iinfo(np.int16).max
+                    ):
+                        df.loc[:, col] = df.loc[:, col].astype(np.int16)
+                    elif (
+                        c_min > np.iinfo(np.int32).min
+                        and c_max < np.iinfo(np.int32).max
+                    ):
+                        df.loc[:, col] = df.loc[:, col].astype(np.int32)
+                    elif (
+                        c_min > np.iinfo(np.int64).min
+                        and c_max < np.iinfo(np.int64).max
+                    ):
+                        df.loc[:, col] = df.loc[:, col].astype(np.int64)
+                else:
+                    if (
+                        c_min > np.finfo(np.float16).min
+                        and c_max < np.finfo(np.float16).max
+                    ):
+                        df.loc[:, col] = df.loc[:, col].astype(np.float16)
+                    elif (
+                        c_min > np.finfo(np.float32).min
+                        and c_max < np.finfo(np.float32).max
+                    ):
+                        df.loc[:, col] = df.loc[:, col].astype(np.float32)
+                    else:
+                        df.loc[:, col] = df.loc[:, col].astype(np.float64)
+
+    end_mem = df.memory_usage().sum() / 1024**2
+    print("Memory usage after optimization is: {:.2f} MB".format(end_mem))
+    print("Decreased by {:.1f}%".format(100 * (start_mem - end_mem) / start_mem))
+
+    return df
+
+
+"""def get_memory_usage(df, unit="Mo", verbose=True):
+    memory_usage = df.memory_usage(deep=True)
+    # Somme de l'utilisation de la mémoire par colonne
+    total_memory = memory_usage.sum()
+
+    if unit.lower() == "ko" or unit.lower() == "kb":
+        memory_usage = total_memory / 1024
+    elif unit.lower() == "mo" or unit.lower() == "mb":
+        memory_usage = total_memory / (1024 * 1024)
+    elif unit.lower() == "go" or unit.lower() == "gb":
+        memory_usage = total_memory / (1024 * 1024 * 1024)
+    else:
+        # print("L'unité doit être Ko, Mo ou Go, l'unité fournie est", unit)
+        print("L'unité doit être Ko Kb, Mo, Mb ou Go Gb, got", unit)
+        return
+    if verbose:
+        print("Taille mémoire du DataFrame :", memory_usage, unit)
+    return memory_usage, unit"""
+
+
+def get_memory_consumed(df, verbose=True):
+    # Somme de l'utilisation de la mémoire par colonne
+    total_memory = df.memory_usage(deep=True).sum()
+    memory_usage_mb = total_memory / (1024 * 1024)
+    if verbose:
+        print("Taille mémoire du DataFrame :", memory_usage_mb, "Mo")
+    return memory_usage_mb
+
+
+def get_available_memory(verbose=True, threshold=0.85):
+    total_memory_available_gb = psutil.virtual_memory().available / (1024 * 1024 * 1024)
+    if verbose:
+        print("RAM totale disponible :", total_memory_available_gb, "Go")
+    memory_available_gb = int(total_memory_available_gb * threshold)
+    del total_memory_available_gb
+    gc.collect()
+    if verbose:
+        print(f"RAM disponible au seuil de {threshold:.0%} : {memory_available_gb} Go")
+    return memory_available_gb
+
+
+"""def get_batch_size(df, verbose=True):
+    n_intial_rows = df.shape[0]
+    memory_available_gb = get_available_memory(verbose=verbose)
+    memory_consumed_gb = get_memory_consumed(df=df, verbose=verbose)
+    del df
+    gc.collect()
+
+    batch_size = int(memory_available_gb * n_intial_rows / memory_consumed_gb)
+    if verbose:
+        print(f"Taille de batch conseillée : {batch_size}")
+    return batch_size"""
 
 
 """def lgbm_feature_importance_simple(config=CONFIG_SIMPLE):
