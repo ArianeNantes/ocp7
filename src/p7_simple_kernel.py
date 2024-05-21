@@ -618,25 +618,28 @@ def get_simple_data(config=CONFIG_SIMPLE):
     # Pour la compétition, le jeu de test initial ne comporte pas de Target.
     # Nous ne pouvons donc pas l'utiliser.
     # Nous nous réservons donc nouveau un jeu de test parmi le jeu de train initial.
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=RANDOM_SEED, stratify=y
-    )
-    del X, y
-    gc.collect()
+    with timer("Partage Train Test(25%)"):
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.25, random_state=RANDOM_SEED, stratify=y
+        )
+        del X, y
+        gc.collect()
 
-    test = pd.concat([X_test, y_test], axis=1)
-    del X_test, y_test
-    gc.collect()
-    test_path = os.path.join(config["data_output_dir"], "test.csv")
-    test.to_csv(test_path, index=False)
-    print(f"Test shape : {test.shape}, saved in {test_path}")
+        test = pd.concat([X_test, y_test], axis=1)
+        del X_test, y_test
+        gc.collect()
+        test_path = os.path.join(config["data_output_dir"], "v0_test.csv")
+        test.to_csv(test_path, index=False)
+        print(f"\nTaille du jeu de test : {test.shape}, sauvegardé dans {test_path}")
 
-    train = pd.concat([X_train, y_train], axis=1)
-    del X_train, y_train
-    gc.collect()
-    train_path = os.path.join(config["data_output_dir"], "train.csv")
-    train.to_csv(train_path, index=False)
-    print(f"Train shape : {train.shape}, saved in {train_path}")
+        train = pd.concat([X_train, y_train], axis=1)
+        del X_train, y_train
+        gc.collect()
+        train_path = os.path.join(config["data_output_dir"], "v0_train.csv")
+        train.to_csv(train_path, index=False)
+        print(
+            f"Taille du jeu de Train : {train.shape}, {get_memory_consumed(train, verbose=False)} Mo. Sauvegardé dans {train_path}"
+        )
     return train, test
 
 
@@ -722,9 +725,9 @@ def reduce_memory(df):
 def get_memory_consumed(df, verbose=True):
     # Somme de l'utilisation de la mémoire par colonne
     total_memory = df.memory_usage(deep=True).sum()
-    memory_usage_mb = total_memory / (1024 * 1024)
+    memory_usage_mb = round(total_memory / (1024 * 1024))
     if verbose:
-        print("Taille mémoire du DataFrame :", memory_usage_mb, "Mo")
+        print(f"Taille mémoire du DataFrame : {memory_usage_mb} Mo")
     return memory_usage_mb
 
 
