@@ -1,5 +1,6 @@
 import datetime
 import time
+import gc
 
 # import random
 import numpy as np
@@ -88,5 +89,6 @@ def clean_ram(list_vars, dic_vars):
     vars_to_del = [var for var in list_vars if var in dic_vars.keys()]
     for var in vars_to_del:
         del dic_vars[var]
+    gc.collect()
     print(f"{len(vars_to_del)} variables détruites : {vars_to_del}")
     return

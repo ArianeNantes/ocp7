@@ -640,6 +640,7 @@ def get_simple_data(config=CONFIG_SIMPLE):
         print(
             f"Taille du jeu de Train : {train.shape}, {get_memory_consumed(train, verbose=False)} Mo. Sauvegardé dans {train_path}"
         )
+        print(f"La consommation mémoire peut être réduite")
     return train, test
 
 

@@ -15,6 +15,7 @@ import inspect
 import lightgbm as lgb
 import optuna
 from optuna.storages import JournalStorage, JournalFileStorage, RDBStorage
+from scipy.stats import beta
 import plotly
 import kaleido
 import mlflow
@@ -54,6 +55,7 @@ from src.p7_simple_kernel import (
     get_memory_consumed,
     get_available_memory,
 )
+from src.p7_metric import pred_prob_to_binary, penalize_f1, penalize_business_gain
 
 
 class ExperimentSearch:
@@ -515,6 +517,10 @@ class ExperimentSearch:
             )
             max_bin = trial.suggest_int("max_bin", 128, 512, step=32)
             n_estimators = trial.suggest_int("n_estimators", 40, 400, step=20)
+            # On concentre la recherche du seuil autour de 0.5 avec la distribution Beta
+            threshold_pred_probability = self.suggest_beta(
+                "threshold_pred_probability", low=0.1, high=0.9
+            )
 
             hyperparams = {
                 "boosting_type": boosting_type,
@@ -528,6 +534,7 @@ class ExperimentSearch:
                 "learning_rate": learning_rate,
                 "max_bin": max_bin,
                 "n_estimators": n_estimators,
+                "threshold_pred_probability": threshold_pred_probability,
             }
 
             # 'binary' est la métrique d'erreur
@@ -549,8 +556,8 @@ class ExperimentSearch:
             f1_scores = []
             recall_scores = []
             weighted_recall_scores = []
-            precision_scores = []
-            balanced_precision_scores = []
+            penalized_f1_sores = []
+            business_gain_scores = []
             fit_durations = []
 
             for i_fold, (train_idx, valid_idx) in enumerate(
@@ -588,19 +595,23 @@ class ExperimentSearch:
                 )
                 fit_durations.append(time.time() - t0_fit)
 
-                pred_y = model.predict_proba(X_val)[:, 1]
-                auc_scores.append(roc_auc_score(y_val, y_score=pred_y))
+                y_score = model.predict_proba(X_val)[:, 1]
+                auc_scores.append(roc_auc_score(y_val, y_score=y_score))
 
-                pred_y = model.predict(X_val)
-                f1_scores.append(f1_score(y_val, pred_y))
-                recall_scores.append(recall_score(y_val, pred_y))
-                weighted_recall_scores.append(
-                    recall_score(y_val, pred_y, average="weighted")
+                y_pred = pred_prob_to_binary(
+                    y_score, threshold=threshold_pred_probability
                 )
-                accuracy_scores.append(accuracy_score(y_val, pred_y))
-                balanced_accuracy_scores.append(balanced_accuracy_score(y_val, pred_y))
-                precision_scores.append(precision_score(y_val, pred_y, zero_division=0))
-                balanced_precision_scores.append(balanced_accuracy_score(y_val, pred_y))
+
+                f1_scores.append(f1_score(y_val, y_pred))
+                recall_scores.append(recall_score(y_val, y_pred))
+                weighted_recall_scores.append(
+                    recall_score(y_val, y_pred, average="weighted")
+                )
+                accuracy_scores.append(accuracy_score(y_val, y_pred))
+                balanced_accuracy_scores.append(balanced_accuracy_score(y_val, y_pred))
+                penalized_f1_sores.append(penalize_f1(y_val, y_pred))
+                business_gain_scores.append(penalize_business_gain(y_val, y_pred))
+
                 del X_train
                 del y_train
                 del X_val
@@ -618,8 +629,8 @@ class ExperimentSearch:
                 "recall": np.mean(recall_scores),
                 "accuracy": np.mean(accuracy_scores),
                 "balanced_accuracy": np.mean(balanced_accuracy_scores),
-                "precision": np.mean(precision_scores),
-                "balanced_precision": np.mean(balanced_precision_scores),
+                "penalized_f1": np.mean(penalized_f1_sores),
+                "business_gain": np.mean(business_gain_scores),
                 "fit_duration": np.mean(fit_durations),
             }
 
@@ -646,7 +657,7 @@ class ExperimentSearch:
         self.parent_run_id = parent_run.info.run_id
         mlflow.end_run()
 
-    def run_trials(self, n_trials=20, n_jobs=8, verbose=True):
+    def run_lgb_trials(self, n_trials=20, n_jobs=8, verbose=True):
         t0 = time.time()
         if verbose:
             print(f"Optimisation {n_trials} trials...")
@@ -684,18 +695,20 @@ class ExperimentSearch:
                 os.path.join(self.output_dir, "optimization_history.html")
             )
 
-    def run_parallel(self, n_workers=8, n_trials_per_worker=10, verbose=True):
+    def run_lgb(self, n_workers=8, n_trials_per_worker=10, verbose=True):
         t0 = time.time()
         if verbose:
             print(f"Optimisation {n_trials_per_worker * n_workers} trials...")
 
         Parallel(n_jobs=n_workers)(
-            delayed(self.run_trials)(n_trials_per_worker, 1) for _ in range(n_workers)
+            delayed(self.run_lgb_trials)(n_trials_per_worker, 1)
+            for _ in range(n_workers)
         )
         duration = time.time() - t0
 
         if verbose:
             print("Durée de l'optimisation (hh:mm:ss) :", format_time(duration))
+        self.create_best_run()
 
     # Inutile, on va plutôt faire un run parent
     def track_best_run(self):
@@ -745,9 +758,15 @@ class ExperimentSearch:
         )"""
         return best_run
 
+    # Permet de suggérer des float en en proposant plus autour de 0.5 si
+    # Si les params alpha et beta sont égaux et low=0 et high=1
+    def suggest_beta(self, param_name, low=0, high=1, alpha=2.0, beta_param=2.0):
+        # Sample a value from the beta distribution
+        value = beta.rvs(alpha, beta_param)
+        # Scale the value to the desired range [low, high]
+        scaled_value = low + (high - low) * value
+        return scaled_value
 
-# Créer une métrique personnalisée à partir de la fonction de perte
-# custom_f1 = make_scorer(weight_f1, greater_is_better=True)
 
 """
 La fonction _objectif est appelée une fois pour chaque essai (trial).

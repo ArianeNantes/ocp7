@@ -1,8 +1,3 @@
-import pandas as pd
-import numpy as np
-from IPython.display import display
-
-
 # URL de téléchargement des données
 DATA_URL = "https://s3-eu-west-1.amazonaws.com/static.oc-static.com/prod/courses/files/Parcours_data_scientist/Projet+-+Impl%C3%A9menter+un+mod%C3%A8le+de+scoring/Projet+Mise+en+prod+-+home-credit-default-risk.zip"
 
@@ -18,10 +13,6 @@ DATA_INTERIM = "data/interim/"
 DATA_CLEAN_DIR = "data/cleaned/"
 
 MODEL_DIR = "models/"
-
-LOCAL_URI = "http://127.0.0.1:8080"
-LOCAL_HOST = "http://127.0.0.1"
-LOCAL_PORT = "8080"
 
 # Style et palette de base SNS pour les plots
 STYLE = "whitegrid"  # Style de base pour graphiques sns
@@ -39,3 +30,6 @@ NUM_FOLDS = 10
 # NUM_FOLDS = 5
 EARLY_STOPPING = 100
 # EARLY_STOPPING = 50
+
+# Taille max du df X pour une réelle parallélisation des threads (optuna)
+MAX_SIZE_PARA = 640
