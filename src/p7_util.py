@@ -4,6 +4,7 @@ import gc
 
 # import random
 import numpy as np
+import pandas as pd
 
 # import os
 # import torch
@@ -92,3 +93,9 @@ def clean_ram(list_vars, dic_vars):
     gc.collect()
     print(f"{len(vars_to_del)} variables détruites : {vars_to_del}")
     return
+
+
+def print_dtype_with_mixt(df):
+    # Imprime les types de données d'un DataFrame même s'il s'agit d'un type de données mixte
+    for column in df.columns:
+        print(column, ":", pd.api.types.infer_dtype(df[column]))
