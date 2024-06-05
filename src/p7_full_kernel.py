@@ -21,6 +21,10 @@ import os
 import gc
 import numpy as np
 import pandas as pd
+import cudf
+import cuml
+from cuml.preprocessing import SimpleImputer as CuSimpleImputer
+import cupy as cp
 import re
 
 import multiprocessing as mp
@@ -36,10 +40,12 @@ import seaborn as sns
 import warnings
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", r"All-NaN (slice|axis) encountered")
 
 from src.p7_constantes import (
     NUM_THREADS,
     DATA_BASE,
+    DATA_INTERIM,
     GENERATE_SUBMISSION_FILES,
     STRATIFIED_KFOLD,
     RANDOM_SEED,
@@ -50,6 +56,7 @@ from src.p7_constantes import (
 from src.p7_util import timer
 
 SUBMISSION_SUFIX = "_full_04"
+
 
 # ------------------------- CONFIGURATIONS -------------------------
 
@@ -338,6 +345,899 @@ LIGHTGBM_PARAMS_FULL = {
         main(debug=True)"""
 
 
+class DataFull:
+    def __init__(self, dataset_num="00", debug=False, add_trends=False) -> None:
+        self.dataset_num = dataset_num
+        self.debug = debug
+        self.n_rows = 30_000 if self.debug else None
+        self.add_trends = add_trends
+        self.input_dir = DATA_BASE
+        self.output_dir = DATA_INTERIM
+        if not os.path.exists(self.output_dir):
+            os.mkdir(self.output_dir)
+
+        # Features à encoder en label encoding
+        self.features_label_encoding = []
+        # Features encodées en One_Hot
+        self.features_oh_encoded = []
+        # liste des features provenant de la premère modalité des variables encodées OH
+        self.first_categories = []
+        # Si kernel_useless est vrai on supprime les features jugées inutiles dans le kernel initial
+        self.kernel_useless = False
+
+    def get_data(self):
+        if self.debug:
+            print(f"DEBUG num_rows={self.n_rows}")
+        with timer("Application Data"):
+            df = self.get_application()
+            print("Application dataframe shape: ", df.shape)
+        with timer("Bureau and bureau_balance data"):
+            bureau_df = self.get_bureau()
+            df = cudf.merge(df, bureau_df, on="SK_ID_CURR", how="left")
+            print("Bureau dataframe shape: ", bureau_df.shape)
+            del bureau_df
+            gc.collect()
+        with timer("previous_application"):
+            prev_df = self.get_previous_applications()
+            df = cudf.merge(df, prev_df, on="SK_ID_CURR", how="left")
+            print("Previous dataframe shape: ", prev_df.shape)
+            del prev_df
+            gc.collect()
+        with timer("Previous applications balances"):
+            pos = self.get_pos_cash()
+            df = cudf.merge(df, pos, on="SK_ID_CURR", how="left")
+            print("Pos-cash dataframe shape: ", pos.shape)
+            del pos
+            gc.collect()
+        with timer("Installments payments"):
+            ins = self.get_installment_payments()
+            df = cudf.merge(df, ins, on="SK_ID_CURR", how="left")
+            print("Installments dataframe shape: ", ins.shape)
+            del ins
+            gc.collect()
+        with timer("Credit card"):
+            cc = self.get_credit_card()
+            df = cudf.merge(df, cc, on="SK_ID_CURR", how="left")
+            print("Credit card dataframe shape: ", cc.shape)
+            del cc
+            gc.collect()
+        with timer("Add ratios"):
+            # Add ratios and groupby between different tables
+            df = add_ratios_features(df)
+        print("All data shape :", df.shape)
+
+        print("\nTraitement des valeurs inf")
+        df = self.inf_to_nan(df)
+        print("Suppression des colonnes de variance nulle")
+        df = self.del_null_std(df)
+        print("Suppression d'une modalité pour les colonnes encodées en One Hot")
+        df = self.drop_first_categories(df)
+        df = df.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
+        print("all_data.info :")
+        print(df.info())
+        with timer("Sauvegarde"):
+            self.save_all_data(df)
+        return df
+
+    # ------------------------- APPLICATION PIPELINE -------------------------
+
+    def get_application(self):
+        """Process application_train.csv and application_test.csv and return a pandas dataframe."""
+        df = cudf.read_csv(
+            os.path.join(self.input_dir, "application_train.csv"), nrows=self.n_rows
+        )
+        # Data cleaning
+        df = df[df["CODE_GENDER"] != "XNA"]  # 4 people with XNA code gender
+        df = df[
+            df["AMT_INCOME_TOTAL"] < 20000000
+        ]  # Max income in test is 4M; train has a 117M value
+        # Contraitrement à Pandas, l'introduction de cudf.NA dans une colonne ne modifiera pas le type de la colonne
+        df["DAYS_EMPLOYED"] = df["DAYS_EMPLOYED"].replace(365243, cudf.NA)
+        df["DAYS_EMPLOYED"] = df["DAYS_EMPLOYED"].replace(0, cudf.NA)
+        df["DAYS_LAST_PHONE_CHANGE"] = df["DAYS_LAST_PHONE_CHANGE"].replace(0, cudf.NA)
+
+        # Flag_document features - count and kurtosis
+        docs = [f for f in df.columns if "FLAG_DOC" in f]
+        df["DOCUMENT_COUNT"] = df[docs].sum(axis=1)
+        # df["NEW_DOC_KURT"] = df[docs].kurtosis(axis=1)
+
+        # Categorical age - based on target=1 plot
+        # df["AGE_RANGE"] = df["DAYS_BIRTH"].apply(lambda x: get_age_label(x))
+
+        # Les cuDF ne supportent pas l'opération .apply, à la place on utilise des opérations vectorisées
+        age_years = -df["DAYS_BIRTH"] / 365
+        df["AGE_RANGE"] = (
+            (age_years < 27).astype(int) * 1
+            + ((age_years >= 27) & (age_years < 40)).astype(int) * 2
+            + ((age_years >= 40) & (age_years < 50)).astype(int) * 3
+            + ((age_years >= 50) & (age_years < 65)).astype(int) * 4
+            + ((age_years >= 65) & (age_years < 99)).astype(int) * 5
+            + (age_years >= 99).astype(int) * 0
+        )
+
+        # New features based on External sources
+        df["EXT_SOURCES_PROD"] = (
+            df["EXT_SOURCE_1"] * df["EXT_SOURCE_2"] * df["EXT_SOURCE_3"]
+        )
+        df["EXT_SOURCES_WEIGHTED"] = (
+            df.EXT_SOURCE_1 * 2 + df.EXT_SOURCE_2 * 1 + df.EXT_SOURCE_3 * 3
+        )
+        # np.seterr(all="ignore", invalid="ignore")
+
+        # nanmedian non implémentée en cudf
+        # for function_name in ["min", "max", "mean", "nanmedian", "var"]
+        for function_name in ["min", "max", "mean", "var"]:
+            feature_name = "EXT_SOURCES_{}".format(function_name.upper())
+            df[feature_name] = eval("np.{}".format(function_name))(
+                df[["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]], axis=1
+            )
+
+        # Credit ratios
+        df["CREDIT_TO_ANNUITY_RATIO"] = df["AMT_CREDIT"] / df["AMT_ANNUITY"]
+        df["CREDIT_TO_GOODS_RATIO"] = df["AMT_CREDIT"] / df["AMT_GOODS_PRICE"]
+        # Income ratios
+        df["ANNUITY_TO_INCOME_RATIO"] = df["AMT_ANNUITY"] / df["AMT_INCOME_TOTAL"]
+        df["CREDIT_TO_INCOME_RATIO"] = df["AMT_CREDIT"] / df["AMT_INCOME_TOTAL"]
+        df["INCOME_TO_EMPLOYED_RATIO"] = df["AMT_INCOME_TOTAL"] / df["DAYS_EMPLOYED"]
+        df["INCOME_TO_BIRTH_RATIO"] = df["AMT_INCOME_TOTAL"] / df["DAYS_BIRTH"]
+        # Time ratios
+        df["EMPLOYED_TO_BIRTH_RATIO"] = df["DAYS_EMPLOYED"] / df["DAYS_BIRTH"]
+        df["ID_TO_BIRTH_RATIO"] = df["DAYS_ID_PUBLISH"] / df["DAYS_BIRTH"]
+        df["CAR_TO_BIRTH_RATIO"] = df["OWN_CAR_AGE"] / df["DAYS_BIRTH"]
+        df["CAR_TO_EMPLOYED_RATIO"] = df["OWN_CAR_AGE"] / df["DAYS_EMPLOYED"]
+        df["PHONE_TO_BIRTH_RATIO"] = df["DAYS_LAST_PHONE_CHANGE"] / df["DAYS_BIRTH"]
+
+        # Groupby: Statistics for applications in the same group
+        group = [
+            "ORGANIZATION_TYPE",
+            "NAME_EDUCATION_TYPE",
+            "OCCUPATION_TYPE",
+            "AGE_RANGE",
+            "CODE_GENDER",
+        ]
+        df = do_median(df, group, "EXT_SOURCES_MEAN", "GROUP_EXT_SOURCES_MEDIAN")
+        df = do_std(df, group, "EXT_SOURCES_MEAN", "GROUP_EXT_SOURCES_STD")
+        df = do_mean(df, group, "AMT_INCOME_TOTAL", "GROUP_INCOME_MEAN")
+        df = do_std(df, group, "AMT_INCOME_TOTAL", "GROUP_INCOME_STD")
+        df = do_mean(
+            df, group, "CREDIT_TO_ANNUITY_RATIO", "GROUP_CREDIT_TO_ANNUITY_MEAN"
+        )
+        df = do_std(df, group, "CREDIT_TO_ANNUITY_RATIO", "GROUP_CREDIT_TO_ANNUITY_STD")
+        df = do_mean(df, group, "AMT_CREDIT", "GROUP_CREDIT_MEAN")
+        df = do_mean(df, group, "AMT_ANNUITY", "GROUP_ANNUITY_MEAN")
+        df = do_std(df, group, "AMT_ANNUITY", "GROUP_ANNUITY_STD")
+
+        """# Encode categorical features (LabelEncoder)
+        df, le_encoded_cols = label_encoder(df, None)"""
+        if self.kernel_useless:
+            # On drop avant d'encoder
+            df = drop_application_columns(df)
+
+        categorical_columns = df.select_dtypes(include="object").columns.tolist()
+        # On encode les features spécifiées en label_encoding et toutes les autres en One Hot
+        to_oh_encode = categorical_columns
+        if self.features_label_encoding:
+            df, le_encoded_cols = label_encoder(
+                df, categorical_columns=self.features_label_encoding
+            )
+            to_oh_encode = [
+                col
+                for col in categorical_columns
+                if col not in self.features_label_encoding
+            ]
+        df, _ = self.one_hot_encoder(df, categorical_columns=to_oh_encode)
+
+        # 'AMT_ANNUITY' existe dans plusieurs tables, on la renomme en préfixant par le début du nom de la table
+        df.rename(
+            columns={
+                "AMT_ANNUITY": "APP_AMT_ANNUITY",
+                "CREDIT_TO_ANNUITY_RATIO": "APP_CREDIT_TO_ANNUITY_RATIO",
+            },
+            inplace=True,
+        )
+        return df
+
+    # ------------------------- BUREAU PIPELINE -------------------------
+
+    def get_bureau(self):
+        """Process bureau.csv and bureau_balance.csv and return a pandas dataframe."""
+        bureau = cudf.read_csv(
+            os.path.join(self.input_dir, "bureau.csv"), nrows=self.n_rows
+        )
+        # Credit duration and credit/account end date difference
+        bureau["CREDIT_DURATION"] = (
+            -bureau["DAYS_CREDIT"] + bureau["DAYS_CREDIT_ENDDATE"]
+        )
+        bureau["ENDDATE_DIF"] = (
+            bureau["DAYS_CREDIT_ENDDATE"] - bureau["DAYS_ENDDATE_FACT"]
+        )
+        # Credit to debt ratio and difference
+        bureau["DEBT_PERCENTAGE"] = (
+            bureau["AMT_CREDIT_SUM"] / bureau["AMT_CREDIT_SUM_DEBT"]
+        )
+        bureau["DEBT_CREDIT_DIFF"] = (
+            bureau["AMT_CREDIT_SUM"] - bureau["AMT_CREDIT_SUM_DEBT"]
+        )
+        bureau["CREDIT_TO_ANNUITY_RATIO"] = (
+            bureau["AMT_CREDIT_SUM"] / bureau["AMT_ANNUITY"]
+        )
+
+        # One-hot encoder
+        bureau, _ = self.one_hot_encoder(bureau, nan_as_category=False)
+        # Join bureau balance features
+        bureau = bureau.merge(self.get_bureau_balance(), how="left", on="SK_ID_BUREAU")
+        # Flag months with late payments (days past due)
+        bureau["STATUS_12345"] = 0
+        for i in range(1, 6):
+            bureau["STATUS_12345"] += bureau["STATUS_{}".format(i)]
+
+        # Aggregate by number of months in balance and merge with bureau (loan length agg)
+        features = [
+            "AMT_CREDIT_MAX_OVERDUE",
+            "AMT_CREDIT_SUM_OVERDUE",
+            "AMT_CREDIT_SUM",
+            "AMT_CREDIT_SUM_DEBT",
+            "DEBT_PERCENTAGE",
+            "DEBT_CREDIT_DIFF",
+            "STATUS_0",
+            "STATUS_12345",
+        ]
+        agg_length = (
+            bureau.groupby("MONTHS_BALANCE_SIZE")[features].mean().reset_index()
+        )
+        agg_length.rename(
+            {feat: "LL_" + feat for feat in features}, axis=1, inplace=True
+        )
+        bureau = bureau.merge(agg_length, how="left", on="MONTHS_BALANCE_SIZE")
+        del agg_length
+        gc.collect()
+
+        # General loans aggregations
+        agg_bureau = group(bureau, "BUREAU_", BUREAU_AGG)
+        # Active and closed loans aggregations
+        active = bureau[bureau["CREDIT_ACTIVE_Active"] == 1]
+        agg_bureau = group_and_merge(
+            active, agg_bureau, "BUREAU_ACTIVE_", BUREAU_ACTIVE_AGG
+        )
+        closed = bureau[bureau["CREDIT_ACTIVE_Closed"] == 1]
+        agg_bureau = group_and_merge(
+            closed, agg_bureau, "BUREAU_CLOSED_", BUREAU_CLOSED_AGG
+        )
+        del active, closed
+        gc.collect()
+        # Aggregations for the main loan types
+        for credit_type in [
+            "Consumer credit",
+            "Credit card",
+            "Mortgage",
+            "Car loan",
+            "Microloan",
+        ]:
+            type_df = bureau[bureau["CREDIT_TYPE_" + credit_type] == 1]
+            prefix = "BUREAU_" + credit_type.split(" ")[0].upper() + "_"
+            agg_bureau = group_and_merge(
+                type_df, agg_bureau, prefix, BUREAU_LOAN_TYPE_AGG
+            )
+            del type_df
+            gc.collect()
+        # Time based aggregations: last x months
+        for time_frame in [6, 12]:
+            prefix = "BUREAU_LAST{}M_".format(time_frame)
+            time_frame_df = bureau[bureau["DAYS_CREDIT"] >= -30 * time_frame]
+            agg_bureau = group_and_merge(
+                time_frame_df, agg_bureau, prefix, BUREAU_TIME_AGG
+            )
+            del time_frame_df
+            gc.collect()
+
+        # Last loan max overdue
+        sort_bureau = bureau.sort_values(by=["DAYS_CREDIT"])
+
+        # cudf ne support pas last, on utilise la méthode nth qui permet de retourner la nième ligne de chaque groupe
+        gr = sort_bureau.groupby("SK_ID_CURR").nth(-1).reset_index()
+        # gr = (
+        #    sort_bureau.groupby("SK_ID_CURR")["AMT_CREDIT_MAX_OVERDUE"].last().reset_index()
+        # )
+        gr = gr.rename(
+            columns={"AMT_CREDIT_MAX_OVERDUE": "BUREAU_LAST_LOAN_MAX_OVERDUE"}
+        )
+
+        agg_bureau = agg_bureau.merge(gr, on="SK_ID_CURR", how="left")
+        # agg_bureau = cudf.merge(agg_bureau, gr, on="SK_ID_CURR", how="left")
+        # Ratios: total debt/total credit and active loans debt/ active loans credit
+        agg_bureau["BUREAU_DEBT_OVER_CREDIT"] = (
+            agg_bureau["BUREAU_AMT_CREDIT_SUM_DEBT_SUM"]
+            / agg_bureau["BUREAU_AMT_CREDIT_SUM_SUM"]
+        )
+        agg_bureau["BUREAU_ACTIVE_DEBT_OVER_CREDIT"] = (
+            agg_bureau["BUREAU_ACTIVE_AMT_CREDIT_SUM_DEBT_SUM"]
+            / agg_bureau["BUREAU_ACTIVE_AMT_CREDIT_SUM_SUM"]
+        )
+        # 'AMT_ANNUITY' existe dans plusieurs tables, on la renomme en préfixant par le début du nom de la table
+        if "AMT_ANNUITY" in agg_bureau:
+            agg_bureau.rename(columns={"AMT_ANNUITY": "BUR_AMT_ANNUITY"}, inplace=True)
+        if "CREDIT_TO_ANNUITY_RATIO" in agg_bureau:
+            agg_bureau.rename(
+                columns={"CREDIT_TO_ANNUITY_RATIO": "BUR_CREDIT_TO_ANNUITY_RATIO"},
+                inplace=True,
+            )
+        return agg_bureau
+
+    def get_bureau_balance(self):
+        bb = cudf.read_csv(
+            os.path.join(self.input_dir, "bureau_balance.csv"), nrows=self.n_rows
+        )
+        bb, categorical_cols = self.one_hot_encoder(bb, nan_as_category=False)
+        # Calculate rate for each category with decay
+        bb_processed = bb.groupby("SK_ID_BUREAU")[categorical_cols].mean().reset_index()
+        # Min, Max, Count and mean duration of payments (months)
+        agg = {"MONTHS_BALANCE": ["min", "max", "mean", "size"]}
+        bb_processed = group_and_merge(bb, bb_processed, "", agg, "SK_ID_BUREAU")
+        del bb
+        gc.collect()
+        return bb_processed
+
+    # ------------------------- PREVIOUS PIPELINE -------------------------
+
+    def get_previous_applications(self):
+        """Process previous_application.csv and return a pandas dataframe."""
+        prev = cudf.read_csv(
+            os.path.join(self.input_dir, "previous_application.csv"), nrows=self.n_rows
+        )
+        pay = cudf.read_csv(
+            os.path.join(self.input_dir, "installments_payments.csv"), nrows=self.n_rows
+        )
+
+        # One-hot encode most important categorical features
+        ohe_columns = [
+            "NAME_CONTRACT_STATUS",
+            "NAME_CONTRACT_TYPE",
+            "CHANNEL_TYPE",
+            "NAME_TYPE_SUITE",
+            "NAME_YIELD_GROUP",
+            "PRODUCT_COMBINATION",
+            "NAME_PRODUCT_TYPE",
+            "NAME_CLIENT_TYPE",
+        ]
+        prev, categorical_cols = self.one_hot_encoder(
+            prev, ohe_columns, nan_as_category=False
+        )
+
+        # Feature engineering: ratios and difference
+        prev["APPLICATION_CREDIT_DIFF"] = prev["AMT_APPLICATION"] - prev["AMT_CREDIT"]
+        prev["APPLICATION_CREDIT_RATIO"] = prev["AMT_APPLICATION"] / prev["AMT_CREDIT"]
+        prev["CREDIT_TO_ANNUITY_RATIO"] = prev["AMT_CREDIT"] / prev["AMT_ANNUITY"]
+        prev["DOWN_PAYMENT_TO_CREDIT"] = prev["AMT_DOWN_PAYMENT"] / prev["AMT_CREDIT"]
+        # Interest ratio on previous application (simplified)
+        total_payment = prev["AMT_ANNUITY"] * prev["CNT_PAYMENT"]
+        prev["SIMPLE_INTERESTS"] = (total_payment / prev["AMT_CREDIT"] - 1) / prev[
+            "CNT_PAYMENT"
+        ]
+
+        # Active loans - approved and not complete yet (last_due 365243)
+        approved = prev[prev["NAME_CONTRACT_STATUS_Approved"] == 1]
+        active_df = approved[approved["DAYS_LAST_DUE"] == 365243]
+        # Find how much was already payed in active loans (using installments csv)
+        active_pay = pay[pay["SK_ID_PREV"].isin(active_df["SK_ID_PREV"])]
+        active_pay_agg = active_pay.groupby("SK_ID_PREV")[
+            ["AMT_INSTALMENT", "AMT_PAYMENT"]
+        ].sum()
+        active_pay_agg.reset_index(inplace=True)
+        # Active loans: difference of what was payed and installments
+        active_pay_agg["INSTALMENT_PAYMENT_DIFF"] = (
+            active_pay_agg["AMT_INSTALMENT"] - active_pay_agg["AMT_PAYMENT"]
+        )
+        # Merge with active_df
+        active_df = active_df.merge(active_pay_agg, on="SK_ID_PREV", how="left")
+        active_df["REMAINING_DEBT"] = active_df["AMT_CREDIT"] - active_df["AMT_PAYMENT"]
+        active_df["REPAYMENT_RATIO"] = (
+            active_df["AMT_PAYMENT"] / active_df["AMT_CREDIT"]
+        )
+        # Perform aggregations for active applications
+        active_agg_df = group(active_df, "PREV_ACTIVE_", PREVIOUS_ACTIVE_AGG)
+        active_agg_df["TOTAL_REPAYMENT_RATIO"] = (
+            active_agg_df["PREV_ACTIVE_AMT_PAYMENT_SUM"]
+            / active_agg_df["PREV_ACTIVE_AMT_CREDIT_SUM"]
+        )
+        del active_pay, active_pay_agg, active_df
+        gc.collect()
+
+        # Change 365.243 values to nan (missing)
+        prev["DAYS_FIRST_DRAWING"].replace(365243, cudf.NA, inplace=True)
+        prev["DAYS_FIRST_DUE"].replace(365243, cudf.NA, inplace=True)
+        prev["DAYS_LAST_DUE_1ST_VERSION"].replace(365243, cudf.NA, inplace=True)
+        prev["DAYS_LAST_DUE"].replace(365243, cudf.NA, inplace=True)
+        prev["DAYS_TERMINATION"].replace(365243, cudf.NA, inplace=True)
+        # Days last due difference (scheduled x done)
+        prev["DAYS_LAST_DUE_DIFF"] = (
+            prev["DAYS_LAST_DUE_1ST_VERSION"] - prev["DAYS_LAST_DUE"]
+        )
+        approved["DAYS_LAST_DUE_DIFF"] = (
+            approved["DAYS_LAST_DUE_1ST_VERSION"] - approved["DAYS_LAST_DUE"]
+        )
+
+        # Categorical features
+        categorical_agg = {key: ["mean"] for key in categorical_cols}
+        # Perform general aggregations
+        agg_prev = group(prev, "PREV_", {**PREVIOUS_AGG, **categorical_agg})
+        # Merge active loans dataframe on agg_prev
+        agg_prev = agg_prev.merge(active_agg_df, how="left", on="SK_ID_CURR")
+        del active_agg_df
+        gc.collect()
+        # Aggregations for approved and refused loans
+        agg_prev = group_and_merge(
+            approved, agg_prev, "APPROVED_", PREVIOUS_APPROVED_AGG
+        )
+        refused = prev[prev["NAME_CONTRACT_STATUS_Refused"] == 1]
+        agg_prev = group_and_merge(refused, agg_prev, "REFUSED_", PREVIOUS_REFUSED_AGG)
+        del approved, refused
+        gc.collect()
+        # Aggregations for Consumer loans and Cash loans
+        for loan_type in ["Consumer loans", "Cash loans"]:
+            type_df = prev[prev["NAME_CONTRACT_TYPE_{}".format(loan_type)] == 1]
+            prefix = "PREV_" + loan_type.split(" ")[0] + "_"
+            agg_prev = group_and_merge(
+                type_df, agg_prev, prefix, PREVIOUS_LOAN_TYPE_AGG
+            )
+            del type_df
+            gc.collect()
+
+        # Get the SK_ID_PREV for loans with late payments (days past due)
+        pay["LATE_PAYMENT"] = pay["DAYS_ENTRY_PAYMENT"] - pay["DAYS_INSTALMENT"]
+
+        pay["LATE_PAYMENT"] = (pay["LATE_PAYMENT"] > 0).astype(int) * 1 + (
+            pay["LATE_PAYMENT"] < 0
+        ).astype(int) * 0
+
+        # pay["LATE_PAYMENT"] = pay["LATE_PAYMENT"].apply(lambda x: 1 if x > 0 else 0)
+        dpd_id = pay[pay["LATE_PAYMENT"] > 0]["SK_ID_PREV"].unique()
+        # Aggregations for loans with late payments
+        agg_dpd = group_and_merge(
+            prev[prev["SK_ID_PREV"].isin(dpd_id)],
+            agg_prev,
+            "PREV_LATE_",
+            PREVIOUS_LATE_PAYMENTS_AGG,
+        )
+        del agg_dpd, dpd_id
+        gc.collect()
+        # Aggregations for loans in the last x months
+        for time_frame in [12, 24]:
+            time_frame_df = prev[prev["DAYS_DECISION"] >= -30 * time_frame]
+            prefix = "PREV_LAST{}M_".format(time_frame)
+            agg_prev = group_and_merge(
+                time_frame_df, agg_prev, prefix, PREVIOUS_TIME_AGG
+            )
+            del time_frame_df
+            gc.collect()
+        del prev
+        gc.collect()
+        # 'AMT_ANNUITY' existe dans plusieurs tables, on la renomme en préfixant par le début du nom de la table
+        if "AMT_ANNUITY" in agg_prev:
+            agg_prev.rename(columns={"AMT_ANNUITY": "PREV_AMT_ANNUITY"}, inplace=True)
+        if "CREDIT_TO_ANNUITY_RATIO" in agg_prev:
+            agg_prev.rename(
+                columns={"CREDIT_TO_ANNUITY_RATIO": "PREV_CREDIT_TO_ANNUITY_RATIO"},
+                inplace=True,
+            )
+        return agg_prev
+
+    # ------------------------- POS-CASH PIPELINE -------------------------
+    """def get_pos_cash(self):
+        #Process POS_CASH_balance.csv and return a pandas dataframe.
+        pos = cudf.read_csv(
+            os.path.join(self.input_dir, "POS_CASH_balance.csv"), nrows=self.n_rows
+        )
+        pos, categorical_cols = self.one_hot_encoder(pos, nan_as_category=False)
+        # Flag months with late payment
+        pos["LATE_PAYMENT"] = (pos["SK_DPD"] > 0).astype(int) * 1 + (
+            pos["SK_DPD"] < 0
+        ).astype(int) * 0
+        # pos["LATE_PAYMENT"] = pos["SK_DPD"].apply(lambda x: 1 if x > 0 else 0)
+
+        # Aggregate by SK_ID_CURR
+        categorical_agg = {key: ["mean"] for key in categorical_cols}
+        pos_agg = group(pos, "POS_", {**POS_CASH_AGG, **categorical_agg})
+        # Sort and group by SK_ID_PREV
+        sort_pos = pos.sort_values(by=["SK_ID_PREV", "MONTHS_BALANCE"])
+        gp = sort_pos.groupby("SK_ID_PREV")
+
+        df = pd.DataFrame()
+        df["SK_ID_CURR"] = gp["SK_ID_CURR"].first()
+
+        df["MONTHS_BALANCE_MAX"] = gp["MONTHS_BALANCE"].max()
+        # Percentage of previous loans completed and completed before initial term
+        df["POS_LOAN_COMPLETED_MEAN"] = gp["NAME_CONTRACT_STATUS_Completed"].mean()
+        df["POS_COMPLETED_BEFORE_MEAN"] = (
+            gp["CNT_INSTALMENT"].first() - gp["CNT_INSTALMENT"].last()
+        )
+        df["POS_COMPLETED_BEFORE_MEAN"] = df.apply(
+            lambda x: (
+                1
+                if x["POS_COMPLETED_BEFORE_MEAN"] > 0
+                and x["POS_LOAN_COMPLETED_MEAN"] > 0
+                else 0
+            ),
+            axis=1,
+        )
+        # Number of remaining installments (future installments) and percentage from total
+        df["POS_REMAINING_INSTALMENTS"] = gp["CNT_INSTALMENT_FUTURE"].last()
+        df["POS_REMAINING_INSTALMENTS_RATIO"] = (
+            gp["CNT_INSTALMENT_FUTURE"].last() / gp["CNT_INSTALMENT"].last()
+        )
+        # Group by SK_ID_CURR and merge
+        df_gp = df.groupby("SK_ID_CURR").sum().reset_index()
+        df_gp.drop(["MONTHS_BALANCE_MAX"], axis=1, inplace=True)
+        pos_agg = pd.merge(pos_agg, df_gp, on="SK_ID_CURR", how="left")
+        del df, gp, df_gp, sort_pos
+        gc.collect()
+
+        # Percentage of late payments for the 3 most recent applications
+        pos = do_sum(pos, ["SK_ID_PREV"], "LATE_PAYMENT", "LATE_PAYMENT_SUM")
+        # Last month of each application
+        last_month_df = pos.groupby("SK_ID_PREV")["MONTHS_BALANCE"].idxmax()
+        # Most recent applications (last 3)
+        sort_pos = pos.sort_values(by=["SK_ID_PREV", "MONTHS_BALANCE"])
+        gp = sort_pos.iloc[last_month_df].groupby("SK_ID_CURR").tail(3)
+        gp_mean = gp.groupby("SK_ID_CURR").mean().reset_index()
+        pos_agg = pd.merge(
+            pos_agg,
+            gp_mean[["SK_ID_CURR", "LATE_PAYMENT_SUM"]],
+            on="SK_ID_CURR",
+            how="left",
+        )
+
+        # print("Colonnes de pos_agg", pos_agg.columns)
+
+        # kernel_useless spécifie s'il faut supprimer les features jugées inutiles dans le kernel d'origine
+        if self.kernel_useless:
+            drop_features = [
+                "POS_NAME_CONTRACT_STATUS_Canceled_MEAN",
+                "POS_NAME_CONTRACT_STATUS_Amortized debt_MEAN",
+                "POS_NAME_CONTRACT_STATUS_XNA_MEAN",
+            ]
+            # pos_agg.drop(drop_features, axis=1, inplace=True)
+            # Pour pouvoir l'exécuter en mode debug, on check si les colonnes sont présentes
+            # car elles sont issues d'un onehot
+            drop_features = [
+                feature for feature in drop_features if feature in pos_agg.columns
+            ]
+            if drop_features:
+                pos_agg.drop(drop_features, axis=1, inplace=True)
+
+        return cudf.from_pandas(pos_agg)"""
+
+    # [TODO] si le temps : passer en cuDF
+    def get_pos_cash(self):
+        # Process POS_CASH_balance.csv and return a pandas dataframe.
+        pos = pd.read_csv(
+            os.path.join(self.input_dir, "POS_CASH_balance.csv"), nrows=self.n_rows
+        )
+        pos, categorical_cols = self.one_hot_encoder(pos, nan_as_category=False)
+        # Flag months with late payment
+        pos["LATE_PAYMENT"] = pos["SK_DPD"].apply(lambda x: 1 if x > 0 else 0)
+
+        # pos["LATE_PAYMENT"] = (pos["LATE_PAYMENT"] > 0).astype(int) * 1 + (
+        #    pos["LATE_PAYMENT"] < 0
+        # ).astype(int) * 0
+
+        # Aggregate by SK_ID_CURR
+        categorical_agg = {key: ["mean"] for key in categorical_cols}
+        pos_agg = group(pos, "POS_", {**POS_CASH_AGG, **categorical_agg})
+        # Sort and group by SK_ID_PREV
+        sort_pos = pos.sort_values(by=["SK_ID_PREV", "MONTHS_BALANCE"])
+        gp = sort_pos.groupby("SK_ID_PREV")
+        df = pd.DataFrame()
+
+        df["SK_ID_CURR"] = gp["SK_ID_CURR"].first()
+
+        df["MONTHS_BALANCE_MAX"] = gp["MONTHS_BALANCE"].max()
+        # Percentage of previous loans completed and completed before initial term
+        df["POS_LOAN_COMPLETED_MEAN"] = gp["NAME_CONTRACT_STATUS_Completed"].mean()
+        df["POS_COMPLETED_BEFORE_MEAN"] = (
+            gp["CNT_INSTALMENT"].first() - gp["CNT_INSTALMENT"].last()
+        )
+        df["POS_COMPLETED_BEFORE_MEAN"] = df.apply(
+            lambda x: (
+                1
+                if x["POS_COMPLETED_BEFORE_MEAN"] > 0
+                and x["POS_LOAN_COMPLETED_MEAN"] > 0
+                else 0
+            ),
+            axis=1,
+        )
+        # Number of remaining installments (future installments) and percentage from total
+        df["POS_REMAINING_INSTALMENTS"] = gp["CNT_INSTALMENT_FUTURE"].last()
+        df["POS_REMAINING_INSTALMENTS_RATIO"] = (
+            gp["CNT_INSTALMENT_FUTURE"].last() / gp["CNT_INSTALMENT"].last()
+        )
+        # Group by SK_ID_CURR and merge
+        df_gp = df.groupby("SK_ID_CURR").sum().reset_index()
+        df_gp.drop(["MONTHS_BALANCE_MAX"], axis=1, inplace=True)
+        pos_agg = pd.merge(pos_agg, df_gp, on="SK_ID_CURR", how="left")
+        del df, gp, df_gp, sort_pos
+        gc.collect()
+
+        # Percentage of late payments for the 3 most recent applications
+        pos = do_sum(pos, ["SK_ID_PREV"], "LATE_PAYMENT", "LATE_PAYMENT_SUM")
+        # Last month of each application
+        last_month_df = pos.groupby("SK_ID_PREV")["MONTHS_BALANCE"].idxmax()
+        # Most recent applications (last 3)
+        sort_pos = pos.sort_values(by=["SK_ID_PREV", "MONTHS_BALANCE"])
+        gp = sort_pos.iloc[last_month_df].groupby("SK_ID_CURR").tail(3)
+        gp_mean = gp.groupby("SK_ID_CURR").mean().reset_index()
+        pos_agg = pd.merge(
+            pos_agg,
+            gp_mean[["SK_ID_CURR", "LATE_PAYMENT_SUM"]],
+            on="SK_ID_CURR",
+            how="left",
+        )
+
+        # print("Colonnes de pos_agg", pos_agg.columns)
+
+        # kernel_useless spécifie s'il faut supprimer les features jugées inutiles dans le kernel d'origine
+        if self.kernel_useless:
+            drop_features = [
+                "POS_NAME_CONTRACT_STATUS_Canceled_MEAN",
+                "POS_NAME_CONTRACT_STATUS_Amortized debt_MEAN",
+                "POS_NAME_CONTRACT_STATUS_XNA_MEAN",
+            ]
+            # pos_agg.drop(drop_features, axis=1, inplace=True)
+            # Pour pouvoir l'exécuter en mode debug, on check si les colonnes sont présentes
+            # car elles sont issues d'un onehot
+            drop_features = [
+                feature for feature in drop_features if feature in pos_agg.columns
+            ]
+            if drop_features:
+                pos_agg.drop(drop_features, axis=1, inplace=True)
+
+        return cudf.from_pandas(pos_agg)
+
+    # ------------------------- INSTALLMENTS PIPELINE -------------------------
+
+    def get_installment_payments(self):
+        """Process installments_payments.csv and return a pandas dataframe."""
+        pay = pd.read_csv(
+            os.path.join(self.input_dir, "installments_payments.csv"), nrows=self.n_rows
+        )
+        # Group payments and get Payment difference
+        pay = do_sum(
+            pay,
+            ["SK_ID_PREV", "NUM_INSTALMENT_NUMBER"],
+            "AMT_PAYMENT",
+            "AMT_PAYMENT_GROUPED",
+        )
+        pay["PAYMENT_DIFFERENCE"] = pay["AMT_INSTALMENT"] - pay["AMT_PAYMENT_GROUPED"]
+        pay["PAYMENT_RATIO"] = pay["AMT_INSTALMENT"] / pay["AMT_PAYMENT_GROUPED"]
+        pay["PAID_OVER_AMOUNT"] = pay["AMT_PAYMENT"] - pay["AMT_INSTALMENT"]
+        pay["PAID_OVER"] = (pay["PAID_OVER_AMOUNT"] > 0).astype(int)
+        # Payment Entry: Days past due and Days before due
+        pay["DPD"] = pay["DAYS_ENTRY_PAYMENT"] - pay["DAYS_INSTALMENT"]
+        pay["DPD"] = pay["DPD"].apply(lambda x: 0 if x <= 0 else x)
+        pay["DBD"] = pay["DAYS_INSTALMENT"] - pay["DAYS_ENTRY_PAYMENT"]
+        pay["DBD"] = pay["DBD"].apply(lambda x: 0 if x <= 0 else x)
+        # Flag late payment
+        pay["LATE_PAYMENT"] = pay["DBD"].apply(lambda x: 1 if x > 0 else 0)
+        # Percentage of payments that were late
+        pay["INSTALMENT_PAYMENT_RATIO"] = pay["AMT_PAYMENT"] / pay["AMT_INSTALMENT"]
+        pay["LATE_PAYMENT_RATIO"] = pay.apply(
+            lambda x: x["INSTALMENT_PAYMENT_RATIO"] if x["LATE_PAYMENT"] == 1 else 0,
+            axis=1,
+        )
+        # Flag late payments that have a significant amount
+        pay["SIGNIFICANT_LATE_PAYMENT"] = pay["LATE_PAYMENT_RATIO"].apply(
+            lambda x: 1 if x > 0.05 else 0
+        )
+        # Flag k threshold late payments
+        pay["DPD_7"] = pay["DPD"].apply(lambda x: 1 if x >= 7 else 0)
+        pay["DPD_15"] = pay["DPD"].apply(lambda x: 1 if x >= 15 else 0)
+        # Aggregations by SK_ID_CURR
+        pay_agg = group(pay, "INS_", INSTALLMENTS_AGG)
+
+        # Installments in the last x months
+        for months in [36, 60]:
+            recent_prev_id = pay[pay["DAYS_INSTALMENT"] >= -30 * months][
+                "SK_ID_PREV"
+            ].unique()
+            pay_recent = pay[pay["SK_ID_PREV"].isin(recent_prev_id)]
+            prefix = "INS_{}M_".format(months)
+            pay_agg = group_and_merge(
+                pay_recent, pay_agg, prefix, INSTALLMENTS_TIME_AGG
+            )
+
+        # Le calcul des tendances est long (nécessite une régression par individu),
+        # On ne les calcule que si demandé
+        if self.add_trends:
+            # Last x periods trend features
+            group_features = [
+                "SK_ID_CURR",
+                "SK_ID_PREV",
+                "DPD",
+                "LATE_PAYMENT",
+                "PAID_OVER_AMOUNT",
+                "PAID_OVER",
+                "DAYS_INSTALMENT",
+            ]
+            gp = pay[group_features].groupby("SK_ID_CURR")
+            func = partial(
+                trend_in_last_k_instalment_features,
+                periods=INSTALLMENTS_LAST_K_TREND_PERIODS,
+            )
+            g = parallel_apply(
+                gp, func, index_name="SK_ID_CURR", chunk_size=10000
+            ).reset_index()
+            pay_agg = pay_agg.merge(g, on="SK_ID_CURR", how="left")
+
+            # Last loan features
+            g = parallel_apply(
+                gp,
+                installments_last_loan_features,
+                index_name="SK_ID_CURR",
+                chunk_size=10000,
+            ).reset_index()
+            pay_agg = pay_agg.merge(g, on="SK_ID_CURR", how="left")
+
+        return cudf.from_pandas(pay_agg)
+
+    # ------------------------- CREDIT CARD PIPELINE -------------------------
+
+    def get_credit_card(self):
+        """Process credit_card_balance.csv and return a pandas dataframe."""
+        cc = cudf.read_csv(
+            os.path.join(self.input_dir, "credit_card_balance.csv"), nrows=self.n_rows
+        )
+        cc, _ = self.one_hot_encoder(cc, nan_as_category=False)
+        cc.rename(columns={"AMT_RECIVABLE": "AMT_RECEIVABLE"}, inplace=True)
+        # Amount used from limit
+        cc["LIMIT_USE"] = cc["AMT_BALANCE"] / cc["AMT_CREDIT_LIMIT_ACTUAL"]
+        # Current payment / Min payment
+        cc["PAYMENT_DIV_MIN"] = (
+            cc["AMT_PAYMENT_CURRENT"] / cc["AMT_INST_MIN_REGULARITY"]
+        )
+        # Late payment
+        cc["LATE_PAYMENT"] = (cc["SK_DPD"] > 0).astype(int) * 1 + (
+            cc["SK_DPD"] < 0
+        ).astype(int) * 0
+        # cc["LATE_PAYMENT"] = cc["SK_DPD"].apply(lambda x: 1 if x > 0 else 0)
+
+        # How much drawing of limit
+        cc["DRAWING_LIMIT_RATIO"] = (
+            cc["AMT_DRAWINGS_ATM_CURRENT"] / cc["AMT_CREDIT_LIMIT_ACTUAL"]
+        )
+        # Aggregations by SK_ID_CURR
+        cc_agg = cc.groupby("SK_ID_CURR").agg(CREDIT_CARD_AGG)
+        cc_agg.columns = cudf.Index(
+            ["CC_" + e[0] + "_" + e[1].upper() for e in cc_agg.columns.tolist()]
+        )
+        cc_agg.reset_index(inplace=True)
+
+        # Last month balance of each credit card application
+        last_ids = cc.groupby("SK_ID_PREV")["MONTHS_BALANCE"].idxmax()
+        last_months_df = cc[cc.index.isin(last_ids)]
+        cc_agg = group_and_merge(
+            last_months_df, cc_agg, "CC_LAST_", {"AMT_BALANCE": ["mean", "max"]}
+        )
+
+        # Aggregations for last x months
+        for months in [12, 24, 48]:
+            cc_prev_id = cc[cc["MONTHS_BALANCE"] >= -months]["SK_ID_PREV"].unique()
+            cc_recent = cc[cc["SK_ID_PREV"].isin(cc_prev_id)]
+            prefix = "INS_{}M_".format(months)
+            cc_agg = group_and_merge(cc_recent, cc_agg, prefix, CREDIT_CARD_TIME_AGG)
+        return cc_agg
+
+    def inf_to_nan(self, df):
+        if not isinstance(df, (pd.DataFrame, pd.Series)):
+            # On convertit en Pandas
+            # Attention np.nan est un float64 (pd.NA tansformerait la colonne en dtype object)
+            X = df.to_pandas()
+            X = X.replace([np.inf, -np.inf], np.nan)
+            X = cudf.from_pandas(X)
+
+        else:
+            X = X.replace([np.inf, -np.inf], np.nan)
+        # Pour les cuDF on peut directement travailler les inf, mais à condition qu'il n'y ait pas d'inf de type int
+        # Contrairement à pandas, cudf.NA ne modifie pas le type de la colonne
+        # Provoque malheureusement une erreur : Potentially unsafe cast for non-equivalent float32 to int64
+        # X = df.replace([float("inf"), -float("inf")], np.nan)
+
+        return X
+
+    def del_null_std(self, df, verbose=True):
+        to_drop = []
+        # Avec un cuDF, nous devons différencier les types
+
+        # On calcule les variances null sur les types number :
+        std = df.select_dtypes(include=["number"]).std()
+        # Colonnes de type number avec un écart type de 0.0 (variance nulle)
+        to_drop = to_drop + std[std == 0.0].index.to_numpy().tolist()
+
+        # On identifie les colonnes de variance nulle pour les types bool ou object
+        # On ne considère pas la présence de types unshable comme les listes etc.
+        for col in df.select_dtypes(exclude="number").columns:
+            if df[col].nunique() == 1:
+                to_drop.append(col)
+
+        # On supprime les colonnes avec un écart type de 0.0
+        X = df.drop(to_drop, axis=1)
+
+        if verbose:
+            print(f"{len(to_drop)} features de variance nulle")
+        return X
+
+    def drop_first_categories(self, df, verbose=True):
+        to_drop = [
+            feature for feature in self.first_categories if feature in df.columns
+        ]
+        X = df.drop(to_drop, axis=1)
+        if verbose:
+            print(
+                f"{len(to_drop)} features issues des premières modalités des variables qualitatives encodées en One Hot"
+            )
+        return X
+
+    def one_hot_encoder(
+        self,
+        df,
+        categorical_columns=None,
+        nan_as_category=True,
+    ):
+        """Crée une nouvelle colonne pour chaque modalité des variables qualitatives,
+        Stocke le nom des colonnes encodées et le nom des colonnes correspondant à leur première modalité
+
+        Args:
+            df (pd.DataFrame ou cudf.DataFrame): DataFrame contenant des variables à encoder
+            categorical_columns (list ou index de colonne, optional): variables à encoder. Si None, toutes les variables de type 'object'. Defaults to None.
+            nan_as_category (bool, optional): Si vrai crèe une colonne pour les valeurs manquantes. Defaults to True.
+
+        Returns:
+            (DF ou cuDF, list): DataFrame avec les variables encodées et la liste des noms de colonnes encodées
+        """
+        original_columns = list(df.columns)
+        # Si categorical_columns n'est pas spécifié on encode toutes les variables de type object
+        if not categorical_columns:
+            categorical_columns = [
+                col for col in df.columns if df[col].dtype == "object"
+            ]
+        if categorical_columns:
+            # On encode et on stocke la première modalité des variables qualitatives.
+            # Nous ne pouvons pas la suprimer avant de faire les aggrégations mais
+            # il sera impératif de la supprimer pour les modèles linéaires.
+            first_categories = []
+            if isinstance(df, (pd.DataFrame, pd.Series)):
+                first_categories = [
+                    f"{col}_{np.unique(df[col].dropna())[0]}"
+                    for col in categorical_columns
+                ]
+
+                df = pd.get_dummies(
+                    df, columns=categorical_columns, dummy_na=nan_as_category
+                )
+
+            # Si df n'est pas pandas, on considère qu'il s'agit d'un cudf
+            else:
+                first_categories = [
+                    f"{col}_{np.unique(df[col]).to_numpy()[0]}"
+                    for col in categorical_columns
+                ]
+                df = cudf.get_dummies(
+                    df, columns=categorical_columns, dummy_na=nan_as_category
+                )
+
+            self.first_categories = self.first_categories + first_categories
+            # On stocke le nom des variables créées par l'encodage
+            encoded_columns = [col for col in df.columns if col not in original_columns]
+            self.features_oh_encoded = self.features_oh_encoded + encoded_columns
+
+        return df, encoded_columns
+
+    def save_all_data(self, df, verbose=True):
+        filename = f"{self.dataset_num}_v0_full_data.csv"
+        filepath = os.path.join(self.output_dir, filename)
+        df.to_csv(filepath, index=False)
+        if verbose:
+            print(f"Données enregistrées dans {filepath}")
+
+
 def add_ratios_features(df):
     # CREDIT TO INCOME RATIO
     df["BUREAU_INCOME_CREDIT_RATIO"] = (
@@ -358,20 +1258,26 @@ def add_ratios_features(df):
     )
     # PREVIOUS TO CURRENT ANNUITY RATIO
     df["CURRENT_TO_APPROVED_ANNUITY_MAX_RATIO"] = (
-        df["APPROVED_AMT_ANNUITY_MAX"] / df["AMT_ANNUITY"]
+        df["APPROVED_AMT_ANNUITY_MAX"] / df["APP_AMT_ANNUITY"]
     )
     df["CURRENT_TO_APPROVED_ANNUITY_MEAN_RATIO"] = (
-        df["APPROVED_AMT_ANNUITY_MEAN"] / df["AMT_ANNUITY"]
+        df["APPROVED_AMT_ANNUITY_MEAN"] / df["APP_AMT_ANNUITY"]
     )
-    df["PAYMENT_MIN_TO_ANNUITY_RATIO"] = df["INS_AMT_PAYMENT_MIN"] / df["AMT_ANNUITY"]
-    df["PAYMENT_MAX_TO_ANNUITY_RATIO"] = df["INS_AMT_PAYMENT_MAX"] / df["AMT_ANNUITY"]
-    df["PAYMENT_MEAN_TO_ANNUITY_RATIO"] = df["INS_AMT_PAYMENT_MEAN"] / df["AMT_ANNUITY"]
+    df["PAYMENT_MIN_TO_ANNUITY_RATIO"] = (
+        df["INS_AMT_PAYMENT_MIN"] / df["APP_AMT_ANNUITY"]
+    )
+    df["PAYMENT_MAX_TO_ANNUITY_RATIO"] = (
+        df["INS_AMT_PAYMENT_MAX"] / df["APP_AMT_ANNUITY"]
+    )
+    df["PAYMENT_MEAN_TO_ANNUITY_RATIO"] = (
+        df["INS_AMT_PAYMENT_MEAN"] / df["APP_AMT_ANNUITY"]
+    )
     # PREVIOUS TO CURRENT CREDIT TO ANNUITY RATIO
     df["CTA_CREDIT_TO_ANNUITY_MAX_RATIO"] = (
-        df["APPROVED_CREDIT_TO_ANNUITY_RATIO_MAX"] / df["CREDIT_TO_ANNUITY_RATIO"]
+        df["APPROVED_CREDIT_TO_ANNUITY_RATIO_MAX"] / df["APP_CREDIT_TO_ANNUITY_RATIO"]
     )
     df["CTA_CREDIT_TO_ANNUITY_MEAN_RATIO"] = (
-        df["APPROVED_CREDIT_TO_ANNUITY_RATIO_MEAN"] / df["CREDIT_TO_ANNUITY_RATIO"]
+        df["APPROVED_CREDIT_TO_ANNUITY_RATIO_MEAN"] / df["APP_CREDIT_TO_ANNUITY_RATIO"]
     )
     # DAYS DIFFERENCES AND RATIOS
     df["DAYS_DECISION_MEAN_TO_BIRTH"] = (
@@ -517,94 +1423,6 @@ def kfold_lightgbm_sklearn(data, categorical_feature=None):
     return mean_importance
 
 
-# ------------------------- APPLICATION PIPELINE -------------------------
-
-
-# Le kernel d'origine utilise le label encoding pour l'application.
-# On place en paramètre ohe pour tester avec du One Hot Encoding
-def get_train_test(path, num_rows=None, ohe=False):
-    """Process application_train.csv and application_test.csv and return a pandas dataframe."""
-    train = pd.read_csv(os.path.join(path, "application_train.csv"), nrows=num_rows)
-    test = pd.read_csv(os.path.join(path, "application_test.csv"), nrows=num_rows)
-    # df = train.append(test)
-    df = pd.concat([train, test], ignore_index=True)
-    del train, test
-    gc.collect()
-    # Data cleaning
-    df = df[df["CODE_GENDER"] != "XNA"]  # 4 people with XNA code gender
-    df = df[
-        df["AMT_INCOME_TOTAL"] < 20000000
-    ]  # Max income in test is 4M; train has a 117M value
-    df["DAYS_EMPLOYED"].replace(365243, np.nan, inplace=True)
-    df["DAYS_LAST_PHONE_CHANGE"].replace(0, np.nan, inplace=True)
-
-    # Flag_document features - count and kurtosis
-    docs = [f for f in df.columns if "FLAG_DOC" in f]
-    df["DOCUMENT_COUNT"] = df[docs].sum(axis=1)
-    df["NEW_DOC_KURT"] = df[docs].kurtosis(axis=1)
-    # Categorical age - based on target=1 plot
-    df["AGE_RANGE"] = df["DAYS_BIRTH"].apply(lambda x: get_age_label(x))
-
-    # New features based on External sources
-    df["EXT_SOURCES_PROD"] = (
-        df["EXT_SOURCE_1"] * df["EXT_SOURCE_2"] * df["EXT_SOURCE_3"]
-    )
-    df["EXT_SOURCES_WEIGHTED"] = (
-        df.EXT_SOURCE_1 * 2 + df.EXT_SOURCE_2 * 1 + df.EXT_SOURCE_3 * 3
-    )
-    # np.warnings.filterwarnings("ignore", r"All-NaN (slice|axis) encountered")
-    np.seterr(all="ignore", invalid="ignore")
-
-    for function_name in ["min", "max", "mean", "nanmedian", "var"]:
-        feature_name = "EXT_SOURCES_{}".format(function_name.upper())
-        df[feature_name] = eval("np.{}".format(function_name))(
-            df[["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]], axis=1
-        )
-
-    # Credit ratios
-    df["CREDIT_TO_ANNUITY_RATIO"] = df["AMT_CREDIT"] / df["AMT_ANNUITY"]
-    df["CREDIT_TO_GOODS_RATIO"] = df["AMT_CREDIT"] / df["AMT_GOODS_PRICE"]
-    # Income ratios
-    df["ANNUITY_TO_INCOME_RATIO"] = df["AMT_ANNUITY"] / df["AMT_INCOME_TOTAL"]
-    df["CREDIT_TO_INCOME_RATIO"] = df["AMT_CREDIT"] / df["AMT_INCOME_TOTAL"]
-    df["INCOME_TO_EMPLOYED_RATIO"] = df["AMT_INCOME_TOTAL"] / df["DAYS_EMPLOYED"]
-    df["INCOME_TO_BIRTH_RATIO"] = df["AMT_INCOME_TOTAL"] / df["DAYS_BIRTH"]
-    # Time ratios
-    df["EMPLOYED_TO_BIRTH_RATIO"] = df["DAYS_EMPLOYED"] / df["DAYS_BIRTH"]
-    df["ID_TO_BIRTH_RATIO"] = df["DAYS_ID_PUBLISH"] / df["DAYS_BIRTH"]
-    df["CAR_TO_BIRTH_RATIO"] = df["OWN_CAR_AGE"] / df["DAYS_BIRTH"]
-    df["CAR_TO_EMPLOYED_RATIO"] = df["OWN_CAR_AGE"] / df["DAYS_EMPLOYED"]
-    df["PHONE_TO_BIRTH_RATIO"] = df["DAYS_LAST_PHONE_CHANGE"] / df["DAYS_BIRTH"]
-
-    # Groupby: Statistics for applications in the same group
-    group = [
-        "ORGANIZATION_TYPE",
-        "NAME_EDUCATION_TYPE",
-        "OCCUPATION_TYPE",
-        "AGE_RANGE",
-        "CODE_GENDER",
-    ]
-    df = do_median(df, group, "EXT_SOURCES_MEAN", "GROUP_EXT_SOURCES_MEDIAN")
-    df = do_std(df, group, "EXT_SOURCES_MEAN", "GROUP_EXT_SOURCES_STD")
-    df = do_mean(df, group, "AMT_INCOME_TOTAL", "GROUP_INCOME_MEAN")
-    df = do_std(df, group, "AMT_INCOME_TOTAL", "GROUP_INCOME_STD")
-    df = do_mean(df, group, "CREDIT_TO_ANNUITY_RATIO", "GROUP_CREDIT_TO_ANNUITY_MEAN")
-    df = do_std(df, group, "CREDIT_TO_ANNUITY_RATIO", "GROUP_CREDIT_TO_ANNUITY_STD")
-    df = do_mean(df, group, "AMT_CREDIT", "GROUP_CREDIT_MEAN")
-    df = do_mean(df, group, "AMT_ANNUITY", "GROUP_ANNUITY_MEAN")
-    df = do_std(df, group, "AMT_ANNUITY", "GROUP_ANNUITY_STD")
-
-    """# Encode categorical features (LabelEncoder)
-    df, le_encoded_cols = label_encoder(df, None)"""
-    # On drop avant d'encoder
-    df = drop_application_columns(df)
-    if ohe:
-        df, ohe_encoded_cols = one_hot_encoder(df, None)
-    else:
-        df, le_encoded_cols = label_encoder(df, None)
-    return df
-
-
 def drop_application_columns(df):
     """Drop features based on permutation feature importance."""
     drop_list = [
@@ -685,390 +1503,6 @@ def get_age_label(days_birth):
         return 0
 
 
-# ------------------------- BUREAU PIPELINE -------------------------
-
-
-def get_bureau(path, num_rows=None):
-    """Process bureau.csv and bureau_balance.csv and return a pandas dataframe."""
-    bureau = pd.read_csv(os.path.join(path, "bureau.csv"), nrows=num_rows)
-    # Credit duration and credit/account end date difference
-    bureau["CREDIT_DURATION"] = -bureau["DAYS_CREDIT"] + bureau["DAYS_CREDIT_ENDDATE"]
-    bureau["ENDDATE_DIF"] = bureau["DAYS_CREDIT_ENDDATE"] - bureau["DAYS_ENDDATE_FACT"]
-    # Credit to debt ratio and difference
-    bureau["DEBT_PERCENTAGE"] = bureau["AMT_CREDIT_SUM"] / bureau["AMT_CREDIT_SUM_DEBT"]
-    bureau["DEBT_CREDIT_DIFF"] = (
-        bureau["AMT_CREDIT_SUM"] - bureau["AMT_CREDIT_SUM_DEBT"]
-    )
-    bureau["CREDIT_TO_ANNUITY_RATIO"] = bureau["AMT_CREDIT_SUM"] / bureau["AMT_ANNUITY"]
-
-    # One-hot encoder
-    bureau, categorical_cols = one_hot_encoder(bureau, nan_as_category=False)
-    # Join bureau balance features
-    bureau = bureau.merge(
-        get_bureau_balance(path, num_rows), how="left", on="SK_ID_BUREAU"
-    )
-    # Flag months with late payments (days past due)
-    bureau["STATUS_12345"] = 0
-    for i in range(1, 6):
-        bureau["STATUS_12345"] += bureau["STATUS_{}".format(i)]
-
-    # Aggregate by number of months in balance and merge with bureau (loan length agg)
-    features = [
-        "AMT_CREDIT_MAX_OVERDUE",
-        "AMT_CREDIT_SUM_OVERDUE",
-        "AMT_CREDIT_SUM",
-        "AMT_CREDIT_SUM_DEBT",
-        "DEBT_PERCENTAGE",
-        "DEBT_CREDIT_DIFF",
-        "STATUS_0",
-        "STATUS_12345",
-    ]
-    agg_length = bureau.groupby("MONTHS_BALANCE_SIZE")[features].mean().reset_index()
-    agg_length.rename({feat: "LL_" + feat for feat in features}, axis=1, inplace=True)
-    bureau = bureau.merge(agg_length, how="left", on="MONTHS_BALANCE_SIZE")
-    del agg_length
-    gc.collect()
-
-    # General loans aggregations
-    agg_bureau = group(bureau, "BUREAU_", BUREAU_AGG)
-    # Active and closed loans aggregations
-    active = bureau[bureau["CREDIT_ACTIVE_Active"] == 1]
-    agg_bureau = group_and_merge(
-        active, agg_bureau, "BUREAU_ACTIVE_", BUREAU_ACTIVE_AGG
-    )
-    closed = bureau[bureau["CREDIT_ACTIVE_Closed"] == 1]
-    agg_bureau = group_and_merge(
-        closed, agg_bureau, "BUREAU_CLOSED_", BUREAU_CLOSED_AGG
-    )
-    del active, closed
-    gc.collect()
-    # Aggregations for the main loan types
-    for credit_type in [
-        "Consumer credit",
-        "Credit card",
-        "Mortgage",
-        "Car loan",
-        "Microloan",
-    ]:
-        type_df = bureau[bureau["CREDIT_TYPE_" + credit_type] == 1]
-        prefix = "BUREAU_" + credit_type.split(" ")[0].upper() + "_"
-        agg_bureau = group_and_merge(type_df, agg_bureau, prefix, BUREAU_LOAN_TYPE_AGG)
-        del type_df
-        gc.collect()
-    # Time based aggregations: last x months
-    for time_frame in [6, 12]:
-        prefix = "BUREAU_LAST{}M_".format(time_frame)
-        time_frame_df = bureau[bureau["DAYS_CREDIT"] >= -30 * time_frame]
-        agg_bureau = group_and_merge(time_frame_df, agg_bureau, prefix, BUREAU_TIME_AGG)
-        del time_frame_df
-        gc.collect()
-
-    # Last loan max overdue
-    sort_bureau = bureau.sort_values(by=["DAYS_CREDIT"])
-    gr = (
-        sort_bureau.groupby("SK_ID_CURR")["AMT_CREDIT_MAX_OVERDUE"].last().reset_index()
-    )
-    gr.rename({"AMT_CREDIT_MAX_OVERDUE": "BUREAU_LAST_LOAN_MAX_OVERDUE"}, inplace=True)
-    agg_bureau = agg_bureau.merge(gr, on="SK_ID_CURR", how="left")
-    # Ratios: total debt/total credit and active loans debt/ active loans credit
-    agg_bureau["BUREAU_DEBT_OVER_CREDIT"] = (
-        agg_bureau["BUREAU_AMT_CREDIT_SUM_DEBT_SUM"]
-        / agg_bureau["BUREAU_AMT_CREDIT_SUM_SUM"]
-    )
-    agg_bureau["BUREAU_ACTIVE_DEBT_OVER_CREDIT"] = (
-        agg_bureau["BUREAU_ACTIVE_AMT_CREDIT_SUM_DEBT_SUM"]
-        / agg_bureau["BUREAU_ACTIVE_AMT_CREDIT_SUM_SUM"]
-    )
-    return agg_bureau
-
-
-def get_bureau_balance(path, num_rows=None):
-    bb = pd.read_csv(os.path.join(path, "bureau_balance.csv"), nrows=num_rows)
-    bb, categorical_cols = one_hot_encoder(bb, nan_as_category=False)
-    # Calculate rate for each category with decay
-    bb_processed = bb.groupby("SK_ID_BUREAU")[categorical_cols].mean().reset_index()
-    # Min, Max, Count and mean duration of payments (months)
-    agg = {"MONTHS_BALANCE": ["min", "max", "mean", "size"]}
-    bb_processed = group_and_merge(bb, bb_processed, "", agg, "SK_ID_BUREAU")
-    del bb
-    gc.collect()
-    return bb_processed
-
-
-# ------------------------- PREVIOUS PIPELINE -------------------------
-
-
-def get_previous_applications(path, num_rows=None):
-    """Process previous_application.csv and return a pandas dataframe."""
-    prev = pd.read_csv(os.path.join(path, "previous_application.csv"), nrows=num_rows)
-    pay = pd.read_csv(os.path.join(path, "installments_payments.csv"), nrows=num_rows)
-
-    # One-hot encode most important categorical features
-    ohe_columns = [
-        "NAME_CONTRACT_STATUS",
-        "NAME_CONTRACT_TYPE",
-        "CHANNEL_TYPE",
-        "NAME_TYPE_SUITE",
-        "NAME_YIELD_GROUP",
-        "PRODUCT_COMBINATION",
-        "NAME_PRODUCT_TYPE",
-        "NAME_CLIENT_TYPE",
-    ]
-    prev, categorical_cols = one_hot_encoder(prev, ohe_columns, nan_as_category=False)
-
-    # Feature engineering: ratios and difference
-    prev["APPLICATION_CREDIT_DIFF"] = prev["AMT_APPLICATION"] - prev["AMT_CREDIT"]
-    prev["APPLICATION_CREDIT_RATIO"] = prev["AMT_APPLICATION"] / prev["AMT_CREDIT"]
-    prev["CREDIT_TO_ANNUITY_RATIO"] = prev["AMT_CREDIT"] / prev["AMT_ANNUITY"]
-    prev["DOWN_PAYMENT_TO_CREDIT"] = prev["AMT_DOWN_PAYMENT"] / prev["AMT_CREDIT"]
-    # Interest ratio on previous application (simplified)
-    total_payment = prev["AMT_ANNUITY"] * prev["CNT_PAYMENT"]
-    prev["SIMPLE_INTERESTS"] = (total_payment / prev["AMT_CREDIT"] - 1) / prev[
-        "CNT_PAYMENT"
-    ]
-
-    # Active loans - approved and not complete yet (last_due 365243)
-    approved = prev[prev["NAME_CONTRACT_STATUS_Approved"] == 1]
-    active_df = approved[approved["DAYS_LAST_DUE"] == 365243]
-    # Find how much was already payed in active loans (using installments csv)
-    active_pay = pay[pay["SK_ID_PREV"].isin(active_df["SK_ID_PREV"])]
-    active_pay_agg = active_pay.groupby("SK_ID_PREV")[
-        ["AMT_INSTALMENT", "AMT_PAYMENT"]
-    ].sum()
-    active_pay_agg.reset_index(inplace=True)
-    # Active loans: difference of what was payed and installments
-    active_pay_agg["INSTALMENT_PAYMENT_DIFF"] = (
-        active_pay_agg["AMT_INSTALMENT"] - active_pay_agg["AMT_PAYMENT"]
-    )
-    # Merge with active_df
-    active_df = active_df.merge(active_pay_agg, on="SK_ID_PREV", how="left")
-    active_df["REMAINING_DEBT"] = active_df["AMT_CREDIT"] - active_df["AMT_PAYMENT"]
-    active_df["REPAYMENT_RATIO"] = active_df["AMT_PAYMENT"] / active_df["AMT_CREDIT"]
-    # Perform aggregations for active applications
-    active_agg_df = group(active_df, "PREV_ACTIVE_", PREVIOUS_ACTIVE_AGG)
-    active_agg_df["TOTAL_REPAYMENT_RATIO"] = (
-        active_agg_df["PREV_ACTIVE_AMT_PAYMENT_SUM"]
-        / active_agg_df["PREV_ACTIVE_AMT_CREDIT_SUM"]
-    )
-    del active_pay, active_pay_agg, active_df
-    gc.collect()
-
-    # Change 365.243 values to nan (missing)
-    prev["DAYS_FIRST_DRAWING"].replace(365243, np.nan, inplace=True)
-    prev["DAYS_FIRST_DUE"].replace(365243, np.nan, inplace=True)
-    prev["DAYS_LAST_DUE_1ST_VERSION"].replace(365243, np.nan, inplace=True)
-    prev["DAYS_LAST_DUE"].replace(365243, np.nan, inplace=True)
-    prev["DAYS_TERMINATION"].replace(365243, np.nan, inplace=True)
-    # Days last due difference (scheduled x done)
-    prev["DAYS_LAST_DUE_DIFF"] = (
-        prev["DAYS_LAST_DUE_1ST_VERSION"] - prev["DAYS_LAST_DUE"]
-    )
-    """approved["DAYS_LAST_DUE_DIFF"] = (
-        approved["DAYS_LAST_DUE_1ST_VERSION"] - approved["DAYS_LAST_DUE"]
-    )"""
-    approved.loc[:, ["DAYS_LAST_DUE_DIFF"]] = (
-        approved.loc[:, ["DAYS_LAST_DUE_1ST_VERSION"]]
-        - approved.loc[:, ["DAYS_LAST_DUE"]]
-    )
-
-    # Categorical features
-    categorical_agg = {key: ["mean"] for key in categorical_cols}
-    # Perform general aggregations
-    agg_prev = group(prev, "PREV_", {**PREVIOUS_AGG, **categorical_agg})
-    # Merge active loans dataframe on agg_prev
-    agg_prev = agg_prev.merge(active_agg_df, how="left", on="SK_ID_CURR")
-    del active_agg_df
-    gc.collect()
-    # Aggregations for approved and refused loans
-    agg_prev = group_and_merge(approved, agg_prev, "APPROVED_", PREVIOUS_APPROVED_AGG)
-    refused = prev[prev["NAME_CONTRACT_STATUS_Refused"] == 1]
-    agg_prev = group_and_merge(refused, agg_prev, "REFUSED_", PREVIOUS_REFUSED_AGG)
-    del approved, refused
-    gc.collect()
-    # Aggregations for Consumer loans and Cash loans
-    for loan_type in ["Consumer loans", "Cash loans"]:
-        type_df = prev[prev["NAME_CONTRACT_TYPE_{}".format(loan_type)] == 1]
-        prefix = "PREV_" + loan_type.split(" ")[0] + "_"
-        agg_prev = group_and_merge(type_df, agg_prev, prefix, PREVIOUS_LOAN_TYPE_AGG)
-        del type_df
-        gc.collect()
-
-    # Get the SK_ID_PREV for loans with late payments (days past due)
-    pay["LATE_PAYMENT"] = pay["DAYS_ENTRY_PAYMENT"] - pay["DAYS_INSTALMENT"]
-    pay["LATE_PAYMENT"] = pay["LATE_PAYMENT"].apply(lambda x: 1 if x > 0 else 0)
-    dpd_id = pay[pay["LATE_PAYMENT"] > 0]["SK_ID_PREV"].unique()
-    # Aggregations for loans with late payments
-    agg_dpd = group_and_merge(
-        prev[prev["SK_ID_PREV"].isin(dpd_id)],
-        agg_prev,
-        "PREV_LATE_",
-        PREVIOUS_LATE_PAYMENTS_AGG,
-    )
-    del agg_dpd, dpd_id
-    gc.collect()
-    # Aggregations for loans in the last x months
-    for time_frame in [12, 24]:
-        time_frame_df = prev[prev["DAYS_DECISION"] >= -30 * time_frame]
-        prefix = "PREV_LAST{}M_".format(time_frame)
-        agg_prev = group_and_merge(time_frame_df, agg_prev, prefix, PREVIOUS_TIME_AGG)
-        del time_frame_df
-        gc.collect()
-    del prev
-    gc.collect()
-    return agg_prev
-
-
-# ------------------------- POS-CASH PIPELINE -------------------------
-
-
-def get_pos_cash(path, num_rows=None):
-    """Process POS_CASH_balance.csv and return a pandas dataframe."""
-    pos = pd.read_csv(os.path.join(path, "POS_CASH_balance.csv"), nrows=num_rows)
-    pos, categorical_cols = one_hot_encoder(pos, nan_as_category=False)
-    # Flag months with late payment
-    pos["LATE_PAYMENT"] = pos["SK_DPD"].apply(lambda x: 1 if x > 0 else 0)
-    # Aggregate by SK_ID_CURR
-    categorical_agg = {key: ["mean"] for key in categorical_cols}
-    pos_agg = group(pos, "POS_", {**POS_CASH_AGG, **categorical_agg})
-    # Sort and group by SK_ID_PREV
-    sort_pos = pos.sort_values(by=["SK_ID_PREV", "MONTHS_BALANCE"])
-    gp = sort_pos.groupby("SK_ID_PREV")
-    df = pd.DataFrame()
-    df["SK_ID_CURR"] = gp["SK_ID_CURR"].first()
-    df["MONTHS_BALANCE_MAX"] = gp["MONTHS_BALANCE"].max()
-    # Percentage of previous loans completed and completed before initial term
-    df["POS_LOAN_COMPLETED_MEAN"] = gp["NAME_CONTRACT_STATUS_Completed"].mean()
-    df["POS_COMPLETED_BEFORE_MEAN"] = (
-        gp["CNT_INSTALMENT"].first() - gp["CNT_INSTALMENT"].last()
-    )
-    df["POS_COMPLETED_BEFORE_MEAN"] = df.apply(
-        lambda x: (
-            1
-            if x["POS_COMPLETED_BEFORE_MEAN"] > 0 and x["POS_LOAN_COMPLETED_MEAN"] > 0
-            else 0
-        ),
-        axis=1,
-    )
-    # Number of remaining installments (future installments) and percentage from total
-    df["POS_REMAINING_INSTALMENTS"] = gp["CNT_INSTALMENT_FUTURE"].last()
-    df["POS_REMAINING_INSTALMENTS_RATIO"] = (
-        gp["CNT_INSTALMENT_FUTURE"].last() / gp["CNT_INSTALMENT"].last()
-    )
-    # Group by SK_ID_CURR and merge
-    df_gp = df.groupby("SK_ID_CURR").sum().reset_index()
-    df_gp.drop(["MONTHS_BALANCE_MAX"], axis=1, inplace=True)
-    pos_agg = pd.merge(pos_agg, df_gp, on="SK_ID_CURR", how="left")
-    del df, gp, df_gp, sort_pos
-    gc.collect()
-
-    # Percentage of late payments for the 3 most recent applications
-    pos = do_sum(pos, ["SK_ID_PREV"], "LATE_PAYMENT", "LATE_PAYMENT_SUM")
-    # Last month of each application
-    last_month_df = pos.groupby("SK_ID_PREV")["MONTHS_BALANCE"].idxmax()
-    # Most recent applications (last 3)
-    sort_pos = pos.sort_values(by=["SK_ID_PREV", "MONTHS_BALANCE"])
-    gp = sort_pos.iloc[last_month_df].groupby("SK_ID_CURR").tail(3)
-    gp_mean = gp.groupby("SK_ID_CURR").mean().reset_index()
-    pos_agg = pd.merge(
-        pos_agg,
-        gp_mean[["SK_ID_CURR", "LATE_PAYMENT_SUM"]],
-        on="SK_ID_CURR",
-        how="left",
-    )
-
-    # print("Colonnes de pos_agg", pos_agg.columns)
-
-    # Drop some useless categorical features
-    drop_features = [
-        "POS_NAME_CONTRACT_STATUS_Canceled_MEAN",
-        "POS_NAME_CONTRACT_STATUS_Amortized debt_MEAN",
-        "POS_NAME_CONTRACT_STATUS_XNA_MEAN",
-    ]
-    # pos_agg.drop(drop_features, axis=1, inplace=True)
-    # Pour pouvoir l'exécuter en mode debug, on check si les colonnes sont présentes
-    # car elles sont issues d'un onehot
-    drop_features = [feature for feature in drop_features if feature in pos_agg.columns]
-    if drop_features:
-        pos_agg.drop(drop_features, axis=1, inplace=True)
-
-    return pos_agg
-
-
-# ------------------------- INSTALLMENTS PIPELINE -------------------------
-
-
-def get_installment_payments(path, num_rows=None):
-    """Process installments_payments.csv and return a pandas dataframe."""
-    pay = pd.read_csv(os.path.join(path, "installments_payments.csv"), nrows=num_rows)
-    # Group payments and get Payment difference
-    pay = do_sum(
-        pay,
-        ["SK_ID_PREV", "NUM_INSTALMENT_NUMBER"],
-        "AMT_PAYMENT",
-        "AMT_PAYMENT_GROUPED",
-    )
-    pay["PAYMENT_DIFFERENCE"] = pay["AMT_INSTALMENT"] - pay["AMT_PAYMENT_GROUPED"]
-    pay["PAYMENT_RATIO"] = pay["AMT_INSTALMENT"] / pay["AMT_PAYMENT_GROUPED"]
-    pay["PAID_OVER_AMOUNT"] = pay["AMT_PAYMENT"] - pay["AMT_INSTALMENT"]
-    pay["PAID_OVER"] = (pay["PAID_OVER_AMOUNT"] > 0).astype(int)
-    # Payment Entry: Days past due and Days before due
-    pay["DPD"] = pay["DAYS_ENTRY_PAYMENT"] - pay["DAYS_INSTALMENT"]
-    pay["DPD"] = pay["DPD"].apply(lambda x: 0 if x <= 0 else x)
-    pay["DBD"] = pay["DAYS_INSTALMENT"] - pay["DAYS_ENTRY_PAYMENT"]
-    pay["DBD"] = pay["DBD"].apply(lambda x: 0 if x <= 0 else x)
-    # Flag late payment
-    pay["LATE_PAYMENT"] = pay["DBD"].apply(lambda x: 1 if x > 0 else 0)
-    # Percentage of payments that were late
-    pay["INSTALMENT_PAYMENT_RATIO"] = pay["AMT_PAYMENT"] / pay["AMT_INSTALMENT"]
-    pay["LATE_PAYMENT_RATIO"] = pay.apply(
-        lambda x: x["INSTALMENT_PAYMENT_RATIO"] if x["LATE_PAYMENT"] == 1 else 0, axis=1
-    )
-    # Flag late payments that have a significant amount
-    pay["SIGNIFICANT_LATE_PAYMENT"] = pay["LATE_PAYMENT_RATIO"].apply(
-        lambda x: 1 if x > 0.05 else 0
-    )
-    # Flag k threshold late payments
-    pay["DPD_7"] = pay["DPD"].apply(lambda x: 1 if x >= 7 else 0)
-    pay["DPD_15"] = pay["DPD"].apply(lambda x: 1 if x >= 15 else 0)
-    # Aggregations by SK_ID_CURR
-    pay_agg = group(pay, "INS_", INSTALLMENTS_AGG)
-
-    # Installments in the last x months
-    for months in [36, 60]:
-        recent_prev_id = pay[pay["DAYS_INSTALMENT"] >= -30 * months][
-            "SK_ID_PREV"
-        ].unique()
-        pay_recent = pay[pay["SK_ID_PREV"].isin(recent_prev_id)]
-        prefix = "INS_{}M_".format(months)
-        pay_agg = group_and_merge(pay_recent, pay_agg, prefix, INSTALLMENTS_TIME_AGG)
-
-    # Last x periods trend features
-    group_features = [
-        "SK_ID_CURR",
-        "SK_ID_PREV",
-        "DPD",
-        "LATE_PAYMENT",
-        "PAID_OVER_AMOUNT",
-        "PAID_OVER",
-        "DAYS_INSTALMENT",
-    ]
-    gp = pay[group_features].groupby("SK_ID_CURR")
-    func = partial(
-        trend_in_last_k_instalment_features, periods=INSTALLMENTS_LAST_K_TREND_PERIODS
-    )
-    g = parallel_apply(
-        gp, func, index_name="SK_ID_CURR", chunk_size=10000
-    ).reset_index()
-    pay_agg = pay_agg.merge(g, on="SK_ID_CURR", how="left")
-
-    # Last loan features
-    g = parallel_apply(
-        gp, installments_last_loan_features, index_name="SK_ID_CURR", chunk_size=10000
-    ).reset_index()
-    pay_agg = pay_agg.merge(g, on="SK_ID_CURR", how="left")
-    return pay_agg
-
-
 def trend_in_last_k_instalment_features(gr, periods):
     gr_ = gr.copy()
     gr_.sort_values(["DAYS_INSTALMENT"], ascending=False, inplace=True)
@@ -1109,47 +1543,6 @@ def installments_last_loan_features(gr):
         features, gr_, "PAID_OVER", ["count", "mean"], "LAST_LOAN_"
     )
     return features
-
-
-# ------------------------- CREDIT CARD PIPELINE -------------------------
-
-
-def get_credit_card(path, num_rows=None):
-    """Process credit_card_balance.csv and return a pandas dataframe."""
-    cc = pd.read_csv(os.path.join(path, "credit_card_balance.csv"), nrows=num_rows)
-    cc, cat_cols = one_hot_encoder(cc, nan_as_category=False)
-    cc.rename(columns={"AMT_RECIVABLE": "AMT_RECEIVABLE"}, inplace=True)
-    # Amount used from limit
-    cc["LIMIT_USE"] = cc["AMT_BALANCE"] / cc["AMT_CREDIT_LIMIT_ACTUAL"]
-    # Current payment / Min payment
-    cc["PAYMENT_DIV_MIN"] = cc["AMT_PAYMENT_CURRENT"] / cc["AMT_INST_MIN_REGULARITY"]
-    # Late payment
-    cc["LATE_PAYMENT"] = cc["SK_DPD"].apply(lambda x: 1 if x > 0 else 0)
-    # How much drawing of limit
-    cc["DRAWING_LIMIT_RATIO"] = (
-        cc["AMT_DRAWINGS_ATM_CURRENT"] / cc["AMT_CREDIT_LIMIT_ACTUAL"]
-    )
-    # Aggregations by SK_ID_CURR
-    cc_agg = cc.groupby("SK_ID_CURR").agg(CREDIT_CARD_AGG)
-    cc_agg.columns = pd.Index(
-        ["CC_" + e[0] + "_" + e[1].upper() for e in cc_agg.columns.tolist()]
-    )
-    cc_agg.reset_index(inplace=True)
-
-    # Last month balance of each credit card application
-    last_ids = cc.groupby("SK_ID_PREV")["MONTHS_BALANCE"].idxmax()
-    last_months_df = cc[cc.index.isin(last_ids)]
-    cc_agg = group_and_merge(
-        last_months_df, cc_agg, "CC_LAST_", {"AMT_BALANCE": ["mean", "max"]}
-    )
-
-    # Aggregations for last x months
-    for months in [12, 24, 48]:
-        cc_prev_id = cc[cc["MONTHS_BALANCE"] >= -months]["SK_ID_PREV"].unique()
-        cc_recent = cc[cc["SK_ID_PREV"].isin(cc_prev_id)]
-        prefix = "INS_{}M_".format(months)
-        cc_agg = group_and_merge(cc_recent, cc_agg, prefix, CREDIT_CARD_TIME_AGG)
-    return cc_agg
 
 
 # ------------------------- UTILITY FUNCTIONS -------------------------
@@ -1226,7 +1619,11 @@ def do_sum(df, group_cols, counted, agg_name):
     return df
 
 
-def one_hot_encoder(df, categorical_columns=None, nan_as_category=True):
+def pd_one_hot_encoder(
+    df,
+    categorical_columns=None,
+    nan_as_category=True,
+):
     """Create a new column for each categorical value in categorical columns."""
     original_columns = list(df.columns)
     if not categorical_columns:
@@ -1314,6 +1711,8 @@ def add_trend_feature(features, gr, feature_name, prefix):
         lr.fit(x, y)
         trend = lr.coef_[0]
     except:
+        # Attention à ne pas assigner pd.NA car cela créerait des types de données mixtes
+        # Tandis que np.nan est un float.
         trend = np.nan
     features["{}{}".format(prefix, feature_name)] = trend
     return features
@@ -1348,49 +1747,57 @@ def chunk_groups(groupby_object, chunk_size):
             yield index_chunk_, group_chunk_
 
 
-def get_full_data(path=DATA_BASE, debug=False, ohe=False, reduce_mem=True):
+def cu_get_full_data(
+    path=DATA_BASE, debug=False, ohe=False, reduce_mem=True, drop_useless=True
+):
     num_rows = 30_000 if debug else None
     if debug:
         print(f"DEBUG num_rows={num_rows}")
-    with timer("application_train and application_test"):
-        df = get_train_test(path, num_rows=num_rows, ohe=ohe)
+    with timer("application_train"):
+        df = get_application(
+            path, num_rows=num_rows, ohe=ohe, drop_useless=drop_useless
+        )
         print("Application dataframe shape: ", df.shape)
     with timer("Bureau and bureau_balance data"):
         bureau_df = get_bureau(path, num_rows=num_rows)
-        df = pd.merge(df, bureau_df, on="SK_ID_CURR", how="left")
+        df = cudf.merge(df, bureau_df, on="SK_ID_CURR", how="left")
         print("Bureau dataframe shape: ", bureau_df.shape)
         del bureau_df
         gc.collect()
     with timer("previous_application"):
         prev_df = get_previous_applications(path, num_rows)
-        df = pd.merge(df, prev_df, on="SK_ID_CURR", how="left")
+        df = cudf.merge(df, prev_df, on="SK_ID_CURR", how="left")
         print("Previous dataframe shape: ", prev_df.shape)
         del prev_df
         gc.collect()
     with timer("previous applications balances"):
         pos = get_pos_cash(path, num_rows)
-        df = pd.merge(df, pos, on="SK_ID_CURR", how="left")
+        df = cudf.merge(df, pos, on="SK_ID_CURR", how="left")
         print("Pos-cash dataframe shape: ", pos.shape)
         del pos
         gc.collect()
+    with timer("Installments payments"):
         ins = get_installment_payments(path, num_rows)
-        df = pd.merge(df, ins, on="SK_ID_CURR", how="left")
+        df = cudf.merge(df, ins, on="SK_ID_CURR", how="left")
         print("Installments dataframe shape: ", ins.shape)
         del ins
         gc.collect()
+    with timer("Credit card"):
         cc = get_credit_card(path, num_rows)
-        df = pd.merge(df, cc, on="SK_ID_CURR", how="left")
+        df = cudf.merge(df, cc, on="SK_ID_CURR", how="left")
         print("Credit card dataframe shape: ", cc.shape)
         del cc
         gc.collect()
-    # Add ratios and groupby between different tables
-    df = add_ratios_features(df)
-    if reduce_mem:
-        df = reduce_memory(df)
+        print("'AMT_ANNUITY' in df.columns ?", "AMT_ANNUITY" in df.columns)
+    with timer("Add ratios"):
+        # Add ratios and groupby between different tables
+        df = add_ratios_features(df)
+    """if reduce_mem:
+        df = reduce_memory(df)"""
     return df
 
 
-def reduce_memory(df):
+def reduce_memory(df, only_without_nan=False):
     """Reduce memory usage of a dataframe by setting data types."""
     start_mem = df.memory_usage().sum() / 1024**2
     print(
@@ -1398,8 +1805,12 @@ def reduce_memory(df):
             start_mem, len(df.columns)
         )
     )
+    columns_to_reduce = df.columns
+    if only_without_nan:
+        columns_with_nan = [col for col in df.columns if df[col].isnull().any()]
+        columns_to_reduce = [col for col in df.columns if col not in columns_with_nan]
 
-    for col in df.columns:
+    for col in columns_to_reduce:
         col_type = df[col].dtypes
         if col_type != object:
             cmin = df[col].min()
