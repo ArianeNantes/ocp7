@@ -506,27 +506,29 @@ def missing_values_barh(
     # Si missing_values est fourni, on ne recalcule pas (pour éviter du temps de calcul)
     if missing_values is None:
         missing_values = data.isna().mean() * 100
-        missing_values = missing_values.sort_values(ascending=False)
+
+    # Tri
+    if sort is not None:
+        # Le barh inverse l'ordre donc on  trie en sens inverse et on sélectionnera la queue
+        if sort == "index":
+            missing_values = missing_values.sort_index(ascending=False)
+        # Tri par % de valeur manquantes, les plus vides se retrouveront en haut
+        else:
+            missing_values = missing_values.sort_values(ascending=True)
 
     # Limite le nombre de variables à afficher
     n = missing_values.shape[0]
     if n > n_max:
         n = n_max
-        missing_values = missing_values[:n]
-        if sort == "value":
-            title = f"Pourcentage de valeurs manquantes par colonne (Top {n_max})\n"
-        else:
+
+        if sort == "index":
             title = f"Pourcentage de valeurs manquantes par colonne ({n_max} 1ères)\n"
+        else:
+            title = f"Pourcentage de valeurs manquantes par colonne (Top {n_max})\n"
     else:
         title = "Pourcentage de valeurs manquantes par colonne\n"
 
-    # Tri
-    if sort is not None and type(sort) == str:
-        if sort == "index":
-            missing_values = missing_values.sort_index(ascending=False)
-        # Tri par % de valeur manquantes, les plus vides se retrouveront en haut
-        if sort == "value" or sort == "values":
-            missing_values = missing_values.sort_values(ascending=True)
+    missing_values = missing_values.tail(n)
 
     # Si l'élément palette fourni est une string, on la convertit en liste de couleurs
     # Si None, on prend le cycle de couleurs Matplotlib en cours
