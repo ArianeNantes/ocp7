@@ -461,7 +461,7 @@ def mv_delete_col_up(data, missing_values=None, limit_top=99.9, inplace=True):
 def missing_values_barh(
     data,
     missing_values=None,
-    limit_top=100,
+    n_max=50,
     annotate="group_middle",
     figsize=None,
     sort="value",
@@ -476,7 +476,7 @@ def missing_values_barh(
     Args:
         data (DataFrame):                   df contenant les données
         missing_values (Series, optional):  Series contenant les % de valeurs manuqantes par colonne. Defaults to None.
-        limit_top (int, optional):          Seuil % de valeurs manquantes pour distinguer le groupe très manquant. Defaults to 100.
+        n_max (int, optional):              Nombre maximum de variables à afficher. Default to 50
         annotate (str, optional):           Groupe pour lequel on veut voir les % affichés sur le graphe (group_top, group_middle group_bottom). Defaults to 'group_middle'.
         figsize (tuple, optional):          Taille de la figure. Si non précisé elle est calculée approximativement. Defaults to None.
         sort (str, optional):               Trie les barres (colonnes) par valeurs ou par ordre alphabétique des noms de colonnes. Defaults to 'value'.
@@ -490,7 +490,7 @@ def missing_values_barh(
     # ********************************************************
     # CONSTANTES à modifier rapidement
     # ********************************************************
-    n_max = 200  # Nombre de variables maximum à afficher
+    limit_top = 100  # Seuil % de valeurs manquantes pour distinguer le groupe très manquant. Defaults to 100.
     n_max_ticks_up = 30  # Nombre max de variables à partir duquel on affiche les ticks en haut en plus du bas
     fontsize = 9  # Taille de police pour les éléments autres que le titre
     fontsize_title = 14  # Taille de police du titre
@@ -498,7 +498,6 @@ def missing_values_barh(
     decimals = (
         1  # Nombre de décimales à afficher et à prendre en compte pour les seuils
     )
-    title = "Pourcentage de valeurs manquantes par colonne\n"
 
     # ********************************************************
     # En fonction des paramètres fournis
@@ -514,8 +513,12 @@ def missing_values_barh(
     if n > n_max:
         n = n_max
         missing_values = missing_values[:n]
-        if verbose:
-            print(f"Le nombre de variables a été limité à {n}")
+        if sort == "value":
+            title = f"Pourcentage de valeurs manquantes par colonne (Top {n_max})\n"
+        else:
+            title = f"Pourcentage de valeurs manquantes par colonne ({n_max} 1ères)\n"
+    else:
+        title = "Pourcentage de valeurs manquantes par colonne\n"
 
     # Tri
     if sort is not None and type(sort) == str:
@@ -652,6 +655,9 @@ def missing_values_barh(
     # ********************************************************
     # Plot
     # ********************************************************
+    # Si missing_values n'est pas pandas, on considère que c'est un cuDF et on le convertit en pandas
+    if not isinstance(missing_values, (pd.DataFrame, pd.Series)):
+        missing_values = missing_values.to_pandas()
     missing_values.plot(kind="barh", width=0.85, color=color_bar)
 
     # ********************************************************
