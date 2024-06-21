@@ -7,6 +7,7 @@ import gc
 import time
 import joblib
 from joblib import Parallel, delayed
+import multiprocessing
 import subprocess
 import psycopg2
 from psycopg2 import OperationalError
@@ -37,38 +38,47 @@ from sklearn.metrics import (
     recall_score,
     precision_score,
 )
+import cudf
+from cuml.linear_model import LogisticRegression
 
 from src.p7_constantes import NUM_THREADS
 from src.p7_util import timer, clean_ram, format_time
 from src.p7_file import make_dir
 from src.p7_regex import sel_var
 from src.p7_constantes import MODEL_DIR, DATA_INTERIM, MAX_SIZE_PARA
-from src.p7_constantes import (
-    LOCAL_HOST,
+
+from src.p7_secret import (
     PORT_MLFLOW,
-    PORT_POSTGRE,
-    PASSWORD_POSTGRE,
-    USER_POSTGRE,
+    HOST_MLFLOW,
+    PORT_PG,
+    HOST_PG,
+    PASSWORD_PG,
+    USER_PG,
 )
+
 from src.p7_simple_kernel import (
-    get_batch_size,
+    # get_batch_size,
     get_memory_consumed,
     get_available_memory,
 )
 from src.p7_metric import pred_prob_to_binary, penalize_f1, penalize_business_gain
+from src.p7_evaluate import cuml_cross_validate
 
 
 class ExperimentSearch:
     def __init__(
         self,
         input_dir=DATA_INTERIM,
-        train_filename="train.csv",
+        train_filename="00_v3_train.csv",
         predictors_name="features_sorted_by_importance.pkl",
-        frac_sample=0.5,
+        # Par défaut on ne réduit pas les lignes
+        frac_sample=1.0,
+        # Par défaut on ne réduit pas les colonnes
         n_predictors=None,
         output_dir=MODEL_DIR,
         task="search",
-        model_name="lgbm",
+        model_name="logreg",
+        pipe_preprocess=None,
         sampling="None",
         objective_name="binary",
         metric="auc",
@@ -79,7 +89,7 @@ class ExperimentSearch:
             min_resource=10, max_resource=400, reduction_factor=3
         ),
         storage=RDBStorage(
-            f"postgresql://{USER_POSTGRE}:{PASSWORD_POSTGRE}@localhost:{PORT_POSTGRE}/optuna_db"
+            f"postgresql://{USER_PG}:{PASSWORD_PG}@localhost:{PORT_PG}/optuna_db"
         ),
         num=0,
     ):
@@ -91,6 +101,7 @@ class ExperimentSearch:
         self.output_dir = output_dir
         self.task = task
         self.model_name = model_name
+        self.pipe_preprocess = pipe_preprocess
         self.sampling = sampling
         self.objective_name = objective_name
         self.metric = metric
@@ -102,7 +113,7 @@ class ExperimentSearch:
         self.num = num
         self.continue_if_exist = False
         self.optimize_boosting_type = True
-        self.uri_mlflow = f"{LOCAL_HOST}:{PORT_MLFLOW}"
+        self.uri_mlflow = f"http://{HOST_MLFLOW}:{PORT_MLFLOW}"
         # Attributs à construire obligatoirement avec initialisation
 
         self.name = ""
@@ -116,14 +127,16 @@ class ExperimentSearch:
         self.study = None
         self.initialized = False
         self.parent_run_id = None
+        # Turn off optuna log notes.
+        optuna.logging.set_verbosity(optuna.logging.WARN)
 
     def check_postgresql_server(
         self,
         host="localhost",
-        port=PORT_POSTGRE,
+        port=PORT_PG,
         dbname="optuna_db",
-        user=USER_POSTGRE,
-        password=PASSWORD_POSTGRE,
+        user=USER_PG,
+        password=PASSWORD_PG,
     ):
         try:
             connection = psycopg2.connect(
@@ -140,6 +153,13 @@ class ExperimentSearch:
                 "Pour démarrer le service, vous pouvez utiliser la méthode experiment.start_postresql_server()"
             )
             print("Error:", e)
+        """
+        On peut vérifier le statut du serveice en ligne de commande :
+        sudo service postgresql status (mdp depuis secret)
+        :q pour sortir
+        Redémarrer :
+        sudo service postgresql restart
+        """
 
     def check_mlflow_server(self):
         # Use the fluent API to set the tracking uri and the active experiment
@@ -170,10 +190,12 @@ class ExperimentSearch:
         )"""
 
         # Use the fluent API to set the tracking uri and the active experiment
-        mlflow.set_tracking_uri(f"{LOCAL_HOST}:{PORT_MLFLOW}")
+        mlflow.set_tracking_uri(self.uri_mlflow)
         return
 
-    def start_mlflow_server(self, host="127.0.0.1", port="8080"):
+    def start_mlflow_server(
+        self, host=HOST_MLFLOW, port=PORT_MLFLOW, check_connect=True
+    ):
         cmd = [
             "mlflow",
             "server",
@@ -185,12 +207,16 @@ class ExperimentSearch:
             port,
         ]
         env = os.environ.copy()
+
         # Start the MLflow server
+        print("Démarrage du serveur MLFlow")
         process = subprocess.Popen(
             cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
         # Allow some time for the server to start
         time.sleep(5)
+        if check_connect:
+            self.check_mlflow_server()
         return process
 
     def check_directories(self):
@@ -199,6 +225,7 @@ class ExperimentSearch:
         )"""
         if not os.path.exists(self.output_dir):
             os.mkdir(self.output_dir)
+            print(f"Répertoire {self.output_dir} créé")
         return
 
     def init_name(
@@ -297,6 +324,7 @@ class ExperimentSearch:
         train_filename=None,
         predictors_name=None,
         n_predictors=None,
+        device="cuda",
         verbose=True,
     ):
         if frac_sample:
@@ -320,7 +348,13 @@ class ExperimentSearch:
                 f"Chargement des données. n_predictors={self.n_predictors}, frac_sample={self.frac_sample}"
             )
 
-        all_train = pd.read_csv(os.path.join(self.input_dir, self.train_filename))
+        all_train = cudf.read_csv(os.path.join(self.input_dir, self.train_filename))
+        if not device == "cuda":
+            all_train = all_train.to_pandas()
+            # S'il y a des nan dans des bool ça donnera des object, on les convertit en float
+            object_features = all_train.select_dtypes("object").columns
+            all_train[object_features] = all_train[object_features].astype("float64")
+
         to_drop = sel_var(all_train.columns, "Unnamed", verbose=False)
         if to_drop:
             all_train = all_train.drop(to_drop, axis=1)
@@ -329,7 +363,9 @@ class ExperimentSearch:
         ##################### Réduction du nombre de colonnes
         reduction_predictor = f"Tous les prédicteurs, "
         # On lit les predicteurs du Kernel simple triés par ordre d'importance
-        all_predictors = joblib.load(os.path.join(self.input_dir, self.predictors_name))
+        # [TODO] modifier le principe de réduction de lignes et de colonnes
+        # all_predictors = joblib.load(os.path.join(self.input_dir, self.predictors_name))
+        all_predictors = [f for f in all_train if f not in ["TARGET"]]
 
         # Si le nombre de prédicteurs n'est pas précisé (None) ou s'il dépasse, on les prends tous
         # sinon on réduira le nombre de colonnes
@@ -345,8 +381,14 @@ class ExperimentSearch:
         self.X = X
         self.y = y
 
+        # [TODO] mettre device en paramètre de la config et prévoir le cas pandas
         if verbose:
-            print("Forme initiale de X :", all_train[all_predictors].shape)
+            print(
+                "Forme initiale de X :",
+                all_train[all_predictors].shape,
+                "type :",
+                type(self.X),
+            )
             print(
                 f"{reduction_predictor}forme de X : {self.X.shape}, conso mémoire : {get_memory_consumed(self.X, verbose=False):.0f} Mo"
             )
@@ -518,9 +560,7 @@ class ExperimentSearch:
             max_bin = trial.suggest_int("max_bin", 128, 512, step=32)
             n_estimators = trial.suggest_int("n_estimators", 40, 400, step=20)
             # On concentre la recherche du seuil autour de 0.5 avec la distribution Beta
-            threshold_pred_probability = self.suggest_beta(
-                "threshold_pred_probability", low=0.1, high=0.9
-            )
+            threshold_prob = self.suggest_beta("threshold_prob", low=0.1, high=0.9)
 
             hyperparams = {
                 "boosting_type": boosting_type,
@@ -534,7 +574,7 @@ class ExperimentSearch:
                 "learning_rate": learning_rate,
                 "max_bin": max_bin,
                 "n_estimators": n_estimators,
-                "threshold_pred_probability": threshold_pred_probability,
+                "threshold_prob": threshold_prob,
             }
 
             # 'binary' est la métrique d'erreur
@@ -550,21 +590,38 @@ class ExperimentSearch:
             folds = StratifiedKFold(
                 n_splits=5, shuffle=True, random_state=self.random_state
             )
-            auc_scores = []
-            accuracy_scores = []
-            balanced_accuracy_scores = []
-            f1_scores = []
-            recall_scores = []
-            weighted_recall_scores = []
-            penalized_f1_sores = []
-            business_gain_scores = []
-            fit_durations = []
+            dic_val_scores = {
+                "auc": [],
+                "accuracy": [],
+                "recall": [],
+                "penalized_f1": [],
+                "business_gain": [],
+                "fit_time": [],
+                "tn": [],
+                "tp": [],
+                "fn": [],
+                "fp": [],
+            }
 
-            for i_fold, (train_idx, valid_idx) in enumerate(
-                folds.split(self.X, self.y)
+            predictors = [
+                f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]
+            ]
+
+            # Dans le split, la copie est indispensable car sinon on a une Vue array avec FLAG qui rend l'array immutable et
+            # provoque l'erreur 'cannot set WRITEABLE flag to True of this array'.
+            for _, (train_idx, valid_idx) in enumerate(
+                folds.split(
+                    # Pour construire les indices de folds, nous n'avons besoin pour X que de 2 variables afin d'obtenir un DataFrame,
+                    # En choisir seulement 2 (si copie) accélère émormément les traitements
+                    self.X[predictors[:2]].to_numpy(copy=True),
+                    self.y.to_numpy(copy=True),
+                )
             ):
-                X_train, y_train = self.X.iloc[train_idx], self.y.iloc[train_idx]
-                X_val, y_val = self.X.iloc[valid_idx], self.y.iloc[valid_idx]
+                # Ici on transforme en array et on copie car cela accélère la parallélisation
+                X_train = self.X.loc[train_idx, predictors].to_numpy(copy=True)
+                y_train = self.y.loc[train_idx].to_numpy(copy=True)
+                X_val = self.X.loc[valid_idx, predictors].to_numpy(copy=True)
+                y_val = self.y.loc[valid_idx].to_numpy(copy=True)
 
                 model = lgb.LGBMClassifier(
                     # force_row_wise=True,
@@ -585,7 +642,7 @@ class ExperimentSearch:
                     callbacks=[pruning_callback],
                     verbose=-1,
                 )
-                t0_fit = time.time()
+                t0_fit_time = time.time()
                 model.fit(
                     X_train,
                     y_train,
@@ -593,24 +650,29 @@ class ExperimentSearch:
                     eval_set=(X_val, y_val),
                     eval_metric=self.metric,
                 )
-                fit_durations.append(time.time() - t0_fit)
+                fit_time = time.time() - t0_fit_time
 
-                y_score = model.predict_proba(X_val)[:, 1]
-                auc_scores.append(roc_auc_score(y_val, y_score=y_score))
+                # y_score = np.array(model.predict_proba(X_val_np)[:, 1], copy=True)
+                # La copie a tendance à augmenter la rapidité ? Bizarre
+                y_score_val = model.predict_proba(X_val)[:, 1]
+                # Prédiction de la classe en fonction du seuil de probabilité
 
-                y_pred = pred_prob_to_binary(
-                    y_score, threshold=threshold_pred_probability
+                y_pred_val = pred_prob_to_binary(y_score_val, threshold=threshold_prob)
+
+                # Mesures sur le jeu de validation
+                dic_val_scores["auc"].append(roc_auc_score(y_val, y_score_val))
+                dic_val_scores["accuracy"].append(accuracy_score(y_val, y_pred_val))
+                dic_val_scores["recall"].append(recall_score(y_val, y_pred_val))
+                dic_val_scores["penalized_f1"].append(penalize_f1(y_val, y_pred_val))
+                dic_val_scores["business_gain"].append(
+                    penalize_business_gain(y_val, y_pred_val)
                 )
-
-                f1_scores.append(f1_score(y_val, y_pred))
-                recall_scores.append(recall_score(y_val, y_pred))
-                weighted_recall_scores.append(
-                    recall_score(y_val, y_pred, average="weighted")
-                )
-                accuracy_scores.append(accuracy_score(y_val, y_pred))
-                balanced_accuracy_scores.append(balanced_accuracy_score(y_val, y_pred))
-                penalized_f1_sores.append(penalize_f1(y_val, y_pred))
-                business_gain_scores.append(penalize_business_gain(y_val, y_pred))
+                dic_val_scores["fit_time"].append(fit_time)
+                tn, fp, fn, tp = confusion_matrix(y_val, y_pred_val).ravel()
+                dic_val_scores["tn"].append(tn)
+                dic_val_scores["fn"].append(fn)
+                dic_val_scores["tp"].append(tp)
+                dic_val_scores["fp"].append(fp)
 
                 del X_train
                 del y_train
@@ -622,29 +684,123 @@ class ExperimentSearch:
             # Fin d'un trial
             del folds
             gc.collect()
-            dic_metrics = {
-                "auc": np.mean(auc_scores),
-                "f1": np.mean(f1_scores),
-                "weighted_recall": np.mean(weighted_recall_scores),
-                "recall": np.mean(recall_scores),
-                "accuracy": np.mean(accuracy_scores),
-                "balanced_accuracy": np.mean(balanced_accuracy_scores),
-                "penalized_f1": np.mean(penalized_f1_sores),
-                "business_gain": np.mean(business_gain_scores),
-                "fit_duration": np.mean(fit_durations),
+            dic_metrics = {k: np.mean(v) for (k, v) in dic_val_scores.items()}
+
+            # Pour logguer les métriques additionnelles dans optuna_db :
+            # trial.set_user_attr("constraint", [c0])
+
+            """for k, v in dic_metrics.items():
+                mlflow.log_metric(k, v)"""
+            mlflow.log_metrics(dic_metrics)
+            mlflow.log_params(hyperparams)
+        return dic_metrics[self.metric]
+
+    def objective_logreg(self, trial):
+
+        with mlflow.start_run(
+            experiment_id=self.mlflow_id, run_name=f"{trial.number}", nested=True
+        ):
+            # doc cuml : https://docs.rapids.ai/api/cuml/nightly/api/#regression-and-classification
+            c = trial.suggest_float("C", 1e-7, 100.0, log=True)
+
+            # En cuml, pas le choix du solver mais
+            # si penalty=None ou l2 solver=L-BFGS,
+            # si penalty=l1 ou elasticnet avec un ratio_l1 > 0 alors solver=OWL-QN
+
+            penalty = trial.suggest_categorical(
+                "penalty", ["none", "l2", "l1", "elasticnet"]
+            )
+            # penalty = trial.suggest_categorical("penalty", ["l1", "elasticnet"])
+            if penalty == "elasticnet":
+                l1_ratio = trial.suggest_float("l1_ratio", 0.2, 0.8, log=False)
+            else:
+                l1_ratio = None
+
+            # penalty = "none"
+
+            class_weight = trial.suggest_categorical(
+                "class_weight", ["none", "balanced"]
+            )
+            # class_weight = "balanced"
+            # Pour avoir l'équivallent d'un tol sklearn en cuml, il faut diviser le tol sklearn par sample_size
+            # tol = trial.suggest_float("tol", 1e-6, 1e-3)
+            fit_intercept = trial.suggest_categorical("fit_intercept", [True, False])
+            # fit_intercept = False
+            clf_params = {
+                "C": c,
+                "penalty": penalty,
+                "l1_ratio": l1_ratio,
+                "fit_intercept": fit_intercept,
             }
+            # Petit bug pour le cuml LogisticRegression, on ne peut pas directement assigner class_weight
+            if class_weight == "balanced":
+                clf_params["class_weight"] = "balanced"
+
+            # Max_iter par défaut est 1_000. Si une régularisation l1 est appliquée, dans ces conditions,
+            # L'algorithme ne pourra pas converger. Soit on augmente max_iter, soit on scale les features binaires dans le pipe.
+            if penalty == "l1" or penalty == "elasticnet":
+                clf_params["max_iter"] = 10_000
+                if penalty == "elasticnet":
+                    clf_params["l1_ratio"] = l1_ratio
+
+            # On concentre la recherche du seuil autour de 0.5 avec la distribution Beta
+            # threshold_prob = self.suggest_beta("threshold_prob", low=0.05, high=0.95)
+            threshold_prob = trial.suggest_float(
+                "threshold_prob", 0.05, 0.95, log=False
+            )
+            print(
+                "Trial",
+                trial.number,
+                "penalty :",
+                penalty,
+                "l1_ratio :",
+                l1_ratio,
+                "threshold_prob :",
+                threshold_prob,
+            )
+
+            clf = LogisticRegression(**clf_params)
+            scores = cuml_cross_validate(
+                self.X,
+                self.y,
+                self.pipe_preprocess,
+                clf,
+                threshold_prob=threshold_prob,
+            )
+
+            mean_scores = scores.mean(axis=0)
+
+            # Minimise la log loss : ll = log_loss(test_y , y_predlr)
+
+            # Fin d'un trial
+            # del folds
+            # gc.collect()
+            dic_metrics = mean_scores.to_dict()
+            print(
+                "Trial",
+                trial.number,
+                "dic_metrics",
+                dic_metrics,
+                "type",
+                type(dic_metrics),
+            )
 
             # Pour logguer les métriques additionnelles dans optuna_db :
             # trial.set_user_attr("constraint", [c0])
 
             for k, v in dic_metrics.items():
                 mlflow.log_metric(k, v)
-            mlflow.log_params(hyperparams)
+            # mlflow.log_metrics(dic_metrics)
+            all_params = {
+                "C": c,
+                "penalty": penalty,
+                # "l1_ratio": l1_ratio,
+                "fit_intercept": fit_intercept,
+                "class_weight": class_weight,
+                "threshold_prob": threshold_prob,
+            }
+            mlflow.log_params(all_params)
         return dic_metrics[self.metric]
-
-    def objective_reg(self):
-        print("[TODO] objective pour reg log")
-        return
 
     def create_parent_run(self):
         # On crée un run parent qui va contenir tous les runs (un run enfant par trial)
@@ -665,9 +821,20 @@ class ExperimentSearch:
         self.study.optimize(
             self.objective_lgb, n_trials=n_trials, n_jobs=n_jobs, gc_after_trial=True
         )
-        duration = time.time() - t0
+
         if verbose:
-            print("Durée de l'optimisation (hh:mm:ss) :", format_time(duration))
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+
+    def run_logreg_trials(self, n_trials=20, n_jobs=1, verbose=True):
+        t0 = time.time()
+        if verbose:
+            print(f"Optimisation {n_trials} trials...")
+
+        self.study.optimize(
+            self.objective_logreg, n_trials=n_trials, n_jobs=n_jobs, gc_after_trial=True
+        )
+        if verbose:
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
 
     def create_best_run(self):
         with mlflow.start_run(
@@ -681,14 +848,14 @@ class ExperimentSearch:
             mlflow.log_artifact(
                 os.path.join(self.output_dir, "hyperparam_importance.html")
             )
-            fig = optuna.visualization.plot_parallel_coordinate(
+            """fig = optuna.visualization.plot_parallel_coordinate(
                 self.study,
-                params=["boosting_type", "n_estimators", "num_leaves", "learning_rate"],
+                # params=["boosting_type", "n_estimators", "num_leaves", "learning_rate"],
             )
             fig.write_html(os.path.join(self.output_dir, "parallel_coordinate.html"))
             mlflow.log_artifact(
                 os.path.join(self.output_dir, "parallel_coordinate.html")
-            )
+            )"""
             fig = optuna.visualization.plot_optimization_history(self.study)
             fig.write_html(os.path.join(self.output_dir, "optimization_history.html"))
             mlflow.log_artifact(
@@ -698,16 +865,32 @@ class ExperimentSearch:
     def run_lgb(self, n_workers=8, n_trials_per_worker=10, verbose=True):
         t0 = time.time()
         if verbose:
-            print(f"Optimisation {n_trials_per_worker * n_workers} trials...")
+            print(
+                f"Optimisation {n_trials_per_worker * n_workers} trials sur CPU. Parallélisation : {n_workers} workers de {n_trials_per_worker} trials chacun..."
+            )
 
         Parallel(n_jobs=n_workers)(
-            delayed(self.run_lgb_trials)(n_trials_per_worker, 1)
+            delayed(self.run_lgb_trials)(n_trials_per_worker, 1, False)
             for _ in range(n_workers)
         )
-        duration = time.time() - t0
 
         if verbose:
-            print("Durée de l'optimisation (hh:mm:ss) :", format_time(duration))
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+        self.create_best_run()
+
+    # La parallélisation ne fonctionne pas si CUDA car pas assez de mémoire
+    # ou tout simplement allocation sur CUDA en parallel ne fonctionne pas bien (alloue plus que nécessaire).
+    # On peut surveiller en temps réel la consommation de VRAM avec nvidia-smi -l 1 (crée une loop pour rafraichir toutes les 1 secondes)
+    # Le multithreads réglerait peut-être le problème de l'allocation VRAM mais MLFlow n'est pas thread-safe.
+    def run_logreg(self, n_trials=10, verbose=True):
+        t0 = time.time()
+        if verbose:
+            print(f"Optimisation {n_trials} trials sur CUDA...")
+
+        self.run_logreg_trials(n_trials=n_trials, n_jobs=1, verbose=False)
+
+        if verbose:
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
         self.create_best_run()
 
     # Inutile, on va plutôt faire un run parent

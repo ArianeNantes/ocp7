@@ -1,3 +1,5 @@
+import matplotlib.pyplot as plt
+import seaborn as sns
 from matplotlib.cbook import CallbackRegistry
 import numpy as np
 import pandas as pd
@@ -8,6 +10,9 @@ import os
 import time
 from contextlib import contextmanager
 from lightgbm import LGBMClassifier, record_evaluation
+import cudf
+from cuml.pipeline import Pipeline
+from cuml.linear_model import LogisticRegression
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.metrics import (
     roc_auc_score,
@@ -21,13 +26,16 @@ from sklearn.metrics import (
     recall_score,
     precision_score,
 )
-import matplotlib.pyplot as plt
-import seaborn as sns
+from IPython.display import display
 import warnings
+from copy import deepcopy
 
 from src.p7_file import make_dir
 from src.p7_regex import sel_var
 from src.p7_util import format_time_min, format_time
+from src.p7_metric import pred_prob_to_binary, penalize_f1, penalize_business_gain
+from src.p7_preprocess import Imputer, VarianceSelector, CuRobustScaler, CuMinMaxScaler
+from src.p7_preprocess import get_binary_features
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
@@ -470,6 +478,261 @@ def evaluate_lgbm(train_df, params, hyperparams, config=CONFIG_SIMPLE):
     return
 
 
+def logreg_cross_evaluate(
+    train_and_val,
+    pipe,
+    hyperparams,
+    threshold_prob=0.5,
+    n_folds=5,
+    random_state=42,
+):
+    """
+    Tous les param de logreg desklearn:
+    penalty='l2', *, dual=False, tol=0.0001, C=1.0, fit_intercept=True, intercept_scaling=1, class_weight=None,
+    random_state=None, solver='lbfgs', max_iter=100, multi_class='deprecated', verbose=0, warm_start=False, n_jobs=None, l1_ratio=None
+    Solver : on va utiliser saga ou sag plus performant sur les larges datasets. saga permet plus de penalty : 'elasticnet', 'l1', 'l2', None, tandis que sag permet penalty : 'l2' et None
+    """
+
+    predictors = [f for f in train_and_val.columns if f not in ["TARGET", "SK_ID_CURR"]]
+
+    X = train_and_val[["SK_ID_CURR", predictors[0]]].to_numpy()
+    y = train_and_val["TARGET"].to_numpy()
+    folds = StratifiedKFold(
+        n_splits=n_folds,
+        shuffle=True,
+        random_state=random_state,
+    )
+
+    # Create arrays and dataframes to store results
+    # oof_preds = np.zeros(train_df.shape[0])
+
+    metrics_mean = {}
+    metrics_std = {}
+
+    dic_train_scores = {
+        "auc": [],
+        "accuracy": [],
+        "recall": [],
+        "penalized_f1": [],
+        "business_gain": [],
+        "fit_time": [],
+    }
+    dic_val_scores = deepcopy(dic_train_scores)
+    t0 = time.time()
+    conf_mat = np.zeros((2, 2))
+
+    for i_fold, (train_idx, valid_idx) in enumerate(folds.split(X, y)):
+        t0_fit_time = time.time()
+
+        X_train = train_and_val.loc[train_idx, ["SK_ID_CURR"] + predictors]
+        y_train = train_and_val.loc[train_idx, "TARGET"].to_numpy()
+        X_val = train_and_val.loc[valid_idx, ["SK_ID_CURR"] + predictors]
+        y_val = train_and_val.loc[valid_idx, "TARGET"].to_numpy()
+        print(
+            f"Fold  {i_fold + 1}/{n_folds}, durée écoulée : {format_time(time.time() - t0)}"
+        )
+        # print(f"\tPrétraitement")
+        X_train_processed = pipe.fit_transform(X_train)
+        X_val_processed = pipe.transform(X_val)
+        # print(f"\tFit model")
+        clf = LogisticRegression(**hyperparams)
+        clf.fit(X_train_processed, y_train)
+
+        fit_time = time.time() - t0_fit_time
+
+        # Probabilité d'appartenir à la classe default pour le jeu de validation
+        y_score_val = clf.predict_proba(X_val_processed)[1].to_numpy()
+        # Prédiction de la classe en fonction du seuil de probabilité
+        y_pred_val = pred_prob_to_binary(y_score_val, threshold=threshold_prob)
+
+        # Mesures sur le jeu de validation
+        dic_val_scores["auc"].append(roc_auc_score(y_val, y_score_val))
+        dic_val_scores["accuracy"].append(accuracy_score(y_val, y_pred_val))
+        dic_val_scores["recall"].append(recall_score(y_val, y_pred_val))
+        dic_val_scores["penalized_f1"].append(penalize_f1(y_val, y_pred_val))
+        dic_val_scores["business_gain"].append(
+            penalize_business_gain(y_val, y_pred_val)
+        )
+        dic_val_scores["fit_time"].append(fit_time)
+
+        # MAtrice de confusion moyenne sur le jeu de validation
+        conf_mat += confusion_matrix(y_val, y_pred_val)
+
+        # Probabilité d'appartenir à la classe default pour le jeu de train
+        y_score_train = clf.predict_proba(X_train_processed)[1].to_numpy()
+        # Prédiction de la classe en fonction du seuil de probabilité
+        y_pred_train = pred_prob_to_binary(y_score_train, threshold=threshold_prob)
+
+        # Mesures sur le jeu de train
+        dic_train_scores["auc"].append(roc_auc_score(y_train, y_score_train))
+        dic_train_scores["accuracy"].append(accuracy_score(y_train, y_pred_train))
+        dic_train_scores["recall"].append(recall_score(y_train, y_pred_train))
+        dic_train_scores["penalized_f1"].append(penalize_f1(y_train, y_pred_train))
+        dic_train_scores["business_gain"].append(
+            penalize_business_gain(y_train, y_pred_train)
+        )
+        dic_train_scores["fit_time"].append(fit_time)
+
+    train_res_folds = pd.DataFrame(
+        dic_train_scores, index=np.arange(start=1, stop=n_folds + 1)
+    )
+    train_res_folds.index.name = "fold"
+    train_res_means = train_res_folds.mean()
+    train_res_std = train_res_folds.std()
+
+    val_res_folds = pd.DataFrame(
+        dic_val_scores, index=np.arange(start=1, stop=n_folds + 1)
+    )
+    val_res_folds.index.name = "fold"
+    val_res_means = val_res_folds.mean()
+    val_res_std = val_res_folds.std()
+
+    results = pd.DataFrame(
+        {
+            "train_mean": train_res_means,
+            "train_std": train_res_std,
+            "val_mean": val_res_means,
+            "val_std": val_res_std,
+        }
+    )
+    print("\nScores globaux :")
+    display(results)
+    print()
+    conf_mat = np.round(conf_mat / n_folds, decimals=0)
+    plot_confusion_matrix_mean(conf_mat)
+
+    """# On extrait les valeurs de la matrice de confusion
+    conf_matrix = confusion_matrix(y_val, preds)
+    tn, fp, fn, tp = conf_matrix.ravel()
+
+    dic_metrics = {"eval_acc": eval_acc, "roc_auc_score": auc_score}
+
+    print(f"Auc Score: {auc_score:.3%}")
+    print(f"Eval Accuracy: {eval_acc:.3%}")
+    # Plot de la courbe ROC
+    plot_roc_curve(
+        sk_model,
+        X_val,
+        y_val,
+        # name = 'ROC Curve (sklearn)',
+    )
+    plt.savefig(os.path.join(MODEL_DIR, "model_test_mlflow_roc_curve.png"))
+
+    # Plot Matrice de confusion
+    plot_confusion_matrix(y_val, preds)
+    plt.savefig(os.path.join(MODEL_DIR, "model_test_mlflow_conf_matrix.png"))
+
+    # Plot Matrice de confusion normalisée True
+    plot_recall(y_val, preds)
+    plt.savefig(os.path.join(MODEL_DIR, "model_test_mlflow_recall.png"))
+
+    # Plot Matrice de confusion normalisée Pred
+    plot_precision(y_val, preds)
+
+    report = classification_report(y_val, preds)
+    print(report)"""
+
+    # Traçage mlflow
+    """mlflow.log_artifact(os.path.join(MODEL_DIR, "model_test_mlflow_roc_curve.png"))
+    mlflow.log_artifact(os.path.join(MODEL_DIR, "model_test_mlflow_conf_matrix.png"))
+    mlflow.log_artifact(os.path.join(MODEL_DIR, "model_test_mlflow_recall.png"))"""
+    # return dic_metrics
+    return
+
+
+def cuml_cross_validate(
+    X_train_and_val,
+    y_train_and_val,
+    pipe_preprocess,
+    cuml_model,
+    threshold_prob=0.5,
+    n_folds=5,
+    random_state=42,
+):
+
+    predictors = [
+        f for f in X_train_and_val.columns if f not in ["TARGET", "SK_ID_CURR"]
+    ]
+    # A faire avant le pipe
+    # binary_features = get_binary_features(train_and_val)
+
+    X = X_train_and_val[["SK_ID_CURR", predictors[0]]].to_numpy()
+    if y_train_and_val is not None:
+        y = y_train_and_val.to_numpy()
+    else:
+        y = X_train_and_val["TARGET"].to_numpy()
+    folds = StratifiedKFold(
+        n_splits=n_folds,
+        shuffle=True,
+        random_state=random_state,
+    )
+
+    dic_val_scores = {
+        "auc": [],
+        "accuracy": [],
+        "recall": [],
+        "penalized_f1": [],
+        "business_gain": [],
+        "fit_time": [],
+        "tn": [],
+        "tp": [],
+        "fn": [],
+        "fp": [],
+    }
+
+    for train_idx, valid_idx in folds.split(X, y):
+        t0_fit_time = time.time()
+
+        X_train = X_train_and_val.loc[train_idx, ["SK_ID_CURR"] + predictors]
+        X_val = X_train_and_val.loc[valid_idx, ["SK_ID_CURR"] + predictors]
+        if y_train_and_val is None:
+            y_train = X_train_and_val.loc[train_idx, "TARGET"].to_numpy()
+            y_val = X_train_and_val.loc[valid_idx, "TARGET"].to_numpy()
+        else:
+            y_train = y_train_and_val.iloc[train_idx].to_numpy()
+            y_val = y_train_and_val.iloc[valid_idx].to_numpy()
+
+        # print(f"\tPrétraitement")
+        pipe = deepcopy(pipe_preprocess)
+        X_train_processed = pipe.fit_transform(X_train)
+        X_val_processed = pipe.transform(X_val)
+
+        # Afin de repartir d'un modèle non fitté, on crée une nouvelle copie du modèle passé en paramètre
+        clf = deepcopy(cuml_model)
+        clf.fit(X_train_processed, y_train)
+
+        fit_time = time.time() - t0_fit_time
+
+        # Probabilité d'appartenir à la classe default pour le jeu de validation
+        y_score_val = clf.predict_proba(X_val_processed)[1].to_numpy()
+        # Prédiction de la classe en fonction du seuil de probabilité
+        y_pred_val = pred_prob_to_binary(y_score_val, threshold=threshold_prob)
+
+        # Mesures sur le jeu de validation
+        dic_val_scores["auc"].append(roc_auc_score(y_val, y_score_val))
+        dic_val_scores["accuracy"].append(accuracy_score(y_val, y_pred_val))
+        dic_val_scores["recall"].append(recall_score(y_val, y_pred_val))
+        dic_val_scores["penalized_f1"].append(penalize_f1(y_val, y_pred_val))
+        dic_val_scores["business_gain"].append(
+            penalize_business_gain(y_val, y_pred_val)
+        )
+        dic_val_scores["fit_time"].append(fit_time)
+        tn, fp, fn, tp = confusion_matrix(y_val, y_pred_val).ravel()
+        dic_val_scores["tn"].append(tn)
+        dic_val_scores["fn"].append(fn)
+        dic_val_scores["tp"].append(tp)
+        dic_val_scores["fp"].append(fp)
+
+    val_res_folds = pd.DataFrame(
+        dic_val_scores, index=np.arange(start=1, stop=n_folds + 1)
+    )
+    val_res_folds.index.name = "fold"
+    del pipe
+    del clf
+    gc.collect()
+    return val_res_folds
+
+
 def plot_roc_curve(y_true, y_score):
     # Taux de faux positifs et taux de faux négatifs
     fpr, tpr, _ = roc_curve(y_true, y_score)
@@ -523,6 +786,30 @@ def plot_confusion_matrix(y_true, y_pred, figsize=(5, 4)):
     ax.set_xlabel("Prédiction")
     ax.set_ylabel("Vraie catégorie")
     return fig
+
+
+def plot_confusion_matrix_mean(conf_mat, figsize=(5, 4)):
+    conf_mat_df = pd.DataFrame(
+        conf_mat,
+        index=["Ok", "Défaut"],
+        columns=["Ok", "Défaut"],
+    )
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.heatmap(
+        conf_mat_df,
+        annot=True,
+        fmt=".0f",
+        vmin=0,
+        linewidths=0.5,
+        cmap="Blues",
+        # cbar_kws={"format": self.format_percent},
+        ax=ax,
+    )
+    fig.suptitle("Matrice de confusion moyenne")
+    plt.yticks(rotation=0)
+    ax.set_xlabel("Prédiction")
+    ax.set_ylabel("Vraie catégorie")
+    return ax
 
 
 def format_percent(x, _):
