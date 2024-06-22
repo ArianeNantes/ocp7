@@ -1,4 +1,5 @@
 import numpy as np
+import random
 import logging
 import re
 import requests
@@ -45,7 +46,7 @@ from src.p7_constantes import NUM_THREADS
 from src.p7_util import timer, clean_ram, format_time
 from src.p7_file import make_dir
 from src.p7_regex import sel_var
-from src.p7_constantes import MODEL_DIR, DATA_INTERIM, MAX_SIZE_PARA
+from src.p7_constantes import MODEL_DIR, DATA_INTERIM, MAX_SIZE_PARA, VAL_SEED
 
 from src.p7_secret import (
     PORT_MLFLOW,
@@ -68,49 +69,33 @@ from src.p7_evaluate import cuml_cross_validate
 class ExperimentSearch:
     def __init__(
         self,
-        input_dir=DATA_INTERIM,
-        train_filename="00_v3_train.csv",
-        predictors_name="features_sorted_by_importance.pkl",
-        # Par défaut on ne réduit pas les lignes
-        frac_sample=1.0,
-        # Par défaut on ne réduit pas les colonnes
-        n_predictors=None,
-        output_dir=MODEL_DIR,
-        task="search",
-        model_name="logreg",
-        pipe_preprocess=None,
-        sampling="None",
-        objective_name="binary",
         metric="auc",
-        dic_metrics={"auc"},
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),
-        pruner=optuna.pruners.HyperbandPruner(
-            min_resource=10, max_resource=400, reduction_factor=3
-        ),
-        storage=RDBStorage(
-            f"postgresql://{USER_PG}:{PASSWORD_PG}@localhost:{PORT_PG}/optuna_db"
-        ),
-        num=0,
     ):
-        self.input_dir = input_dir
-        self.train_filename = train_filename
-        self.predictors_name = predictors_name
-        self.n_predictors = n_predictors
-        self.frac_sample = frac_sample
-        self.output_dir = output_dir
-        self.task = task
-        self.model_name = model_name
-        self.pipe_preprocess = pipe_preprocess
-        self.sampling = sampling
-        self.objective_name = objective_name
+        self.input_dir = DATA_INTERIM
+        self.train_filename = "00_v3_train.csv"
+        self.predictors_name = "features_sorted_by_importance.pkl"
+        # Par défaut on ne réduit pas les colonnes
+        self.n_predictors = None
+        # Par défaut on ne réduit pas les lignes
+        self.frac_sample = 1.0
+        self.output_dir = MODEL_DIR
+        self.task = "search"
+        self.model_name = "debug"
+        self.pipe_preprocess = None
+        self.sampling = None
+        self.objective_name = "binary"
         self.metric = metric
-        self.dic_metrics = dic_metrics
+        self.dic_metrics = {"auc"}
         self.direction = direction
-        self.sampler = sampler
-        self.pruner = pruner
-        self.storage = storage
-        self.num = num
+        self.sampler = optuna.samplers.TPESampler()
+        self.pruner = optuna.pruners.HyperbandPruner(
+            min_resource=10, max_resource=400, reduction_factor=3
+        )
+        self.storage = RDBStorage(
+            f"postgresql://{USER_PG}:{PASSWORD_PG}@localhost:{PORT_PG}/optuna_db"
+        )
+        self.num = 0
         self.continue_if_exist = False
         self.optimize_boosting_type = True
         self.uri_mlflow = f"http://{HOST_MLFLOW}:{PORT_MLFLOW}"
@@ -122,13 +107,14 @@ class ExperimentSearch:
         self.tags = {}
         self.X = None
         self.y = None
-        self.random_state = 42
+        self.random_state = VAL_SEED
         self.mlflow_id = None
         self.study = None
         self.initialized = False
         self.parent_run_id = None
+        self.device = "cuda"
         # Turn off optuna log notes.
-        optuna.logging.set_verbosity(optuna.logging.WARN)
+        # optuna.logging.set_verbosity(optuna.logging.WARN)
 
     def check_postgresql_server(
         self,
@@ -324,7 +310,6 @@ class ExperimentSearch:
         train_filename=None,
         predictors_name=None,
         n_predictors=None,
-        device="cuda",
         verbose=True,
     ):
         if frac_sample:
@@ -349,7 +334,7 @@ class ExperimentSearch:
             )
 
         all_train = cudf.read_csv(os.path.join(self.input_dir, self.train_filename))
-        if not device == "cuda":
+        if self.device != "cuda":
             all_train = all_train.to_pandas()
             # S'il y a des nan dans des bool ça donnera des object, on les convertit en float
             object_features = all_train.select_dtypes("object").columns
@@ -540,7 +525,253 @@ class ExperimentSearch:
         study = self.create_or_load_study()
         return id_experiment, study
 
-    def objective_lgb(self, trial):
+    def create_parent_run(self):
+        # On crée un run parent qui va contenir tous les runs (un run enfant par trial)
+        parent_run = mlflow.start_run(
+            experiment_id=self.mlflow_id,
+            run_name="Study",
+            tags=self.tags,
+            # description="Résultats de la recherche d'hyperparamètres",
+        )
+        self.parent_run_id = parent_run.info.run_id
+        mlflow.end_run()
+
+    def create_best_run(self):
+        with mlflow.start_run(
+            experiment_id=self.mlflow_id,
+            run_name=f"T_{self.study.best_trial.number}_best_of_{len(self.study.get_trials())}_trials",
+        ):
+            mlflow.log_params(self.study.best_trial.params)
+            mlflow.log_metric(self.metric, self.study.best_trial.value)
+            fig = optuna.visualization.plot_param_importances(self.study)
+            fig.write_html(os.path.join(self.output_dir, "hyperparam_importance.html"))
+            mlflow.log_artifact(
+                os.path.join(self.output_dir, "hyperparam_importance.html")
+            )
+            """fig = optuna.visualization.plot_parallel_coordinate(
+                self.study,
+                # params=["boosting_type", "n_estimators", "num_leaves", "learning_rate"],
+            )
+            fig.write_html(os.path.join(self.output_dir, "parallel_coordinate.html"))
+            mlflow.log_artifact(
+                os.path.join(self.output_dir, "parallel_coordinate.html")
+            )"""
+            fig = optuna.visualization.plot_optimization_history(self.study)
+            fig.write_html(os.path.join(self.output_dir, "optimization_history.html"))
+            mlflow.log_artifact(
+                os.path.join(self.output_dir, "optimization_history.html")
+            )
+
+    # Inutile, on va plutôt faire un run parent
+    def track_best_run(self):
+        # find the best run, log its metrics as the final metrics of this run.
+        # client = MlflowClient()
+
+        # Récupération de tous les runs de l'experiment
+        runs = mlflow.search_runs(experiment_ids=[self.mlflow_id])
+        print("len(runs)", len(runs), "type", type(runs))
+        # print(runs)
+
+        # On enlève le parent
+        # nested_runs = [run for run in runs if run.run_name != "best"]
+        # print(runs.columns)
+        nested_runs = runs[runs["tags.mlflow.parentRunId"].notnull()].sort_values(
+            by=f"metrics.{self.metric}", ascending=False
+        )
+        best_run = nested_runs.head(1)
+        print("len(nested_runs)", nested_runs.shape)
+
+        # parent_run_name = "best"
+        """runs = client.search_runs(
+            [self.mlflow_id], f"tags.mlflow.parentRunName == 'best'"
+        )"""
+
+        # Filtrer les runs qui ont le run parent désiré
+        # nested_runs = runs[runs["tags.mlflow.parentRunName"] == parent_run_name]
+        # nested_runs = [runs[runs["tags.mlflow.parentRunId"]] == self.parent_run_id]
+
+        """best_metric = 0
+
+        for r in nested_runs:
+            if r.data.metrics[self.metric] > best_metric:
+                best_run = r
+        if best_run:
+            print("Metrics du best", best_run.data.metrics)
+        else:
+            print("best run non trouvé")"""
+
+        """mlflow.set_tag("best_run", best_run.info.run_id)
+        mlflow.log_metrics(
+            {
+                f"train_{metric}": best_val_train,
+                f"val_{metric}": best_val_valid,
+                f"test_{metric}": best_val_test,
+            }
+        )"""
+        return best_run
+
+    # Permet de suggérer des float en en proposant plus autour de 0.5 si
+    # Si les params alpha et beta sont égaux et low=0 et high=1
+    def suggest_beta(self, param_name, low=0, high=1, alpha=2.0, beta_param=2.0):
+        # Sample a value from the beta distribution
+        value = beta.rvs(alpha, beta_param)
+        # Scale the value to the desired range [low, high]
+        scaled_value = low + (high - low) * value
+        return scaled_value
+
+
+class ExperimentSearchCuml(ExperimentSearch):
+    def __init__(self, metric="auc", direction="maximize"):
+        super().__init__(metric=metric, direction=direction)
+        self.device = "cuda"
+        self.model_name = "logreg"
+        # Turn off optuna log notes.
+        # optuna.logging.set_verbosity(optuna.logging.WARN)
+
+    def objective(self, trial):
+
+        with mlflow.start_run(
+            experiment_id=self.mlflow_id, run_name=f"{trial.number}", nested=True
+        ):
+            # doc cuml : https://docs.rapids.ai/api/cuml/nightly/api/#regression-and-classification
+            c = trial.suggest_float("C", 1e-7, 100.0, log=True)
+
+            # En cuml, pas le choix du solver mais
+            # si penalty=None ou l2 solver=L-BFGS,
+            # si penalty=l1 ou elasticnet avec un ratio_l1 > 0 alors solver=OWL-QN
+
+            penalty = trial.suggest_categorical(
+                "penalty", ["none", "l2", "l1", "elasticnet"]
+            )
+            # penalty = trial.suggest_categorical("penalty", ["l1", "elasticnet"])
+            if penalty == "elasticnet":
+                l1_ratio = trial.suggest_float("l1_ratio", 0.2, 0.8, log=False)
+            else:
+                l1_ratio = None
+
+            class_weight = trial.suggest_categorical(
+                "class_weight", ["none", "balanced"]
+            )
+            # class_weight = "balanced"
+            # Pour avoir l'équivallent d'un tol sklearn en cuml, il faut diviser le tol sklearn par sample_size
+            # tol = trial.suggest_float("tol", 1e-6, 1e-3)
+            fit_intercept = trial.suggest_categorical("fit_intercept", [True, False])
+            # fit_intercept = False
+            clf_params = {
+                "C": c,
+                "penalty": penalty,
+                "l1_ratio": l1_ratio,
+                "fit_intercept": fit_intercept,
+            }
+            # Petit bug pour le cuml LogisticRegression, on ne peut pas directement assigner class_weight
+            if class_weight == "balanced":
+                clf_params["class_weight"] = "balanced"
+
+            # Max_iter par défaut est 1_000. Si une régularisation l1 est appliquée, dans ces conditions,
+            # L'algorithme ne pourra pas converger. Soit on augmente max_iter, soit on scale les features binaires dans le pipe.
+            if penalty == "l1" or penalty == "elasticnet":
+                clf_params["max_iter"] = 10_000
+                if penalty == "elasticnet":
+                    clf_params["l1_ratio"] = l1_ratio
+
+            # On concentre la recherche du seuil autour de 0.5 avec la distribution Beta
+            # threshold_prob = self.suggest_beta("threshold_prob", low=0.05, high=0.95)
+            threshold_prob = trial.suggest_float(
+                "threshold_prob", 0.05, 0.95, log=False
+            )
+            print(
+                "Trial",
+                trial.number,
+                "penalty :",
+                penalty,
+                "l1_ratio :",
+                l1_ratio,
+                "threshold_prob :",
+                threshold_prob,
+            )
+
+            clf = LogisticRegression(**clf_params)
+            scores = cuml_cross_validate(
+                self.X,
+                self.y,
+                self.pipe_preprocess,
+                clf,
+                threshold_prob=threshold_prob,
+            )
+
+            mean_scores = scores.mean(axis=0)
+
+            # Minimise la log loss : ll = log_loss(test_y , y_predlr)
+
+            # Fin d'un trial
+            # del folds
+            # gc.collect()
+            dic_metrics = mean_scores.to_dict()
+            print(
+                "Trial",
+                trial.number,
+                "dic_metrics",
+                dic_metrics,
+                "type",
+                type(dic_metrics),
+            )
+
+            # Pour logguer les métriques additionnelles dans optuna_db :
+            # trial.set_user_attr("constraint", [c0])
+
+            """for k, v in dic_metrics.items():
+                mlflow.log_metric(k, v)"""
+            mlflow.log_metrics(dic_metrics)
+            all_params = {
+                "C": c,
+                "penalty": penalty,
+                # "l1_ratio": l1_ratio,
+                "fit_intercept": fit_intercept,
+                "class_weight": class_weight,
+                "threshold_prob": threshold_prob,
+            }
+            mlflow.log_params(all_params)
+        return dic_metrics[self.metric]
+
+    def run_logreg_trials(self, n_trials=20, n_jobs=1, verbose=True):
+        t0 = time.time()
+        if verbose:
+            print(f"Optimisation {n_trials} trials...")
+
+        self.study.optimize(
+            self.objective, n_trials=n_trials, n_jobs=1, gc_after_trial=True
+        )
+        if verbose:
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+
+    # La parallélisation ne fonctionne pas si CUDA car pas assez de mémoire
+    # ou tout simplement allocation sur CUDA en parallel ne fonctionne pas bien (alloue plus que nécessaire).
+    # On peut surveiller en temps réel la consommation de VRAM avec nvidia-smi -l 1 (crée une loop pour rafraichir toutes les 1 secondes)
+    # Le multithreads réglerait peut-être le problème de l'allocation VRAM mais MLFlow n'est pas thread-safe.
+    def optimize(self, n_trials=10, verbose=True):
+        t0 = time.time()
+        if verbose:
+            print(f"Optimisation {n_trials} trials sur CUDA...")
+
+        # self.run_logreg_trials(n_trials=n_trials, n_jobs=1, verbose=False)
+        self.study.optimize(
+            self.objective, n_trials=n_trials, n_jobs=1, gc_after_trial=True
+        )
+
+        if verbose:
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+        self.create_best_run()
+
+
+class ExperimentSearchLgbm(ExperimentSearch):
+    def __init__(self, metric="auc", direction="maximize"):
+        super().__init__(metric=metric, direction=direction)
+        self.device = "cpu"
+        self.model_name = "lgbm"
+        # Turn off optuna log notes.
+        # optuna.logging.set_verbosity(optuna.logging.WARN)
+
+    def objective(self, trial):
         # parent_run_name = "best"
         # Attention les n° de trial ne correspondent pas à ceux fournis en logging stdout
         with mlflow.start_run(
@@ -640,6 +871,7 @@ class ExperimentSearch:
                     learning_rate=learning_rate,
                     max_bin=max_bin,
                     callbacks=[pruning_callback],
+                    random_state=VAL_SEED,
                     verbose=-1,
                 )
                 t0_fit_time = time.time()
@@ -695,260 +927,64 @@ class ExperimentSearch:
             mlflow.log_params(hyperparams)
         return dic_metrics[self.metric]
 
-    def objective_logreg(self, trial):
-
-        with mlflow.start_run(
-            experiment_id=self.mlflow_id, run_name=f"{trial.number}", nested=True
-        ):
-            # doc cuml : https://docs.rapids.ai/api/cuml/nightly/api/#regression-and-classification
-            c = trial.suggest_float("C", 1e-7, 100.0, log=True)
-
-            # En cuml, pas le choix du solver mais
-            # si penalty=None ou l2 solver=L-BFGS,
-            # si penalty=l1 ou elasticnet avec un ratio_l1 > 0 alors solver=OWL-QN
-
-            penalty = trial.suggest_categorical(
-                "penalty", ["none", "l2", "l1", "elasticnet"]
-            )
-            # penalty = trial.suggest_categorical("penalty", ["l1", "elasticnet"])
-            if penalty == "elasticnet":
-                l1_ratio = trial.suggest_float("l1_ratio", 0.2, 0.8, log=False)
-            else:
-                l1_ratio = None
-
-            # penalty = "none"
-
-            class_weight = trial.suggest_categorical(
-                "class_weight", ["none", "balanced"]
-            )
-            # class_weight = "balanced"
-            # Pour avoir l'équivallent d'un tol sklearn en cuml, il faut diviser le tol sklearn par sample_size
-            # tol = trial.suggest_float("tol", 1e-6, 1e-3)
-            fit_intercept = trial.suggest_categorical("fit_intercept", [True, False])
-            # fit_intercept = False
-            clf_params = {
-                "C": c,
-                "penalty": penalty,
-                "l1_ratio": l1_ratio,
-                "fit_intercept": fit_intercept,
-            }
-            # Petit bug pour le cuml LogisticRegression, on ne peut pas directement assigner class_weight
-            if class_weight == "balanced":
-                clf_params["class_weight"] = "balanced"
-
-            # Max_iter par défaut est 1_000. Si une régularisation l1 est appliquée, dans ces conditions,
-            # L'algorithme ne pourra pas converger. Soit on augmente max_iter, soit on scale les features binaires dans le pipe.
-            if penalty == "l1" or penalty == "elasticnet":
-                clf_params["max_iter"] = 10_000
-                if penalty == "elasticnet":
-                    clf_params["l1_ratio"] = l1_ratio
-
-            # On concentre la recherche du seuil autour de 0.5 avec la distribution Beta
-            # threshold_prob = self.suggest_beta("threshold_prob", low=0.05, high=0.95)
-            threshold_prob = trial.suggest_float(
-                "threshold_prob", 0.05, 0.95, log=False
-            )
-            print(
-                "Trial",
-                trial.number,
-                "penalty :",
-                penalty,
-                "l1_ratio :",
-                l1_ratio,
-                "threshold_prob :",
-                threshold_prob,
-            )
-
-            clf = LogisticRegression(**clf_params)
-            scores = cuml_cross_validate(
-                self.X,
-                self.y,
-                self.pipe_preprocess,
-                clf,
-                threshold_prob=threshold_prob,
-            )
-
-            mean_scores = scores.mean(axis=0)
-
-            # Minimise la log loss : ll = log_loss(test_y , y_predlr)
-
-            # Fin d'un trial
-            # del folds
-            # gc.collect()
-            dic_metrics = mean_scores.to_dict()
-            print(
-                "Trial",
-                trial.number,
-                "dic_metrics",
-                dic_metrics,
-                "type",
-                type(dic_metrics),
-            )
-
-            # Pour logguer les métriques additionnelles dans optuna_db :
-            # trial.set_user_attr("constraint", [c0])
-
-            for k, v in dic_metrics.items():
-                mlflow.log_metric(k, v)
-            # mlflow.log_metrics(dic_metrics)
-            all_params = {
-                "C": c,
-                "penalty": penalty,
-                # "l1_ratio": l1_ratio,
-                "fit_intercept": fit_intercept,
-                "class_weight": class_weight,
-                "threshold_prob": threshold_prob,
-            }
-            mlflow.log_params(all_params)
-        return dic_metrics[self.metric]
-
-    def create_parent_run(self):
-        # On crée un run parent qui va contenir tous les runs (un run enfant par trial)
-        parent_run = mlflow.start_run(
-            experiment_id=self.mlflow_id,
-            run_name="Study",
-            tags=self.tags,
-            # description="Résultats de la recherche d'hyperparamètres",
-        )
-        self.parent_run_id = parent_run.info.run_id
-        mlflow.end_run()
-
-    def run_lgb_trials(self, n_trials=20, n_jobs=8, verbose=True):
-        t0 = time.time()
-        if verbose:
-            print(f"Optimisation {n_trials} trials...")
+    def run_lgb_trials(self, n_trials=10, reseed_sampler=False):
+        if reseed_sampler:
+            self.study.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
+            self.study.sampler.reseed_rng()
+        else:
+            self.study.sampler = optuna.samplers.TPESampler()
 
         self.study.optimize(
-            self.objective_lgb, n_trials=n_trials, n_jobs=n_jobs, gc_after_trial=True
+            self.objective, n_trials=n_trials, n_jobs=1, gc_after_trial=True
         )
 
-        if verbose:
-            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+    # Pourquoi Lgbm sur CPU et pas cuda / gpu contrairement aux modèles linéaires ?
+    # RAPID avec cudf ou cuml ne supporte pas lightgbm puisque lightgbm apporte son propre support GPU. Cependant,
+    # Lgbm existe sur GPU mais n'est pas performant du tout si beaucoup de vraiables en OneHot.
+    # Dans notre cas (beaucoup de OneHot), le traitement GPU est plus long que le le traitement CPU.
+    # On choisit donc CPU pour ce modèle, mais on tente de paralléliser.
 
-    def run_logreg_trials(self, n_trials=20, n_jobs=1, verbose=True):
+    # Parallélisation des jobs sur CPU :
+    # La vraie parallélisation est beaucoup plus rapide que le multithread (multithread optuna = optimize avec n_jobs > 1)
+    # share_sampler_seed permet de s'assurer que le sampler ne va pas proposer les mêmes combinaisons de paramètres dans chaque workers,
+    # grâce à la méthode opuna .reseed_rng().
+    # cependant, les traitements sont alors vraiment beaucoup plus longs
+    # (comme le sampler doit être partagé entre les workers, il s'agit probbablement de multithrading).
+
+    # Si share_sampler_seed est false, on applique tout simplement un sampler avec une graine différente dans chaque worker,
+    # C'est BEAUCOUP PLUS RAPIDE (du simple au double au minimum).
+    # Les résultats ne sont pas reproductibles en parallélisation quelque soit la valeur de share_sampler_seed (True ou False), Mais
+    # les résultats sont un PETIT PEU MEILLEURS avec share_sampler_seed=True qu'avec share_sampler_seed=False .
+    def optimize(
+        self,
+        n_workers=4,
+        n_trials_per_worker=10,
+        share_sampler_seed=False,
+        verbose=True,
+    ):
         t0 = time.time()
-        if verbose:
-            print(f"Optimisation {n_trials} trials...")
 
-        self.study.optimize(
-            self.objective_logreg, n_trials=n_trials, n_jobs=n_jobs, gc_after_trial=True
-        )
-        if verbose:
-            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
-
-    def create_best_run(self):
-        with mlflow.start_run(
-            experiment_id=self.mlflow_id,
-            run_name=f"T_{self.study.best_trial.number}_best_of_{len(self.study.get_trials())}_trials",
-        ):
-            mlflow.log_params(self.study.best_trial.params)
-            mlflow.log_metric(self.metric, self.study.best_trial.value)
-            fig = optuna.visualization.plot_param_importances(self.study)
-            fig.write_html(os.path.join(self.output_dir, "hyperparam_importance.html"))
-            mlflow.log_artifact(
-                os.path.join(self.output_dir, "hyperparam_importance.html")
-            )
-            """fig = optuna.visualization.plot_parallel_coordinate(
-                self.study,
-                # params=["boosting_type", "n_estimators", "num_leaves", "learning_rate"],
-            )
-            fig.write_html(os.path.join(self.output_dir, "parallel_coordinate.html"))
-            mlflow.log_artifact(
-                os.path.join(self.output_dir, "parallel_coordinate.html")
-            )"""
-            fig = optuna.visualization.plot_optimization_history(self.study)
-            fig.write_html(os.path.join(self.output_dir, "optimization_history.html"))
-            mlflow.log_artifact(
-                os.path.join(self.output_dir, "optimization_history.html")
-            )
-
-    def run_lgb(self, n_workers=8, n_trials_per_worker=10, verbose=True):
-        t0 = time.time()
         if verbose:
             print(
                 f"Optimisation {n_trials_per_worker * n_workers} trials sur CPU. Parallélisation : {n_workers} workers de {n_trials_per_worker} trials chacun..."
             )
-
-        Parallel(n_jobs=n_workers)(
-            delayed(self.run_lgb_trials)(n_trials_per_worker, 1, False)
-            for _ in range(n_workers)
-        )
-
-        if verbose:
-            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
-        self.create_best_run()
-
-    # La parallélisation ne fonctionne pas si CUDA car pas assez de mémoire
-    # ou tout simplement allocation sur CUDA en parallel ne fonctionne pas bien (alloue plus que nécessaire).
-    # On peut surveiller en temps réel la consommation de VRAM avec nvidia-smi -l 1 (crée une loop pour rafraichir toutes les 1 secondes)
-    # Le multithreads réglerait peut-être le problème de l'allocation VRAM mais MLFlow n'est pas thread-safe.
-    def run_logreg(self, n_trials=10, verbose=True):
-        t0 = time.time()
-        if verbose:
-            print(f"Optimisation {n_trials} trials sur CUDA...")
-
-        self.run_logreg_trials(n_trials=n_trials, n_jobs=1, verbose=False)
-
-        if verbose:
-            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
-        self.create_best_run()
-
-    # Inutile, on va plutôt faire un run parent
-    def track_best_run(self):
-        # find the best run, log its metrics as the final metrics of this run.
-        # client = MlflowClient()
-
-        # Récupération de tous les runs de l'experiment
-        runs = mlflow.search_runs(experiment_ids=[self.mlflow_id])
-        print("len(runs)", len(runs), "type", type(runs))
-        # print(runs)
-
-        # On enlève le parent
-        # nested_runs = [run for run in runs if run.run_name != "best"]
-        # print(runs.columns)
-        nested_runs = runs[runs["tags.mlflow.parentRunId"].notnull()].sort_values(
-            by=f"metrics.{self.metric}", ascending=False
-        )
-        best_run = nested_runs.head(1)
-        print("len(nested_runs)", nested_runs.shape)
-
-        # parent_run_name = "best"
-        """runs = client.search_runs(
-            [self.mlflow_id], f"tags.mlflow.parentRunName == 'best'"
-        )"""
-
-        # Filtrer les runs qui ont le run parent désiré
-        # nested_runs = runs[runs["tags.mlflow.parentRunName"] == parent_run_name]
-        # nested_runs = [runs[runs["tags.mlflow.parentRunId"]] == self.parent_run_id]
-
-        """best_metric = 0
-
-        for r in nested_runs:
-            if r.data.metrics[self.metric] > best_metric:
-                best_run = r
-        if best_run:
-            print("Metrics du best", best_run.data.metrics)
+        if share_sampler_seed:
+            print("Seed recalculée pour chaque worker.")
+            Parallel(n_jobs=n_workers)(
+                delayed(self.run_lgb_trials)(n_trials_per_worker, True)
+                for _ in range(n_workers)
+            )
         else:
-            print("best run non trouvé")"""
+            print("Seed aléatoire pour chaque worker.")
 
-        """mlflow.set_tag("best_run", best_run.info.run_id)
-        mlflow.log_metrics(
-            {
-                f"train_{metric}": best_val_train,
-                f"val_{metric}": best_val_valid,
-                f"test_{metric}": best_val_test,
-            }
-        )"""
-        return best_run
+            Parallel(n_jobs=n_workers)(
+                delayed(self.run_lgb_trials)(n_trials_per_worker, False)
+                for i in range(n_workers)
+            )
 
-    # Permet de suggérer des float en en proposant plus autour de 0.5 si
-    # Si les params alpha et beta sont égaux et low=0 et high=1
-    def suggest_beta(self, param_name, low=0, high=1, alpha=2.0, beta_param=2.0):
-        # Sample a value from the beta distribution
-        value = beta.rvs(alpha, beta_param)
-        # Scale the value to the desired range [low, high]
-        scaled_value = low + (high - low) * value
-        return scaled_value
+        if verbose:
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+        self.create_best_run()
 
 
 """
