@@ -1,6 +1,8 @@
 import numpy as np
 
 import cudf
+import cuml
+import sklearn
 from cuml.preprocessing import RobustScaler, MinMaxScaler, StandardScaler
 from sklearn.base import BaseEstimator, TransformerMixin, check_is_fitted
 from imblearn.under_sampling import NearMiss
@@ -491,6 +493,84 @@ def get_binary_features(df):
     ]
     binary_features = features_bool + features_bin_not_bool
     return binary_features
+
+
+def train_test_split_nan(df, y=None, test_size=0.25, shuffle=True, random_state=42):
+    """Réalise un train_test_split stratifié sur cudf ou pandas Dataframe, même s'il y a des NaN
+
+    Args:
+        df (cudf ou pandas DataFrame): Données à splitter
+        y (cudf ou pandas Series, optional): target utilisée pour stratifier. Si elle n'est pas indiquée, il s'agit d'une colonne de df nommée 'TARGET'. Defaults to None.
+        test_size (float, optional): fraction pour le jeu de test. Defaults to 0.25.
+        shuffle (bool, optional): Mélange du dataset avant le split. Defaults to True.
+        random_state (int, optional): Graine pour la reproductibilité des résultats. Defaults to 42.
+
+    Returns:
+        cudf ou pandas DF/Series selon le type de df: X_train, X_test, y_train, y_test
+    """
+    # Si y n'est pas fournie, on considère qu'il s'agit de la colonne nommée "TARGET" dans le df
+    if y is None:
+        if "TARGET" not in df.columns:
+            print("TARGET n'est pas dans le dataset, veuillez préciser y")
+            return
+        else:
+            y = df["TARGET"]
+            X = df.drop("TARGET", axis=1)
+    # Si la target a été fournie en param, on n'enlève pas 'TARGET' du df
+    else:
+        X = df
+
+    # Si le dataset est un cudf
+    if isinstance(X, (cudf.core.dataframe.DataFrame, cudf.core.series.Series)):
+        n_missing = df.isna().sum().sum()
+        # train_test_split de cuml n'autorise pas les nan
+        # Si'il n'y a pas de nan, on utilise train_test_split de cuml
+        if n_missing == 0:
+            return cuml.model_selection.train_test_split(
+                X,
+                y,
+                test_size=test_size,
+                shuffle=shuffle,
+                stratify=y,
+                random_state=random_state,
+            )
+        # s'il y a des nan dans le cudf, il nous faut au moins 2 colonnes sans nan dans X
+        else:
+            if isinstance(X, cudf.core.series.Series):
+                print(
+                    "Le dataset doit comporter au moins 2 colonnes sans NaN or X est une série"
+                )
+                return
+            columns_without_nan = [c for c in X.columns if X[c].isna().sum() == 0]
+            if len(columns_without_nan) < 2:
+                print("Le dataset doit comporter au moins 2 colonnes sans NaN")
+                return
+            # Si on a suffisemment de colonnes sans nan, on effetue le split sur 2 colonnes pour récupérer les index des slits
+            X_train_tmp, X_test_tmp, y_train, y_test = (
+                cuml.model_selection.train_test_split(
+                    X[columns_without_nan[:2]],
+                    y,
+                    test_size=test_size,
+                    shuffle=shuffle,
+                    stratify=y,
+                    random_state=random_state,
+                )
+            )
+            X_train = X.loc[X_train_tmp.index, X.columns]
+            X_test = X.loc[X_test_tmp.index, X.columns]
+            return X_train, X_test, y_train, y_test
+
+    # Si le dataset n'est pas de type cudf, on considère qu'il s'agit d'un pandas df ou un numpy array
+    # if isinstance(df, (pd.core.frame.DataFrame, pd.core.frame.Series))
+    else:
+        return sklearn.model_selection.train_test_split(
+            X,
+            y,
+            test_size=test_size,
+            shuffle=shuffle,
+            stratify=y,
+            random_state=random_state,
+        )
 
 
 def balance_nearmiss(

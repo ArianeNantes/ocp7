@@ -34,6 +34,7 @@ import math
 import warnings
 
 # Personnalisées
+from .p7_preprocess import check_no_nan
 from src.p7_regex import sel_item_regex
 
 # from src.p7_regex import sel_lines_regex
@@ -42,6 +43,35 @@ from src.p7_regex import sel_item_regex
 # from src.p7_pre_process import LogTranformer, BoxCoxTranformer
 
 from src.p7_color import get_palette_colors
+
+"""***********************************************************************************************************************
+RUBRIQUE BALANCE
+**************************************************************************************************************************
+"""
+
+
+def plot_default_ratio(series):
+    labels = ["Ok", "Défaut"]
+    # Plot en camembert
+    fig, ax = plt.subplots(figsize=(7, 5))
+    fig.suptitle(
+        f"Pourcentage de prêts avec et sans défaut de remboursement\nNombre d'observations : {len(series):_}",
+        ha="left",  # Aligne les deux ligne du titre sur leur gauche
+        x=0.0,  # Positionne les lignes du titres complètement à gauche
+    )
+    ratio = series.value_counts(normalize=True)
+    # Si on a un cudf la conversion en numpy est nécessaire. Si on a un pd.df, la conversion ne nuit pas.
+    ax.pie(
+        series.value_counts(normalize=True).to_numpy(),
+        labels=labels,
+        autopct="%.1f%%",
+    )
+
+    fig.legend(loc="lower right")
+    fig.tight_layout()
+    plt.show()
+    return
+
 
 """***********************************************************************************************************************
 RUBRIQUE TRANSFORMATIONS
@@ -1045,6 +1075,7 @@ def corr_cluster_map(
         dist = squareform(1 - abs(corr))
 
         # Réalisation du clustering hiérarchique
+        # corr_linkage = hierarchy.complete(dist)
         corr_linkage = hierarchy.complete(dist)
 
         # Récupération du dendrogramme
@@ -1060,14 +1091,9 @@ def corr_cluster_map(
             corr_linkage,
             orientation="right",
             ax=ax_dendro,
-            # labels=to_process
             labels=to_process,
-            # labels=to_process,
-            # color_threshold=threshold,
-            # above_threshold_color='black'
         )
         # Ligne pour tracer le seuil
-        # On trace la moyenne, la médiane et le mode
         ax_dendro.vlines(
             threshold,
             ymin=ax_dendro.get_ylim()[0],

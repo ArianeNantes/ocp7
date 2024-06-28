@@ -43,7 +43,7 @@ from src.p7_constantes import (
     DATA_BASE,
     DATA_INTERIM,
     MODEL_DIR,
-    RANDOM_SEED,
+    VAL_SEED,
     # GENERATE_SUBMISSION_FILES,
     # STRATIFIED_KFOLD,
     # NUM_FOLDS,
@@ -69,7 +69,7 @@ CONFIG_SIMPLE = {
     "stratified_kfold": True,
     "num_folds": 10,
     "early_stopping": 100,
-    "random_seed": 1001,
+    "VAL_SEED": 1001,
 }
 
 # LightGBM parameters found by Bayesian optimization for kernel simple_features
@@ -107,7 +107,11 @@ def make_model_dir(config=CONFIG_SIMPLE):
 def one_hot_encoder(df, nan_as_category=True):
     original_columns = list(df.columns)
     categorical_columns = [col for col in df.columns if df[col].dtype == "object"]
-    df = pd.get_dummies(df, columns=categorical_columns, dummy_na=nan_as_category)
+    # On ne peut pas pour l'instant fixer le paramètre drop_first à True,
+    # car nous avons besoin des colonnes pour les aggrégations
+    df = pd.get_dummies(
+        df, columns=categorical_columns, drop_first=False, dummy_na=nan_as_category
+    )
     new_columns = [c for c in df.columns if c not in original_columns]
     return df, new_columns
 
@@ -414,13 +418,13 @@ def kfold_lightgbm_simple(df=None, config=CONFIG_SIMPLE):
         folds = StratifiedKFold(
             n_splits=config["num_folds"],
             shuffle=True,
-            random_state=config["random_seed"],
+            random_state=config["VAL_SEED"],
         )
     else:
         folds = KFold(
             n_splits=config["num_folds"],
             shuffle=True,
-            random_state=config["random_seed"],
+            random_state=config["VAL_SEED"],
         )
     # Create arrays and dataframes to store results
     oof_preds = np.zeros(train_df.shape[0])
@@ -446,7 +450,7 @@ def kfold_lightgbm_simple(df=None, config=CONFIG_SIMPLE):
 
         # LightGBM parameters found by Bayesian optimization
         params = {
-            "random_state": config["random_seed"],
+            "random_state": config["VAL_SEED"],
             "nthread": config["num_threads"],
         }
         clf = LGBMClassifier(**{**params, **LIGHTGBM_PARAMS_SIMPLE})
@@ -604,6 +608,14 @@ def get_simple_data(config=CONFIG_SIMPLE):
         df = df.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
     with timer("Remplacement des valeurs infinies par NaN"):
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    with timer("Suppression des colonnes de variance nulle"):
+        features = [
+            feature for feature in df.columns if feature not in ["SK_ID_CURR", "TARGET"]
+        ]
+        all_std = df[features].std()
+        null_std_features = all_std[all_std == 0.0].index
+        df.drop(null_std_features, axis=1, inplace=True)
+        print("Train and test df shape:", df.shape)
 
     # write data
     print("write data")
@@ -620,7 +632,7 @@ def get_simple_data(config=CONFIG_SIMPLE):
     # Nous nous réservons donc nouveau un jeu de test parmi le jeu de train initial.
     with timer("Partage Train Test(25%)"):
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.25, random_state=RANDOM_SEED, stratify=y
+            X, y, test_size=0.25, random_state=VAL_SEED, stratify=y
         )
         del X, y
         gc.collect()

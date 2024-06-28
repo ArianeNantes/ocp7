@@ -48,7 +48,7 @@ from src.p7_constantes import (
     DATA_INTERIM,
     GENERATE_SUBMISSION_FILES,
     STRATIFIED_KFOLD,
-    RANDOM_SEED,
+    VAL_SEED,
     NUM_FOLDS,
     EARLY_STOPPING,
     MODEL_DIR,
@@ -412,6 +412,12 @@ class DataFull:
         df = self.del_null_std(df)
         print("Suppression d'une modalité pour les colonnes encodées en One Hot")
         df = self.drop_first_categories(df)
+
+        to_drop = ["SK_ID_PREV", "SK_ID_BUREAU", "index"]
+        for f in to_drop:
+            if f in df.columns:
+                df.drop(f, axis=1, inplace=True)
+
         df = df.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
         print("all_data.info :")
         print(df.info())
@@ -431,7 +437,11 @@ class DataFull:
         df = df[
             df["AMT_INCOME_TOTAL"] < 20000000
         ]  # Max income in test is 4M; train has a 117M value
-        # Contraitrement à Pandas, l'introduction de cudf.NA dans une colonne ne modifiera pas le type de la colonne
+        # Contraitrement à Pandas, l'introduction de cudf.NA dans une colonne ne modifie pas le type de la colonne en object
+        # De même, l'introduire np.nan ne modifie pas le type de la colonne en float64, il faut donc caste ravant
+        """df[["DAYS_EMPLOYED", "DAYS_LAST_PHONE_CHANGE"]] = df[
+            ["DAYS_EMPLOYED", "DAYS_LAST_PHONE_CHANGE"]
+        ].astype("float64")"""
         df["DAYS_EMPLOYED"] = df["DAYS_EMPLOYED"].replace(365243, cudf.NA)
         df["DAYS_EMPLOYED"] = df["DAYS_EMPLOYED"].replace(0, cudf.NA)
         df["DAYS_LAST_PHONE_CHANGE"] = df["DAYS_LAST_PHONE_CHANGE"].replace(0, cudf.NA)
@@ -1125,7 +1135,7 @@ class DataFull:
             cc_agg = group_and_merge(cc_recent, cc_agg, prefix, CREDIT_CARD_TIME_AGG)
         return cc_agg
 
-    def inf_to_nan(self, df):
+    def inf_to_nan_old(self, df):
         if not isinstance(df, (pd.DataFrame, pd.Series)):
             # On convertit en Pandas
             # Attention np.nan est un float64 (pd.NA tansformerait la colonne en dtype object)
@@ -1139,8 +1149,20 @@ class DataFull:
         # Contrairement à pandas, cudf.NA ne modifie pas le type de la colonne
         # Provoque malheureusement une erreur : Potentially unsafe cast for non-equivalent float32 to int64
         # X = df.replace([float("inf"), -float("inf")], np.nan)
-
         return X
+
+    def inf_to_nan(self, df, verbose=True):
+        if verbose:
+            # On identifie les colonnes comportant des NaN (parmi les float)
+            # Il n'y a des inf que dans les float64
+            infinite_columns = []
+            for col in df.select_dtypes("float").columns:
+                if (df[col] == np.inf).any() or (df[col] == -np.inf).any():
+                    infinite_columns.append(col)
+            print(f"{len(infinite_columns)} features comportent des valeurs infinies :")
+            print(infinite_columns)
+        df.select_dtypes("float").replace([np.inf, -np.inf], np.nan, inplace=True)
+        return df
 
     def del_null_std(self, df, verbose=True):
         to_drop = []
@@ -1314,11 +1336,9 @@ def kfold_lightgbm_sklearn(data, categorical_feature=None):
     predictors = list(filter(lambda v: v not in del_features, df.columns))
 
     if not STRATIFIED_KFOLD:
-        folds = KFold(n_splits=NUM_FOLDS, shuffle=True, random_state=RANDOM_SEED)
+        folds = KFold(n_splits=NUM_FOLDS, shuffle=True, random_state=VAL_SEED)
     else:
-        folds = StratifiedKFold(
-            n_splits=NUM_FOLDS, shuffle=True, random_state=RANDOM_SEED
-        )
+        folds = StratifiedKFold(n_splits=NUM_FOLDS, shuffle=True, random_state=VAL_SEED)
 
     # Hold oof predictions, test predictions, feature importance and training/valid auc
     oof_preds = np.zeros(df.shape[0])
@@ -1332,7 +1352,7 @@ def kfold_lightgbm_sklearn(data, categorical_feature=None):
         train_x, train_y = df[predictors].iloc[train_idx], df["TARGET"].iloc[train_idx]
         valid_x, valid_y = df[predictors].iloc[valid_idx], df["TARGET"].iloc[valid_idx]
 
-        params = {"random_state": RANDOM_SEED, "nthread": NUM_THREADS}
+        params = {"random_state": VAL_SEED, "nthread": NUM_THREADS}
         clf = LGBMClassifier(**{**params, **LIGHTGBM_PARAMS_FULL})
 
         if not categorical_feature:
