@@ -293,7 +293,7 @@ class ExpMlFlow:
         env = os.environ.copy()
 
         # Start the MLflow server
-        print("Démarrage du serveur MLFlow")
+        print("Démarrage du serveur MLFlow...")
         process = subprocess.Popen(
             cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
@@ -410,11 +410,6 @@ class ExpMlFlow:
             return
         tags = self.meta._tags
         tags["mlflow.note.content"] = self.meta._description
-        print(
-            "[debug] create_or_lod_experiment, meta._description:",
-            self.meta._description,
-        )
-        print("[debug] create_or_lod_experiment, tags:", tags)
 
         # On vérifie si l'expérience existe déjà
         existing_experiment = mlflow.get_experiment_by_name(self.meta._name)
@@ -424,13 +419,11 @@ class ExpMlFlow:
             experiment_id = existing_experiment.experiment_id
             load_or_create = "Chargement de "
         else:
-            print(f"[debug] Je crée l'exp {self.meta._name}")
             experiment_id = mlflow.create_experiment(
                 self.meta._name,
                 artifact_location=self.output_dir,
                 tags=tags,
             )
-            print(f"[debug] Ca y est {self.meta._name} est créée")
         self._mlflow_id = experiment_id
         if verbose:
             print(
@@ -504,9 +497,11 @@ class ExpSearch(ExpMlFlow):
         self.meta.suffix2 = metric
         self.meta.extra_tags = {"direction": self.direction, "metric": self.metric}
 
-        # Par défaut dans optuna, on ne loque à l'écran que les warnings
-        # Pour loguer les trials optuna.logging.INFO
-        self.optuna_verbosity = optuna.logging.WARNING
+        # Par défaut dans optuna, on loggue les trials à l'écran
+        # Pour ne loguer que les trials optuna.logging.WARNING
+        # L'affichage des infos ou non sera véritablement effectué lors de l'optimisation en fonction du nombre de trials dans les classes enfantes
+        self.optuna_verbosity = optuna.logging.INFO
+        optuna.logging.set_verbosity(self.optuna_verbosity)
         self.sampler = optuna.samplers.TPESampler()
         self.pruner = optuna.pruners.HyperbandPruner(
             min_resource=10, max_resource=400, reduction_factor=3
@@ -524,6 +519,9 @@ class ExpSearch(ExpMlFlow):
         # optuna.logging.set_verbosity(optuna.logging.WARN)
         # Les expéreince de recherche d'yperparamètres nécessitent postgresql en back-end
         self._check_pg = True
+        # Par défaut on ne loggue pas dans mlflow le plot des params en parallel, cela dépend du modèle,
+        # donc à définire dans classe enfant
+        self._params_to_plot_in_parallel = []
 
     # Attributs publics de l'objet
     @property
@@ -546,7 +544,7 @@ class ExpSearch(ExpMlFlow):
             # alors elle existe et on la continue. Cependant ce ne sera a priori jamais le cas.
             load_if_exists=True,
         )
-        print("[debug] je crée ou load une study")
+        # [TODO] si le temps mettre un warning si la study existe déjà (voir si nécessaire)
         self._study = study
         return self._study
 
@@ -635,14 +633,20 @@ class ExpSearch(ExpMlFlow):
             mlflow.log_artifact(
                 os.path.join(self.output_dir, "hyperparam_importance.html")
             )
-            """fig = optuna.visualization.plot_parallel_coordinate(
-                self._study,
-                # params=["boosting_type", "n_estimators", "num_leaves", "learning_rate"],
-            )
-            fig.write_html(os.path.join(self.output_dir, "parallel_coordinate.html"))
-            mlflow.log_artifact(
-                os.path.join(self.output_dir, "parallel_coordinate.html")
-            )"""
+            # On ne logue dans ml flow le parallel_plot que si une liste est définie (change en fonction deu modèle)
+            if self._params_to_plot_in_parallel:
+                fig = optuna.visualization.plot_parallel_coordinate(
+                    self._study,
+                    params=self._params_to_plot_in_parallel,
+                )
+                fig.write_html(
+                    os.path.join(self.output_dir, "parallel_coordinate.html")
+                )
+                mlflow.log_artifact(
+                    os.path.join(self.output_dir, "parallel_coordinate.html")
+                )
+
+            # On loggue dans mlflow les visualisations qui ne dépendent pas du modèle
             fig = optuna.visualization.plot_optimization_history(self._study)
             fig.write_html(os.path.join(self.output_dir, "optimization_history.html"))
             mlflow.log_artifact(

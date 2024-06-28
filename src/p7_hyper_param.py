@@ -82,6 +82,14 @@ class SearchLogReg(ExpSearch):
         self.device = "cuda"
         # Comme CUDA est utilisé, on ne parallélise pas, on peut donc fiwxer la graine du sampler
         self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
+        # Liste des paramètres qu'on veut voir affichés dans le parrallel plot fait par optuna
+        self._params_to_plot_in_parallel = [
+            "C",
+            "penalty",
+            "class_weight",
+            "threshold_prob",
+            "fit_intercept",
+        ]
 
     def objective(self, trial):
 
@@ -182,6 +190,13 @@ class SearchLogReg(ExpSearch):
     # On peut surveiller en temps réel la consommation de VRAM avec nvidia-smi -l 1 (crée une loop pour rafraichir toutes les 1 secondes)
     # Le multithreads réglerait peut-être le problème de l'allocation VRAM mais MLFlow n'est pas thread-safe.
     def optimize(self, n_trials=10, verbose=True):
+        # Si le nombre de trials est grand, on ne les loggue pas à l'écran, à la place on affiche uniquement les warnings
+        if n_trials > 20:
+            self.optuna_verbosity = optuna.logging.WARNING
+        else:
+            self.optuna_verbosity = optuna.logging.INFO
+        optuna.logging.set_verbosity(self.optuna_verbosity)
+
         t0 = time.time()
         if verbose:
             print(f"Optimisation {n_trials} trials sur CUDA...")
