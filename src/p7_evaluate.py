@@ -1,3 +1,5 @@
+import array
+from decimal import Rounded
 import matplotlib.pyplot as plt
 import seaborn as sns
 from matplotlib.cbook import CallbackRegistry
@@ -11,6 +13,7 @@ import time
 from contextlib import contextmanager
 from lightgbm import LGBMClassifier, record_evaluation
 import cudf
+import cuml
 from cuml.pipeline import Pipeline
 from cuml.linear_model import LogisticRegression
 from sklearn.model_selection import KFold, StratifiedKFold
@@ -33,7 +36,13 @@ from copy import deepcopy
 from src.p7_file import make_dir
 from src.p7_regex import sel_var
 from src.p7_util import format_time_min, format_time
-from src.p7_metric import pred_prob_to_binary, penalize_f1, penalize_business_gain
+from src.p7_metric import (
+    cu_pred_prob_to_binary,
+    pd_pred_prob_to_binary,
+    penalize_f1,
+    penalize_business_gain,
+    cupd_recall_score,
+)
 from src.p7_preprocess import Imputer, VarianceSelector, CuRobustScaler, CuMinMaxScaler
 from src.p7_preprocess import get_binary_features
 
@@ -46,7 +55,7 @@ from src.p7_constantes import (
     MODEL_DIR,
     # GENERATE_SUBMISSION_FILES,
     # STRATIFIED_KFOLD,
-    # RANDOM_SEED,
+    VAL_SEED,
     # NUM_FOLDS,
     # EARLY_STOPPING,
 )
@@ -166,7 +175,7 @@ def lgb_cross_evaluate(
         train_set,
         # num_boost_round=1_000,
         nfold=10,
-        seed=42,
+        seed=VAL_SEED,
         shuffle=True,
         stratified=True,
         callbacks=callbacks,
@@ -381,7 +390,7 @@ def evaluate_lgbm(train_df, params, hyperparams, config=CONFIG_SIMPLE):
     folds = StratifiedKFold(
         n_splits=config["num_folds"],
         shuffle=True,
-        random_state=config["random_seed"],
+        random_state=VAL_SEED,
     )
 
     # Passe les variables catégorielles en dtype category sinon LGM ne pourra pas les traiter
@@ -478,13 +487,14 @@ def evaluate_lgbm(train_df, params, hyperparams, config=CONFIG_SIMPLE):
     return
 
 
+# Vieux, remplacé par cuml_cross_evaluate
 def logreg_cross_evaluate(
     train_and_val,
     pipe,
     hyperparams,
     threshold_prob=0.5,
     n_folds=5,
-    random_state=42,
+    random_state=VAL_SEED,
 ):
     """
     Tous les param de logreg desklearn:
@@ -543,7 +553,7 @@ def logreg_cross_evaluate(
         # Probabilité d'appartenir à la classe default pour le jeu de validation
         y_score_val = clf.predict_proba(X_val_processed)[1].to_numpy()
         # Prédiction de la classe en fonction du seuil de probabilité
-        y_pred_val = pred_prob_to_binary(y_score_val, threshold=threshold_prob)
+        y_pred_val = pd_pred_prob_to_binary(y_score_val, threshold=threshold_prob)
 
         # Mesures sur le jeu de validation
         dic_val_scores["auc"].append(roc_auc_score(y_val, y_score_val))
@@ -561,7 +571,7 @@ def logreg_cross_evaluate(
         # Probabilité d'appartenir à la classe default pour le jeu de train
         y_score_train = clf.predict_proba(X_train_processed)[1].to_numpy()
         # Prédiction de la classe en fonction du seuil de probabilité
-        y_pred_train = pred_prob_to_binary(y_score_train, threshold=threshold_prob)
+        y_pred_train = pd_pred_prob_to_binary(y_score_train, threshold=threshold_prob)
 
         # Mesures sur le jeu de train
         dic_train_scores["auc"].append(roc_auc_score(y_train, y_score_train))
@@ -640,6 +650,7 @@ def logreg_cross_evaluate(
     return
 
 
+# [TODO] Enlever SK_ID_CURR du modèle à fitter ?
 def cuml_cross_validate(
     X_train_and_val,
     y_train_and_val,
@@ -656,11 +667,9 @@ def cuml_cross_validate(
     # A faire avant le pipe
     # binary_features = get_binary_features(train_and_val)
 
-    X = X_train_and_val[["SK_ID_CURR", predictors[0]]].to_numpy()
-    if y_train_and_val is not None:
-        y = y_train_and_val.to_numpy()
-    else:
-        y = X_train_and_val["TARGET"].to_numpy()
+    X_tmp = X_train_and_val[["SK_ID_CURR", predictors[0]]].to_numpy()
+    y_tmp = y_train_and_val.to_pandas()
+
     folds = StratifiedKFold(
         n_splits=n_folds,
         shuffle=True,
@@ -680,17 +689,19 @@ def cuml_cross_validate(
         "fp": [],
     }
 
-    for train_idx, valid_idx in folds.split(X, y):
+    for train_idx_array, valid_idx_array in folds.split(X_tmp, y_tmp):
+        train_idx = train_idx_array.tolist()
+        valid_idx = valid_idx_array.tolist()
         t0_fit_time = time.time()
+        X_train = X_train_and_val.iloc[train_idx]
+        X_val = X_train_and_val.iloc[valid_idx]
 
-        X_train = X_train_and_val.loc[train_idx, ["SK_ID_CURR"] + predictors]
-        X_val = X_train_and_val.loc[valid_idx, ["SK_ID_CURR"] + predictors]
         if y_train_and_val is None:
-            y_train = X_train_and_val.loc[train_idx, "TARGET"].to_numpy()
-            y_val = X_train_and_val.loc[valid_idx, "TARGET"].to_numpy()
+            y_train = X_train_and_val.loc[train_idx, "TARGET"]
+            y_val = X_train_and_val.loc[valid_idx, "TARGET"]
         else:
-            y_train = y_train_and_val.iloc[train_idx].to_numpy()
-            y_val = y_train_and_val.iloc[valid_idx].to_numpy()
+            y_train = y_train_and_val.iloc[train_idx]
+            y_val = y_train_and_val.iloc[valid_idx]
 
         # print(f"\tPrétraitement")
         pipe = deepcopy(pipe_preprocess)
@@ -704,33 +715,42 @@ def cuml_cross_validate(
         fit_time = time.time() - t0_fit_time
 
         # Probabilité d'appartenir à la classe default pour le jeu de validation
-        y_score_val = clf.predict_proba(X_val_processed)[1].to_numpy()
+        y_score_val = clf.predict_proba(X_val_processed)[1]
         # Prédiction de la classe en fonction du seuil de probabilité
-        y_pred_val = pred_prob_to_binary(y_score_val, threshold=threshold_prob)
+        y_pred_val = cu_pred_prob_to_binary(y_score_val, threshold=threshold_prob)
 
-        # Mesures sur le jeu de validation
-        dic_val_scores["auc"].append(roc_auc_score(y_val, y_score_val))
-        dic_val_scores["accuracy"].append(accuracy_score(y_val, y_pred_val))
-        dic_val_scores["recall"].append(recall_score(y_val, y_pred_val))
-        dic_val_scores["penalized_f1"].append(penalize_f1(y_val, y_pred_val))
-        dic_val_scores["business_gain"].append(
-            penalize_business_gain(y_val, y_pred_val)
-        )
-        dic_val_scores["fit_time"].append(fit_time)
-        tn, fp, fn, tp = confusion_matrix(y_val, y_pred_val).ravel()
+        # Order C applatit la matrice en ligne comme ravel() de numpy, mais
+        # Attention, ne renvoie pas des scalaires mais des cupy ndarrays
+        mat = cuml.metrics.confusion_matrix(y_val, y_pred_val)
+        tn_array, fp_array, fn_array, tp_array = mat.ravel(order="C")
+        # On extrait les scalaires des cupy ndarrays()
+        tn = tn_array.item()
+        fp = fp_array.item()
+        fn = fn_array.item()
+        tp = tp_array.item()
         dic_val_scores["tn"].append(tn)
         dic_val_scores["fn"].append(fn)
         dic_val_scores["tp"].append(tp)
         dic_val_scores["fp"].append(fp)
 
-    val_res_folds = pd.DataFrame(
-        dic_val_scores, index=np.arange(start=1, stop=n_folds + 1)
-    )
-    val_res_folds.index.name = "fold"
+        # Mesures sur le jeu de validation
+        dic_val_scores["auc"].append(cuml.metrics.roc_auc_score(y_val, y_score_val))
+        dic_val_scores["accuracy"].append(
+            cuml.metrics.accuracy_score(y_val, y_pred_val)
+        )
+        dic_val_scores["recall"].append(cupd_recall_score(tp=tp, fn=fn))
+        dic_val_scores["penalized_f1"].append(penalize_f1(tp=tp, fp=fp, fn=fn))
+        dic_val_scores["business_gain"].append(
+            penalize_business_gain(tp=tp, fn=fn, tn=tn, fp=fp)
+        )
+
+        dic_val_scores["fit_time"].append(fit_time)
+
     del pipe
     del clf
     gc.collect()
-    return val_res_folds
+    # print(dic_val_scores)
+    return dic_val_scores
 
 
 def plot_roc_curve(y_true, y_score):
@@ -788,7 +808,154 @@ def plot_confusion_matrix(y_true, y_pred, figsize=(5, 4)):
     return fig
 
 
-def plot_confusion_matrix_mean(conf_mat, figsize=(5, 4)):
+def plot_confusion_matrix_mean(tn, fp, fn, tp, figsize=(5, 4)):
+    values = [tn, fp, fn, tp]
+    rounded_values = np.round(values)
+    conf_mat = rounded_values.reshape(2, 2)
+    conf_mat_df = pd.DataFrame(
+        conf_mat,
+        index=["Ok", "Défaut"],
+        columns=["Ok", "Défaut"],
+    )
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.heatmap(
+        conf_mat_df,
+        annot=True,
+        fmt=".0f",
+        vmin=0,
+        linewidths=0.5,
+        cmap="Blues",
+        # cbar_kws={"format": self.format_percent},
+        ax=ax,
+    )
+    fig.suptitle("Matrice de confusion moyenne")
+    plt.yticks(rotation=0)
+    ax.set_xlabel("Prédiction")
+    ax.set_ylabel("Vraie catégorie")
+    return ax
+
+
+def plot_recall_mean(
+    tn, fp, fn, tp, title="Recall moyen (% par ligne)", subtitle="", n_samples=True
+):
+    """Plotte le Recall (=la matrice de confusion en pourcentage par lignes) à partir des valeurs présentes dans la matrice de confusion binaire.
+    Utilisée pour une cross_validation (matrice de confusion moyenne à travers les folds) ou si CUDA
+
+    Args:
+        tn (float): Nombre de vrais négatifs = Ok prédits en Ok
+        fp (float): Nombre de faux positifs = vrai Ok prédits en Défaut de remboursement (pas trop grave)
+        fn (float): Nombre de faux négatifs  = vrai Default prédits en Ok (Grave, oubli de prédire le default de remboursement)
+        tp (float): Nombre de vrais positifs = défaut prédits en défaut
+        title (str, optional): Titre de la figure. Defaults to "Recall moyen (% par ligne)".
+        subtitle (str, optional): Sous_titre du graphique (ex : modèle concerné). Defaults to "".
+        n_samples (bool, optional): Affichage oui/non du nombre d'observations concernées en dessous de chaque recall. Defaults to True.
+
+    Returns:
+        matplotlib.figure.Figure: figure à afficher dans le notebook ou à logguer dans mlflow
+    """
+    figsize = (5, 4)
+    if subtitle:
+        figsize = (5, 4.3)
+    values = [tn, fp, fn, tp]
+    rounded_values = np.round(values)
+    conf_mat = rounded_values.reshape(2, 2)
+
+    row_sums = conf_mat.sum(axis=1, keepdims=True)
+    normalized_mat = conf_mat / row_sums
+
+    # Si n_samples est vrai, on affiche le nombre d'observations en valeurs en dessous du recall en %
+    if n_samples:
+        # On crée la matrice des annotations avec les valeurs arrondies entre parenthèses
+        annotations = np.array(
+            [
+                [
+                    f"{normalized_mat[i, j]:.0%}\n(n={int(rounded_values[i * 2 + j])})"
+                    for j in range(2)
+                ]
+                for i in range(2)
+            ]
+        )
+        fmt = ""
+    # Si n_samples faux, on affiche uniquement le recall en %
+    else:
+        annotations = True
+        fmt = ".0%"
+
+    conf_mat_df = pd.DataFrame(
+        normalized_mat,
+        index=["Ok", "Défaut"],
+        columns=["Ok", "Défaut"],
+    )
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.heatmap(
+        conf_mat_df,
+        annot=annotations,
+        fmt=fmt,
+        vmin=0,
+        vmax=1,
+        linewidths=0.5,
+        cmap="Blues",
+        cbar_kws={"format": format_percent},
+        ax=ax,
+    )
+    fig.suptitle(title)
+
+    if subtitle:
+        # title = title + "\n" + subtitle
+        ax.set_title(
+            subtitle,
+            ha="left",
+            x=0,
+            # Les 3 solutions suivantes pour la fontsize sont équivallentes si on n'a pas modifé le comportement par défaut
+            # fontsize=plt.rcParams["font.size"],
+            # fontsize="medium",
+            fontsize=ax.xaxis.label.get_fontsize(),
+        )
+    else:
+        fig.suptitle(title)
+    plt.tight_layout()
+    plt.yticks(rotation=0)
+    ax.set_xlabel("Prédiction")
+    ax.set_ylabel("Vraie catégorie")
+
+    # Si on ne veut pas afficher la figure dans le notebook lors de l'appel de la fonc
+    # plt.close(fig)
+    return fig
+
+
+def plot_recall_mean_old(tn, fp, fn, tp, figsize=(5, 4)):
+    values = [tn, fp, fn, tp]
+    rounded_values = np.round(values)
+    conf_mat = rounded_values.reshape(2, 2)
+
+    row_sums = conf_mat.sum(axis=1, keepdims=True)
+    normalized_mat = conf_mat / row_sums
+
+    conf_mat_df = pd.DataFrame(
+        normalized_mat,
+        index=["Ok", "Défaut"],
+        columns=["Ok", "Défaut"],
+    )
+    fig, ax = plt.subplots(figsize=figsize)
+    sns.heatmap(
+        conf_mat_df,
+        annot=True,
+        fmt=".0%",
+        vmin=0,
+        vmax=1,
+        linewidths=0.5,
+        cmap="Blues",
+        cbar_kws={"format": format_percent},
+        ax=ax,
+    )
+    fig.suptitle("Recall moyen (% par ligne)")
+    plt.yticks(rotation=0)
+    ax.set_xlabel("Prédiction")
+    ax.set_ylabel("Vraie catégorie")
+    return
+
+
+def plot_confusion_matrix_mean_old(conf_mat, figsize=(5, 4)):
     conf_mat_df = pd.DataFrame(
         conf_mat,
         index=["Ok", "Défaut"],
