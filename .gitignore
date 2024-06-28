@@ -579,7 +579,6 @@ p7env/
 *.jpeg
 *.png
 *.html
-*.txt
 test*.py
 test*.ipynb
 gitignore_old
