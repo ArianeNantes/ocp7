@@ -40,6 +40,7 @@ from sklearn.metrics import (
     precision_score,
 )
 import cudf
+import cuml
 from cuml.linear_model import LogisticRegression
 
 from src.p7_constantes import NUM_THREADS
@@ -62,576 +63,30 @@ from src.p7_simple_kernel import (
     get_memory_consumed,
     get_available_memory,
 )
-from src.p7_metric import pred_prob_to_binary, penalize_f1, penalize_business_gain
+from src.p7_metric import (
+    cu_pred_prob_to_binary,
+    pd_pred_prob_to_binary,
+    penalize_f1,
+    penalize_business_gain,
+)
 from src.p7_evaluate import cuml_cross_validate
+from src.p7_preprocess import train_test_split_nan
+from src.p7_tracking import ExpMetaData, ExpMlFlow, ExpSearch
 
 
-class ExperimentSearch:
-    def __init__(
-        self,
-        metric="auc",
-        direction="maximize",
-    ):
-        self.input_dir = DATA_INTERIM
-        self.train_filename = "00_v3_train.csv"
-        self.predictors_name = "features_sorted_by_importance.pkl"
-        # Par défaut on ne réduit pas les colonnes
-        self.n_predictors = None
-        # Par défaut on ne réduit pas les lignes
-        self.frac_sample = 1.0
-        self.output_dir = MODEL_DIR
-        self.task = "search"
-        self.model_name = "debug"
-        self.pipe_preprocess = None
-        self.sampling = None
-        self.objective_name = "binary"
-        self.metric = metric
-        self.dic_metrics = {"auc"}
-        self.direction = direction
-        self.sampler = optuna.samplers.TPESampler()
-        self.pruner = optuna.pruners.HyperbandPruner(
-            min_resource=10, max_resource=400, reduction_factor=3
+class SearchLogReg(ExpSearch):
+    def __init__(self, metric="auc", direction="maximize", debug=False):
+        super().__init__(
+            model_name="logreg", metric=metric, direction=direction, debug=debug
         )
-        self.storage = RDBStorage(
-            f"postgresql://{USER_PG}:{PASSWORD_PG}@localhost:{PORT_PG}/optuna_db"
-        )
-        self.num = 0
-        self.continue_if_exist = False
-        self.optimize_boosting_type = True
-        self.uri_mlflow = f"http://{HOST_MLFLOW}:{PORT_MLFLOW}"
-        # Attributs à construire obligatoirement avec initialisation
-
-        self.name = ""
-        self.study_name = ""
-        self.description = ""
-        self.tags = {}
-        self.X = None
-        self.y = None
-        self.random_state = VAL_SEED
-        self.mlflow_id = None
-        self.study = None
-        self.initialized = False
-        self.parent_run_id = None
         self.device = "cuda"
-        # Turn off optuna log notes.
-        # optuna.logging.set_verbosity(optuna.logging.WARN)
-
-    def check_postgresql_server(
-        self,
-        host="localhost",
-        port=PORT_PG,
-        dbname="optuna_db",
-        user=USER_PG,
-        password=PASSWORD_PG,
-    ):
-        try:
-            connection = psycopg2.connect(
-                host=host, port=port, dbname=dbname, user=user, password=password
-            )
-            connection.close()
-            print("La connexion Postgresql est OK")
-        except OperationalError as e:
-            self.initialized = False
-            print(
-                "La connexion PostgreSQL a échoué. Vérifier que le service est démarré"
-            )
-            print(
-                "Pour démarrer le service, vous pouvez utiliser la méthode experiment.start_postresql_server()"
-            )
-            print("Error:", e)
-        """
-        On peut vérifier le statut du serveice en ligne de commande :
-        sudo service postgresql status (mdp depuis secret)
-        :q pour sortir
-        Redémarrer :
-        sudo service postgresql restart
-        """
-
-    def check_mlflow_server(self):
-        # Use the fluent API to set the tracking uri and the active experiment
-        mlflow.set_tracking_uri(self.uri_mlflow)
-        try:
-            response = requests.get(self.uri_mlflow)
-            if response.status_code == 200:
-                print("Le serveur MLFlow est Ok")
-            else:
-                print(
-                    "La connexion MLFlow a échoué. Status code:",
-                    response.status_code,
-                )
-        except requests.exceptions.RequestException as e:
-            self.initialized = False
-            print("La connexion MLFlow a échoué. Vérifiez que le serveur est démarré.")
-            print(
-                "Pour le démarrer, vous pouver utiliser experiment.start_mlflow_server()"
-            )
-            print("Error:", e)
-
-    def check_services(self):
-        """print(
-            "# [TODO] Vérifier que les services sont démarrés (serveur mlflow et postgresql)"
-            #Démarrer un serveur mlflow local en ligne de commande :
-            #mlflow server --host 127.0.0.1 --port 8080
-
-        )"""
-
-        # Use the fluent API to set the tracking uri and the active experiment
-        mlflow.set_tracking_uri(self.uri_mlflow)
-        return
-
-    def start_mlflow_server(
-        self, host=HOST_MLFLOW, port=PORT_MLFLOW, check_connect=True
-    ):
-        cmd = [
-            "mlflow",
-            "server",
-            # "--backend-store-uri", backend_store_uri,
-            # "--default-artifact-root", default_artifact_root,
-            "--host",
-            host,
-            "--port",
-            port,
-        ]
-        env = os.environ.copy()
-
-        # Start the MLflow server
-        print("Démarrage du serveur MLFlow")
-        process = subprocess.Popen(
-            cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        # Allow some time for the server to start
-        time.sleep(5)
-        if check_connect:
-            self.check_mlflow_server()
-        return process
-
-    def check_directories(self):
-        """print(
-            "# [TODO] Vérifier que les directories sont ok et les créer si nécessaire"
-        )"""
-        if not os.path.exists(self.output_dir):
-            os.mkdir(self.output_dir)
-            print(f"Répertoire {self.output_dir} créé")
-        return
-
-    def init_name(
-        self,
-        model_name=None,
-        objective_name=None,
-        num=None,
-        verbose=True,
-        continue_if_exist=False,
-    ):
-        if model_name:
-            self.model_name = model_name
-        if objective_name:
-            self.objective_name = objective_name
-        if num:
-            self.num = num
-        if continue_if_exist is not None:
-            self.continue_if_exist = continue_if_exist
-
-        root_name = f"{self.task}_{self.model_name}_{self.objective_name}"
-        name = root_name + f"_{self.num:03}"
-
-        # On vérifie si l'expérience existe déjà dans mlflow
-        existing_experiment = mlflow.get_experiment_by_name(name)
-
-        # Si on autorise le chargement d'une expérience qui existe déjà
-        detail = " (nouvelle)"
-        if self.continue_if_exist:
-            if existing_experiment:
-                detail = " déjà existante"
-
-        # Si on n'autorise pas un nom d'expérience qui existe déjà, on augmente le numéro jusqu'à une qui n'existe pas
-        else:
-            while existing_experiment:
-                self.num += 1
-                num_str = f"_{self.num:03}"
-                name = root_name + num_str
-                existing_experiment = mlflow.get_experiment_by_name(name)
-                detail = " (nouvelle - numéro augmenté)"
-            self.name = name
-
-        if verbose:
-            print(f"Nom de l'expérience{detail} : {self.name}")
-
-        return name, existing_experiment
-
-    # Appeler cette fonc après init_name
-    def init_description(
-        self,
-        objective_name=None,
-        metric=None,
-        add_description="",
-        add_tags={},
-        verbose=True,
-    ):
-        if objective_name:
-            self.objective_name = objective_name
-        if metric:
-            self.metric = metric
-
-        main_description = (
-            f"Recherche bayesienne d'hyperparamètres pour modèle {self.model_name}"
-        )
-        main_tags = {
-            "task": self.task,
-            "model": self.model_name,
-            "objective": self.objective_name,
-            "metric": self.metric,
-            "num": f"{self.num:03}",
-            "db": "optuna",
-        }
-        description = main_description
-        tags = main_tags
-        if add_description:
-            description = main_description + "\n" + add_description
-        if add_tags:
-            for k, v in add_tags.items():
-                tags[k] = v
-
-        self.description = description
-        self.tags = tags
-
-        if verbose:
-            print(f"Description de '{self.name}' :")
-            print(self.description)
-            print("Tags :")
-            for k, v in self.tags.items():
-                print(f"\t'{k}' : {v}")
-        return self.description, self.tags
-
-    # Lecture des données AVANT resampling de type smote etc.
-    def init_data(
-        self,
-        frac_sample=None,
-        input_dir=None,
-        train_filename=None,
-        predictors_name=None,
-        n_predictors=None,
-        verbose=True,
-    ):
-        if frac_sample:
-            self.frac_sample = frac_sample
-        if input_dir:
-            self.input_dir = input_dir
-        if train_filename:
-            self.train_filename = train_filename
-        if predictors_name:
-            self.predictors_name = predictors_name
-        if n_predictors:
-            self.n_predictors = n_predictors
-        if frac_sample:
-            self.frac_sample = float(frac_sample)
-            # [TODO] Pas tags mais fonc add_tags qui ajoute des tags à une expérience déjà créée ou initialisée
-            self.tags[frac_sample] = f"{frac_sample:0%}"
-
-        ##################### Lecture de toutes les données de train (=avec target ET déjà partagé pour laisser un test.csv)
-        if verbose:
-            print(
-                f"Chargement des données. n_predictors={self.n_predictors}, frac_sample={self.frac_sample}"
-            )
-
-        all_train = cudf.read_csv(os.path.join(self.input_dir, self.train_filename))
-        if self.device != "cuda":
-            all_train = all_train.to_pandas()
-            # S'il y a des nan dans des bool ça donnera des object, on les convertit en float
-            object_features = all_train.select_dtypes("object").columns
-            all_train[object_features] = all_train[object_features].astype("float64")
-
-        to_drop = sel_var(all_train.columns, "Unnamed", verbose=False)
-        if to_drop:
-            all_train = all_train.drop(to_drop, axis=1)
-        all_train = all_train.rename(columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x))
-
-        ##################### Réduction du nombre de colonnes
-        reduction_predictor = f"Tous les prédicteurs, "
-        # On lit les predicteurs du Kernel simple triés par ordre d'importance
-        # [TODO] modifier le principe de réduction de lignes et de colonnes
-        # all_predictors = joblib.load(os.path.join(self.input_dir, self.predictors_name))
-        all_predictors = [f for f in all_train if f not in ["TARGET"]]
-
-        # Si le nombre de prédicteurs n'est pas précisé (None) ou s'il dépasse, on les prends tous
-        # sinon on réduira le nombre de colonnes
-        if not self.n_predictors or self.n_predictors > len(all_predictors):
-            self.n_predictors = len(all_predictors)
-        if len(all_predictors) > self.n_predictors:
-            reduction_predictor = "Après réduction des prédicteurs, "
-
-        X, y = (
-            all_train[all_predictors[: self.n_predictors]],
-            all_train["TARGET"],
-        )
-        self.X = X
-        self.y = y
-
-        # [TODO] mettre device en paramètre de la config et prévoir le cas pandas
-        if verbose:
-            print(
-                "Forme initiale de X :",
-                all_train[all_predictors].shape,
-                "type :",
-                type(self.X),
-            )
-            print(
-                f"{reduction_predictor}forme de X : {self.X.shape}, conso mémoire : {get_memory_consumed(self.X, verbose=False):.0f} Mo"
-            )
-        del all_train, all_predictors
-        gc.collect()
-
-        ##################### Réduction du nombre de lignes (avant under_sampling)
-        row_reduction = "Toutes les lignes, "
-        if self.frac_sample < 1.0:
-            X_sampled, _, y_sampled, _ = train_test_split(
-                X,
-                y,
-                train_size=self.frac_sample,
-                random_state=self.random_state,
-                stratify=y,
-            )
-            self.X = X_sampled
-            self.y = y_sampled
-            row_reduction = (
-                f"Après réduction des lignes (échantillon {self.frac_sample:.0%}), "
-            )
-        if verbose:
-            memory_consumed_mb = get_memory_consumed(self.X, verbose=False)
-            print(
-                f"{row_reduction}forme de X : {self.X.shape}, conso mémoire {memory_consumed_mb:.0f} Mo"
-            )
-
-        ##################### Warning taille memoire
-        mem_consumed = get_memory_consumed(self.X, verbose=False)
-        if mem_consumed > MAX_SIZE_PARA:
-            print(
-                f"WARNING: X est trop gros ({mem_consumed:.0f} > {MAX_SIZE_PARA} Mo) pour une réelle parallélisation des threads"
-            )
-        return self.X, self.y
-
-    # Appeler init_data avant cette fonc
-    def init_resampling(self):
-        # [TODO] Implémenter le resampling ex smote
-        return
-
-    # Appeler init_expriment_name avant cette fonc et check service
-    def create_or_load_experiment(self, verbose=True):
-
-        tags = self.tags
-        tags["mlflow.note.content"] = self.description
-
-        # On vérifie si l'expérience existe déjà
-        existing_experiment = mlflow.get_experiment_by_name(self.name)
-
-        load_or_create = "Création de "
-        if existing_experiment:
-            experiment_id = existing_experiment.experiment_id
-            load_or_create = "Chargement de "
-        else:
-            experiment_id = mlflow.create_experiment(
-                self.name,
-                artifact_location=self.output_dir,
-                tags=tags,
-            )
-        self.mlflow_id = experiment_id
-        if verbose:
-            print(
-                f"{load_or_create}l'expérience MLFlow '{self.name}', ID = {self.mlflow_id}"
-            )
-        # self.create_parent_run()
-        return self.mlflow_id
-
-    # Appeler init_name avant cette fonc, et check_service (pg doit être démarré)
-    def create_or_load_study(
-        self,
-        objective_name=None,
-        direction=None,
-        storage=None,
-        sampler=None,
-        pruner=None,
-    ):
-        if objective_name:
-            self.objective_name = objective_name
-        if direction:
-            self.direction = direction
-        if storage:
-            self.storage = storage
-        if sampler:
-            self.sampler = sampler
-        if pruner:
-            self.pruner = pruner
-
-        study = optuna.create_study(
-            study_name=self.name,
-            direction=self.direction,
-            sampler=self.sampler,
-            pruner=self.pruner,
-            storage=self.storage,
-            load_if_exists=True,
-        )
-        self.study = study
-        return self.study
-
-    def init_config(self, verbose=True, **kwargs):
-        # La liste des paramètres possibles à passer dans kwargs sont
-        # les attributs qui ne sont pas protégés ni privés et qui ne sont pas des méthodes
-        public_attributes = [
-            a
-            for a in dir(self)
-            if not a.startswith("_")
-            and not a.startswith("__")
-            and not callable(getattr(self, a))
-        ]
-
-        valid_args = [arg for arg in kwargs.keys() if arg in public_attributes]
-        invalid_args = [arg for arg in kwargs.keys() if arg not in valid_args]
-
-        # On met à jour les paramètres qui sont autorisés
-        for k in valid_args:
-            v = kwargs[k]
-            self.__setattr__(k, v)
-
-        if verbose:
-            print(f"Les paramètres {valid_args} ont été mis à jour")
-        if invalid_args:
-            print(
-                f"Les paramètres {invalid_args} ne sont pas valides. Liste des paramètres possibles :"
-            )
-            # [TODO] Trier par ordre alhabétique ?
-            print(public_attributes)
-
-        # On ne veut pas ré-initialiser les data pour rien (la lecture est longue)
-        # donc on récupère les arguments de kwargs qui sont aussi dans la signature de init_data
-        # on n'exécute init_data que si les df X ou y sont vides ou si des arguments de data ont été passés dans kwargs, même s'ils ne sont pas différents d'avant
-        data_signature = inspect.signature(self.init_data)
-        data_args = [param.name for param in data_signature.parameters.values()]
-        data_args_to_init = [a for a in kwargs.keys() if k in data_args]
-        if self.X is None or self.y is None or data_args_to_init:
-            self.init_data()
-        self.init_name()
-        self.init_description()
-        self.check_directories()
-        self.check_services()
-
-        if invalid_args:
-            return False
-        else:
-            self.initialized = True
-            return self.initialized
-
-    # Appeler les init avant les create
-    def create_or_load(self):
-        id_experiment = self.create_or_load_experiment()
-        study = self.create_or_load_study()
-        return id_experiment, study
-
-    def create_parent_run(self):
-        # On crée un run parent qui va contenir tous les runs (un run enfant par trial)
-        parent_run = mlflow.start_run(
-            experiment_id=self.mlflow_id,
-            run_name="Study",
-            tags=self.tags,
-            # description="Résultats de la recherche d'hyperparamètres",
-        )
-        self.parent_run_id = parent_run.info.run_id
-        mlflow.end_run()
-
-    def create_best_run(self):
-        with mlflow.start_run(
-            experiment_id=self.mlflow_id,
-            run_name=f"T_{self.study.best_trial.number}_best_of_{len(self.study.get_trials())}_trials",
-        ):
-            mlflow.log_params(self.study.best_trial.params)
-            mlflow.log_metric(self.metric, self.study.best_trial.value)
-            fig = optuna.visualization.plot_param_importances(self.study)
-            fig.write_html(os.path.join(self.output_dir, "hyperparam_importance.html"))
-            mlflow.log_artifact(
-                os.path.join(self.output_dir, "hyperparam_importance.html")
-            )
-            """fig = optuna.visualization.plot_parallel_coordinate(
-                self.study,
-                # params=["boosting_type", "n_estimators", "num_leaves", "learning_rate"],
-            )
-            fig.write_html(os.path.join(self.output_dir, "parallel_coordinate.html"))
-            mlflow.log_artifact(
-                os.path.join(self.output_dir, "parallel_coordinate.html")
-            )"""
-            fig = optuna.visualization.plot_optimization_history(self.study)
-            fig.write_html(os.path.join(self.output_dir, "optimization_history.html"))
-            mlflow.log_artifact(
-                os.path.join(self.output_dir, "optimization_history.html")
-            )
-
-    # Inutile, on va plutôt faire un run parent
-    def track_best_run(self):
-        # find the best run, log its metrics as the final metrics of this run.
-        # client = MlflowClient()
-
-        # Récupération de tous les runs de l'experiment
-        runs = mlflow.search_runs(experiment_ids=[self.mlflow_id])
-        print("len(runs)", len(runs), "type", type(runs))
-        # print(runs)
-
-        # On enlève le parent
-        # nested_runs = [run for run in runs if run.run_name != "best"]
-        # print(runs.columns)
-        nested_runs = runs[runs["tags.mlflow.parentRunId"].notnull()].sort_values(
-            by=f"metrics.{self.metric}", ascending=False
-        )
-        best_run = nested_runs.head(1)
-        print("len(nested_runs)", nested_runs.shape)
-
-        # parent_run_name = "best"
-        """runs = client.search_runs(
-            [self.mlflow_id], f"tags.mlflow.parentRunName == 'best'"
-        )"""
-
-        # Filtrer les runs qui ont le run parent désiré
-        # nested_runs = runs[runs["tags.mlflow.parentRunName"] == parent_run_name]
-        # nested_runs = [runs[runs["tags.mlflow.parentRunId"]] == self.parent_run_id]
-
-        """best_metric = 0
-
-        for r in nested_runs:
-            if r.data.metrics[self.metric] > best_metric:
-                best_run = r
-        if best_run:
-            print("Metrics du best", best_run.data.metrics)
-        else:
-            print("best run non trouvé")"""
-
-        """mlflow.set_tag("best_run", best_run.info.run_id)
-        mlflow.log_metrics(
-            {
-                f"train_{metric}": best_val_train,
-                f"val_{metric}": best_val_valid,
-                f"test_{metric}": best_val_test,
-            }
-        )"""
-        return best_run
-
-    # Permet de suggérer des float en en proposant plus autour de 0.5 si
-    # Si les params alpha et beta sont égaux et low=0 et high=1
-    def suggest_beta(self, param_name, low=0, high=1, alpha=2.0, beta_param=2.0):
-        # Sample a value from the beta distribution
-        value = beta.rvs(alpha, beta_param)
-        # Scale the value to the desired range [low, high]
-        scaled_value = low + (high - low) * value
-        return scaled_value
-
-
-class ExperimentSearchCuml(ExperimentSearch):
-    def __init__(self, metric="auc", direction="maximize"):
-        super().__init__(metric=metric, direction=direction)
-        self.device = "cuda"
-        self.model_name = "logreg"
-        # Turn off optuna log notes.
-        # optuna.logging.set_verbosity(optuna.logging.WARN)
+        # Comme CUDA est utilisé, on ne parallélise pas, on peut donc fiwxer la graine du sampler
+        self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
 
     def objective(self, trial):
 
         with mlflow.start_run(
-            experiment_id=self.mlflow_id, run_name=f"{trial.number}", nested=True
+            experiment_id=self._mlflow_id, run_name=f"{trial.number}", nested=True
         ):
             # doc cuml : https://docs.rapids.ai/api/cuml/nightly/api/#regression-and-classification
             c = trial.suggest_float("C", 1e-7, 100.0, log=True)
@@ -661,6 +116,7 @@ class ExperimentSearchCuml(ExperimentSearch):
                 "C": c,
                 "penalty": penalty,
                 "l1_ratio": l1_ratio,
+                "tol": 1e-4,
                 "fit_intercept": fit_intercept,
             }
             # Petit bug pour le cuml LogisticRegression, on ne peut pas directement assigner class_weight
@@ -668,9 +124,10 @@ class ExperimentSearchCuml(ExperimentSearch):
                 clf_params["class_weight"] = "balanced"
 
             # Max_iter par défaut est 1_000. Si une régularisation l1 est appliquée, dans ces conditions,
-            # L'algorithme ne pourra pas converger. Soit on augmente max_iter, soit on scale les features binaires dans le pipe.
+            # L'algorithme ne pourra pas converger. Soit on augmente max_iter, (voire la tol) soit on scale les features binaires dans le pipe.
             if penalty == "l1" or penalty == "elasticnet":
                 clf_params["max_iter"] = 10_000
+                clf_params["tol"] = 1e-3
                 if penalty == "elasticnet":
                     clf_params["l1_ratio"] = l1_ratio
 
@@ -679,18 +136,11 @@ class ExperimentSearchCuml(ExperimentSearch):
             threshold_prob = trial.suggest_float(
                 "threshold_prob", 0.05, 0.95, log=False
             )
-            print(
-                "Trial",
-                trial.number,
-                "penalty :",
-                penalty,
-                "l1_ratio :",
-                l1_ratio,
-                "threshold_prob :",
-                threshold_prob,
-            )
 
-            clf = LogisticRegression(**clf_params)
+            # La verbosité permet de désactiver le warning : QWL-QN stopped, because the line search failed to advance (step delta = 0.000000)
+            clf = LogisticRegression(
+                **clf_params, verbose=cuml.common.logger.level_error
+            )
             scores = cuml_cross_validate(
                 self.X,
                 self.y,
@@ -699,46 +149,29 @@ class ExperimentSearchCuml(ExperimentSearch):
                 threshold_prob=threshold_prob,
             )
 
-            mean_scores = scores.mean(axis=0)
+            # mean_scores = scores.mean(axis=0)
+            mean_scores = {k: np.mean(v) for (k, v) in scores.items()}
 
             # Minimise la log loss : ll = log_loss(test_y , y_predlr)
 
             # Fin d'un trial
             # del folds
             # gc.collect()
-            dic_metrics = mean_scores.to_dict()
-            print(
-                "Trial",
-                trial.number,
-                "dic_metrics",
-                dic_metrics,
-                "type",
-                type(dic_metrics),
-            )
+            # dic_metrics = mean_scores.to_dict()
 
-            # Pour logguer les métriques additionnelles dans optuna_db :
-            # trial.set_user_attr("constraint", [c0])
-
-            """for k, v in dic_metrics.items():
-                mlflow.log_metric(k, v)"""
-            mlflow.log_metrics(dic_metrics)
-            all_params = {
-                "C": c,
-                "penalty": penalty,
-                # "l1_ratio": l1_ratio,
-                "fit_intercept": fit_intercept,
-                "class_weight": class_weight,
-                "threshold_prob": threshold_prob,
-            }
+            mlflow.log_metrics(mean_scores)
+            all_params = {k: v for (k, v) in clf_params.items()}
+            all_params["threshold_prob"] = threshold_prob
             mlflow.log_params(all_params)
-        return dic_metrics[self.metric]
+            # mlflow.log_params(trial.params)
+        return mean_scores[self.metric]
 
     def run_logreg_trials(self, n_trials=20, n_jobs=1, verbose=True):
         t0 = time.time()
         if verbose:
             print(f"Optimisation {n_trials} trials...")
 
-        self.study.optimize(
+        self._study.optimize(
             self.objective, n_trials=n_trials, n_jobs=1, gc_after_trial=True
         )
         if verbose:
@@ -754,16 +187,22 @@ class ExperimentSearchCuml(ExperimentSearch):
             print(f"Optimisation {n_trials} trials sur CUDA...")
 
         # self.run_logreg_trials(n_trials=n_trials, n_jobs=1, verbose=False)
-        self.study.optimize(
+        self._study.optimize(
             self.objective, n_trials=n_trials, n_jobs=1, gc_after_trial=True
         )
 
         if verbose:
+            print(
+                f"Meilleure combinaison : trial {self._study.best_trial.number}, {self.metric} : {self._study.best_trial.value}"
+            )
+            print(f"Paramètres : {self._study.best_trial.params}")
+
             print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
         self.create_best_run()
 
 
-class ExperimentSearchLgbm(ExperimentSearch):
+# [TODO] refacto car hérite de ExpSearch au lieu de ExperimentSearch
+class SearchLgb(ExpSearch):
     def __init__(self, metric="auc", direction="maximize"):
         super().__init__(metric=metric, direction=direction)
         self.device = "cpu"
@@ -775,7 +214,7 @@ class ExperimentSearchLgbm(ExperimentSearch):
         # parent_run_name = "best"
         # Attention les n° de trial ne correspondent pas à ceux fournis en logging stdout
         with mlflow.start_run(
-            experiment_id=self.mlflow_id, run_name=f"{trial.number}", nested=True
+            experiment_id=self._mlflow_id, run_name=f"{trial.number}", nested=True
         ):
             boosting_type = trial.suggest_categorical("boosting_type", ["dart", "gbdt"])
             lambda_l1 = (trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),)
@@ -889,7 +328,9 @@ class ExperimentSearchLgbm(ExperimentSearch):
                 y_score_val = model.predict_proba(X_val)[:, 1]
                 # Prédiction de la classe en fonction du seuil de probabilité
 
-                y_pred_val = pred_prob_to_binary(y_score_val, threshold=threshold_prob)
+                y_pred_val = pd_pred_prob_to_binary(
+                    y_score_val, threshold=threshold_prob
+                )
 
                 # Mesures sur le jeu de validation
                 dic_val_scores["auc"].append(roc_auc_score(y_val, y_score_val))
@@ -929,12 +370,12 @@ class ExperimentSearchLgbm(ExperimentSearch):
 
     def run_lgb_trials(self, n_trials=10, reseed_sampler=False):
         if reseed_sampler:
-            self.study.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
-            self.study.sampler.reseed_rng()
+            self._study.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
+            self._study.sampler.reseed_rng()
         else:
-            self.study.sampler = optuna.samplers.TPESampler()
+            self._study.sampler = optuna.samplers.TPESampler()
 
-        self.study.optimize(
+        self._study.optimize(
             self.objective, n_trials=n_trials, n_jobs=1, gc_after_trial=True
         )
 
@@ -947,14 +388,15 @@ class ExperimentSearchLgbm(ExperimentSearch):
     # Parallélisation des jobs sur CPU :
     # La vraie parallélisation est beaucoup plus rapide que le multithread (multithread optuna = optimize avec n_jobs > 1)
     # share_sampler_seed permet de s'assurer que le sampler ne va pas proposer les mêmes combinaisons de paramètres dans chaque workers,
-    # grâce à la méthode opuna .reseed_rng().
-    # cependant, les traitements sont alors vraiment beaucoup plus longs
+    # grâce à la méthode optuna .reseed_rng().
+    # cependant, les traitements sont alors VRAIMENT beaucoup plus LONGS
+    # (simple au double dans le meilleur des cas mais souvent facteur beaucoup plus grand),
     # (comme le sampler doit être partagé entre les workers, il s'agit probbablement de multithrading).
 
     # Si share_sampler_seed est false, on applique tout simplement un sampler avec une graine différente dans chaque worker,
     # C'est BEAUCOUP PLUS RAPIDE (du simple au double au minimum).
     # Les résultats ne sont pas reproductibles en parallélisation quelque soit la valeur de share_sampler_seed (True ou False), Mais
-    # les résultats sont un PETIT PEU MEILLEURS avec share_sampler_seed=True qu'avec share_sampler_seed=False .
+    # les résultats sont souvent (pas toujours !) un PETIT PEU MEILLEURS avec share_sampler_seed=True qu'avec share_sampler_seed=False .
     def optimize(
         self,
         n_workers=4,
@@ -963,19 +405,24 @@ class ExperimentSearchLgbm(ExperimentSearch):
         verbose=True,
     ):
         t0 = time.time()
+        sampler_type = self._study.sampler.__class__
 
         if verbose:
             print(
                 f"Optimisation {n_trials_per_worker * n_workers} trials sur CPU. Parallélisation : {n_workers} workers de {n_trials_per_worker} trials chacun..."
             )
         if share_sampler_seed:
-            print("Seed recalculée pour chaque worker.")
+            print(
+                f"Seed du Sampler {sampler_type} recalculée et partagée entre workers"
+            )
             Parallel(n_jobs=n_workers)(
                 delayed(self.run_lgb_trials)(n_trials_per_worker, True)
                 for _ in range(n_workers)
             )
         else:
-            print("Seed aléatoire pour chaque worker.")
+            print(
+                f"Seed aléatoire du Sampler {sampler_type} indépendante pour chaque worker."
+            )
 
             Parallel(n_jobs=n_workers)(
                 delayed(self.run_lgb_trials)(n_trials_per_worker, False)
