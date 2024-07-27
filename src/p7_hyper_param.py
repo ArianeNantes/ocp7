@@ -1,6 +1,7 @@
 import numpy as np
 import random
 import logging
+import io
 import re
 import requests
 import os
@@ -8,6 +9,7 @@ import gc
 import time
 import joblib
 from joblib import Parallel, delayed
+from copy import deepcopy
 import multiprocessing
 import subprocess
 import psycopg2
@@ -39,9 +41,13 @@ from sklearn.metrics import (
     recall_score,
     precision_score,
 )
+from scipy import special
 import cudf
 import cuml
 from cuml.linear_model import LogisticRegression
+from bokbokbok.loss_functions.classification import WeightedCrossEntropyLoss
+from bokbokbok.eval_metrics.classification import WeightedCrossEntropyMetric
+from bokbokbok.utils import clip_sigmoid
 
 from src.p7_constantes import NUM_THREADS
 from src.p7_util import timer, clean_ram, format_time
@@ -69,15 +75,132 @@ from src.p7_metric import (
     penalize_f1,
     penalize_business_gain,
 )
-from src.p7_evaluate import cuml_cross_validate
+from src.p7_evaluate import (
+    cuml_cross_validate,
+    cuml_cross_evaluate,
+    balance_smote,
+    balance_nearmiss,
+)
+from src.p7_evaluate import CuDummyClassifier
 from src.p7_preprocess import train_test_split_nan
 from src.p7_tracking import ExpMetaData, ExpMlFlow, ExpSearch
+from src.p7_metric import logloss_objective, logloss_metric, feval_auc
+
+
+class SearchCuDummy(ExpSearch):
+    def __init__(self, metric="auc", direction="maximize", debug=False):
+        super().__init__(
+            model_name="dummy", metric=metric, direction=direction, debug=debug
+        )
+        self.device = "cuda"
+        self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
+        # Liste des paramètres qu'on veut voir affichés dans le parrallel plot fait par optuna
+        self._params_to_plot_in_parallel = []
+
+    def objective(self, trial):
+        with mlflow.start_run(
+            experiment_id=self._mlflow_id, run_name=f"{trial.number}", nested=True
+        ):
+
+            threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
+
+            # Si la métric à optimiser est l'auc, on ne fixe pas les graines de hasard
+            # car l'auc ne dépendant pas du seul de proba, nous aurons toujours la même auc
+            # Par contre pour les autres métriques on peut fixer les graines de hasard car le seuil de proba modifie la métrique résultante
+            if self.metric == "auc":
+                clf = CuDummyClassifier(random_state=None)
+            else:
+                clf = CuDummyClassifier(random_state=VAL_SEED)
+            all_params = {"threshold_prob": threshold_prob}
+
+            # Si on n'a pas d'oversampling ni d'undersampling, on fait une cross validation avec 5 folds,
+            # Si on a de l'oversampling ou de l'undersampling on ne fait que 2 folds pour diminuer les temps de calcul
+            if self.meta.balance == "none":
+                n_folds = 5
+                k_neighbors = 0
+            else:
+                n_folds = 2
+                k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
+                all_params["k_neighbors"] = k_neighbors
+
+            scores = cuml_cross_evaluate(
+                X_train_and_val=self.X,
+                y_train_and_val=self.y,
+                pipe_preprocess=self.pipe_preprocess,
+                cuml_model=clf,
+                balance=self.meta.balance,
+                k_neighbors=k_neighbors,
+                n_folds=n_folds,
+                threshold_prob=threshold_prob,
+                train_scores=False,
+            )
+
+            # mean_scores = scores.mean(axis=0)
+            mean_scores = {k: np.mean(v) for (k, v) in scores.items()}
+
+            # Minimise la log loss : ll = log_loss(test_y , y_predlr)
+
+            # Dans optuna, il ne sera loggé par défaut que la métrique à optimiser, pour loguer toutes les métriques,
+            # on personnalise pour enregistrer toutes les métriques
+            trial.set_user_attr("mean_scores", mean_scores)
+
+            # Fin d'un trial, on loggue dans mlflow
+            mlflow.log_metrics(mean_scores)
+
+            mlflow.log_params(all_params)
+            # On ne logue le dataset que dans le best_run
+            # self.track_dataset()
+
+        return mean_scores[self.metric]
+
+    def run_logreg_trials(self, n_trials=20, verbose=True):
+        t0 = time.time()
+        if verbose:
+            print(f"Optimisation {n_trials} trials...")
+
+        self._study.optimize(self.objective, n_trials=n_trials, gc_after_trial=True)
+        if verbose:
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+
+    # La parallélisation ne fonctionne pas si CUDA car pas assez de mémoire
+    # ou tout simplement allocation sur CUDA en parallel ne fonctionne pas bien (alloue plus que nécessaire).
+    # On peut surveiller en temps réel la consommation de VRAM avec nvidia-smi -l 1 (crée une loop pour rafraichir toutes les 1 secondes)
+    # Le multithreads réglerait peut-être le problème de l'allocation VRAM mais MLFlow n'est pas thread-safe.
+    def optimize(self, n_trials=10, verbose=True):
+        # Si le nombre de trials est grand, on ne les loggue pas à l'écran, à la place on affiche uniquement les warnings
+        if n_trials > 20:
+            self.optuna_verbosity = optuna.logging.WARNING
+        else:
+            self.optuna_verbosity = optuna.logging.INFO
+        optuna.logging.set_verbosity(self.optuna_verbosity)
+
+        t0 = time.time()
+        if verbose:
+            print(f"Optimisation {n_trials} trials sur CUDA...")
+
+        # self.run_logreg_trials(n_trials=n_trials, n_jobs=1, verbose=False)
+        self._study.optimize(
+            self.objective, n_trials=n_trials, n_jobs=1, gc_after_trial=True
+        )
+
+        if verbose:
+            """print(
+                f"Meilleure combinaison : trial {self._study.best_trial.number}, {self.metric} : {self._study.best_trial.value}"
+            )
+            print(f"Paramètres : {self._study.best_trial.params}")"""
+
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+        self.create_best_run(verbose=verbose)
 
 
 class SearchLogReg(ExpSearch):
     def __init__(self, metric="auc", direction="maximize", debug=False):
         super().__init__(
-            model_name="logreg", metric=metric, direction=direction, debug=debug
+            model_name="logreg",
+            metric=metric,
+            direction=direction,
+            debug=debug,
+            loss="binary",
         )
         self.device = "cuda"
         # Comme CUDA est utilisé, on ne parallélise pas, on peut donc fiwxer la graine du sampler
@@ -141,20 +264,43 @@ class SearchLogReg(ExpSearch):
 
             # On concentre la recherche du seuil autour de 0.5 avec la distribution Beta
             # threshold_prob = self.suggest_beta("threshold_prob", low=0.05, high=0.95)
-            threshold_prob = trial.suggest_float(
-                "threshold_prob", 0.05, 0.95, log=False
-            )
+            threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
 
             # La verbosité permet de désactiver le warning : QWL-QN stopped, because the line search failed to advance (step delta = 0.000000)
             clf = LogisticRegression(
                 **clf_params, verbose=cuml.common.logger.level_error
             )
-            scores = cuml_cross_validate(
+            """scores = cuml_cross_validate(
                 self.X,
                 self.y,
                 self.pipe_preprocess,
                 clf,
                 threshold_prob=threshold_prob,
+            )"""
+
+            all_params = {k: v for (k, v) in clf_params.items()}
+            all_params["threshold_prob"] = threshold_prob
+
+            # Si on n'a pas d'oversampling ni d'undersampling, on fait une cross validation avec 5 folds,
+            # Si on a de l'oversampling ou de l'undersampling on ne fait que 2 folds pour diminuer les temps de calcul
+            if self.meta.balance == "none":
+                n_folds = 5
+                k_neighbors = 0
+            else:
+                n_folds = 2
+                k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
+                all_params["k_neighbors"] = k_neighbors
+
+            scores = cuml_cross_evaluate(
+                X_train_and_val=self.X,
+                y_train_and_val=self.y,
+                pipe_preprocess=self.pipe_preprocess,
+                cuml_model=clf,
+                balance=self.meta.balance,
+                k_neighbors=k_neighbors,
+                n_folds=n_folds,
+                threshold_prob=threshold_prob,
+                train_scores=False,
             )
 
             # mean_scores = scores.mean(axis=0)
@@ -162,16 +308,19 @@ class SearchLogReg(ExpSearch):
 
             # Minimise la log loss : ll = log_loss(test_y , y_predlr)
 
-            # Fin d'un trial
-            # del folds
-            # gc.collect()
-            # dic_metrics = mean_scores.to_dict()
+            # Dans optuna, il ne sera loggé par défaut que la métrique à optimiser, pour loguer toutes les métriques,
+            # on personnalise pour enregistrer toutes les métriques
+            trial.set_user_attr("mean_scores", mean_scores)
 
+            # Fin d'un trial, on loggue dans mlflow
             mlflow.log_metrics(mean_scores)
-            all_params = {k: v for (k, v) in clf_params.items()}
-            all_params["threshold_prob"] = threshold_prob
+            """all_params = {k: v for (k, v) in clf_params.items()}
+            all_params["threshold_prob"] = threshold_prob"""
+
             mlflow.log_params(all_params)
-            # mlflow.log_params(trial.params)
+            # On ne logue le dataset que dans le best_run
+            # self.track_dataset()
+
         return mean_scores[self.metric]
 
     def run_logreg_trials(self, n_trials=20, n_jobs=1, verbose=True):
@@ -189,7 +338,7 @@ class SearchLogReg(ExpSearch):
     # ou tout simplement allocation sur CUDA en parallel ne fonctionne pas bien (alloue plus que nécessaire).
     # On peut surveiller en temps réel la consommation de VRAM avec nvidia-smi -l 1 (crée une loop pour rafraichir toutes les 1 secondes)
     # Le multithreads réglerait peut-être le problème de l'allocation VRAM mais MLFlow n'est pas thread-safe.
-    def optimize(self, n_trials=10, verbose=True):
+    def run(self, n_trials=10, verbose=True):
         # Si le nombre de trials est grand, on ne les loggue pas à l'écran, à la place on affiche uniquement les warnings
         if n_trials > 20:
             self.optuna_verbosity = optuna.logging.WARNING
@@ -207,25 +356,324 @@ class SearchLogReg(ExpSearch):
         )
 
         if verbose:
-            print(
+            """print(
                 f"Meilleure combinaison : trial {self._study.best_trial.number}, {self.metric} : {self._study.best_trial.value}"
             )
-            print(f"Paramètres : {self._study.best_trial.params}")
+            print(f"Paramètres : {self._study.best_trial.params}")"""
 
             print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
-        self.create_best_run()
+        self.create_best_run(verbose=verbose)
+
+    def get_model(self):
+        params_of_model = self.get_params_of_model()
+        return LogisticRegression(**params_of_model)
 
 
 # [TODO] refacto car hérite de ExpSearch au lieu de ExperimentSearch
 class SearchLgb(ExpSearch):
-    def __init__(self, metric="auc", direction="maximize"):
-        super().__init__(metric=metric, direction=direction)
+    def __init__(self, metric="auc", direction="maximize", loss="binary", debug=False):
+        super().__init__(
+            model_name="lgbm",
+            metric=metric,
+            direction=direction,
+            debug=debug,
+            loss=loss,
+        )
+        self.meta.balance = "none"
         self.device = "cpu"
-        self.model_name = "lgbm"
+        self.sampler = optuna.samplers.TPESampler(VAL_SEED)
+        # Grand maximum en séquentiel
+        self.lgb_n_threads = 12
         # Turn off optuna log notes.
         # optuna.logging.set_verbosity(optuna.logging.WARN)
+        # Liste des paramètres qu'on veut voir affichés dans le parrallel plot fait par optuna
+        self._params_to_plot_in_parallel = [
+            "n_estimators",
+            "learning_rate",
+            "lambda_l1",
+            "lambda_l2",
+            "num_leaves",
+            "feature_fraction",
+            "bagging_freq",
+            "threshold_prob",
+        ]
+        self._param_names_model = [
+            "boosting_type",
+            "force_col_wise",
+            "is_unbalanced",
+            "objective",
+            "reg_alpha",
+            "reg_lambda",
+            "num_leaves",
+            "feature_fraction",
+            "bagging_fraction",
+            "bagging_freq",
+            "min_child_samples",
+            "learning_rate",
+            "n_estimators",
+        ]
+        self._param_names_train = ["feval"]
+        """self.meta.extra_tags = {
+            "direction": self.direction,
+            "metric": self.metric,
+            "loss": self.loss,
+        }"""
 
+    # On ne teste pas boosting_type dart car pas de early_stopping et c'est trop long
+    # Pas de validation croisée car c'est trop long
     def objective(self, trial):
+        with mlflow.start_run(
+            experiment_id=self._mlflow_id, run_name=f"{trial.number}", nested=True
+        ):
+            learning_rate = trial.suggest_float("learning_rate", 0.0001, 0.5, log=True)
+            max_bin = trial.suggest_int("max_bin", 128, 512, step=32)
+            n_estimators = trial.suggest_int("n_estimators", 40, 400, step=20)
+
+            if self.loss == "binary":
+                lgb_objective = "binary"
+                feval = None
+                alpha = 1.0
+                num_leaves = trial.suggest_int("num_leaves", 8, 256)
+                min_child_samples = trial.suggest_int("min_child_samples", 5, 100)
+                metrics = [
+                    "binary_logloss",
+                    self.metric,
+                ]
+            elif self.loss == "logloss_objective":
+                lgb_objective = logloss_objective
+                # Le early_stopping s'effectue sur la loss mais
+                # le pruning s'effectue sur la métrique à optimiser (auc...) calculée dans feval
+                metrics = ["logloss"]
+                feval = [logloss_metric, feval_auc]
+                alpha = 1.0
+                num_leaves = trial.suggest_int("num_leaves", 8, 256)
+                min_child_samples = trial.suggest_int("min_child_samples", 5, 100)
+
+            elif self.loss == "weighted_cross_entropy":
+                # alpha < 1.0 réduit le nombre de faux négatifs, 1 équivaut à loss="binary" (à condition de boost_from_average=False)
+                # et alpha > 1 réduirait le nombre de faux positifs
+                alpha = trial.suggest_float("alpha", 0.1, 1.0, step=0.1)
+
+                lgb_objective = logloss_objective
+                metrics = [logloss_metric]
+                feval = [logloss_metric, feval_auc]
+                """lgb_objective = WeightedCrossEntropyLoss(alpha=alpha)
+                metrics = [WeightedCrossEntropyMetric(alpha=alpha)]
+                feval = [WeightedCrossEntropyMetric(alpha=alpha), feval_auc]"""
+                num_leaves = trial.suggest_int("num_leaves", 8, 64)
+                min_child_samples = trial.suggest_int("min_child_samples", 5, 20)
+
+            # équivallent class_weight mais pour classfification binaire
+            is_unbalance = trial.suggest_categorical("is_unbalance", [True, False])
+            lambda_l1 = trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True)
+            lambda_l2 = trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True)
+            # Permet d'utiliser un sous-ensemble des features sélectionnées aléatoirement
+            # et ainsi de varier les arbres. Aide contre surfit et diminue temps de fit
+            feature_fraction = trial.suggest_float(
+                "feature_fraction", 0.4, 1.0, step=0.1
+            )
+            # Idem feature_fraction mais pour les lignes
+            bagging_fraction = trial.suggest_float(
+                "bagging_fraction", 0.4, 1.0, step=0.1
+            )
+            bagging_freq = trial.suggest_int("bagging_freq", 1, 7)
+
+            threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
+
+            # Si on a de l'oversampling ou de l'undersampling, on recherche le nombre de voisins,
+            # On ne recherche pas la sampling_strategy car on n'a pas la puissance de calcul
+            if self.meta.balance != "none":
+                k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
+                # all_params["k_neighbors"] = k_neighbors
+            else:
+                k_neighbors = 0
+
+            lgb_params = {
+                "force_col_wise": True,
+                "boosting_type": "gbdt",
+                # "boost_from_average": False,
+                # "deterministic": True,
+                "objective": lgb_objective,
+                "metrics": metrics,
+                "is_unbalance": is_unbalance,
+                "lambda_l1": lambda_l1,
+                "lambda_l2": lambda_l2,
+                "num_leaves": num_leaves,
+                "feature_fraction": feature_fraction,
+                "bagging_fraction": bagging_fraction,
+                "bagging_freq": bagging_freq,
+                "min_child_samples": min_child_samples,
+                "learning_rate": learning_rate,
+                "max_bin": max_bin,
+                "num_threads": self.lgb_n_threads,
+                "verbosity": -1,
+                "verbose_eval": False,
+            }
+            all_params = {
+                k: v
+                for k, v in lgb_params.items()
+                if k
+                not in [
+                    "random_seed",
+                    "verbosity",
+                    "verbose",
+                    "verbose_eval",
+                    "objective",
+                    "metrics",
+                    "num_threads",
+                ]
+            }
+            all_params["n_estimators"] = n_estimators
+            all_params["loss"] = self.loss
+            all_params["alpha"] = alpha
+            all_params["balance"] = self.meta.balance
+            all_params["k_neigbors"] = k_neighbors
+            mlflow.log_params(all_params)
+
+            pruning_callback = optuna.integration.LightGBMPruningCallback(
+                trial, self.metric
+            )
+            eval_results = {}
+            lgb_callbacks = [
+                lgb.early_stopping(stopping_rounds=20, verbose=True),
+                # pruning_callback,
+                # lgb.log_evaluation(period=5),
+                lgb.record_evaluation(eval_results),
+            ]
+
+            predictors = [
+                f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]
+            ]
+
+            # On n'utilise pas de validation croisée, les temps de calculs sont trop longs
+            X_train, X_val, y_train, y_val = train_test_split(
+                self.X[predictors],
+                self.y,
+                stratify=self.y,
+                test_size=0.25,
+                random_state=VAL_SEED,
+            )
+
+            # Eventuel pipeline de pré-traitement
+            if self.pipe_preprocess:
+                pipe = deepcopy(self.pipe_preprocess)
+                X_train_processed = pipe.fit_transform(X_train)
+                X_val_processed = pipe.transform(X_val)
+            else:
+                X_train_processed = X_train
+                X_val_processed = X_val
+
+            # Eventuel rééquilibrage avec SMOTE ou NearMiss
+            if self.meta.balance == "none":
+                X_train_balanced = X_train_processed
+                y_train_balanced = y_train
+            elif self.meta.balance == "smote":
+                # Si la sampling_strategy n'a pas été définie, on utilise par défaut 0.7
+                # Cela ne rééquilibre pas à 50% (trop long, trop de ram) mais c'est suffisant.
+                if self.meta.sampling_strategy == 0:
+                    self.meta.sampling_strategy = 0.7
+                X_train_balanced, y_train_balanced = balance_smote(
+                    X_train_processed,
+                    y_train,
+                    k_neighbors=k_neighbors,
+                    sampling_strategy=0.7,
+                    random_state=VAL_SEED,
+                    verbose=False,
+                )
+            elif self.meta.balance == "nearmiss":
+                X_train_balanced, y_train_balanced, features_null_var = (
+                    balance_nearmiss(
+                        X_train_processed,
+                        y_train,
+                        k_neighbors=k_neighbors,
+                        verbose=False,
+                    )
+                )
+            else:
+                print(
+                    f"{self.meta.balance} est une valeur incorrecte pour balance. Les valeurs possibles sont 'none', 'smote' ou 'nearmiss'"
+                )
+
+            # On transforme en dataset lgb
+            lgb_train = lgb.Dataset(
+                X_train_balanced,
+                y_train_balanced,
+                params={"verbosity": -1},
+                free_raw_data=False,
+            )
+            lgb_val = lgb.Dataset(
+                X_val_processed,
+                y_val,
+                reference=lgb_train,
+                params={"verbosity": -1},
+                free_raw_data=False,
+            )
+            t0_fit_time = time.time()
+            model = lgb.train(
+                params=lgb_params,
+                train_set=lgb_train,
+                valid_sets=[lgb_val],
+                num_boost_round=n_estimators,
+                feval=feval,
+                callbacks=lgb_callbacks,
+            )
+            fit_time = time.time() - t0_fit_time
+
+            # Si on utilise une fonc built-il pour la perte, le modèle renvoie déjà des probas,
+            # Si on utilise les fonc perso, on a des logits et on doit appliquer sigmoid pour obtenir les probas,
+            if self.loss == "binary":
+                y_score_val = model.predict(X_val_processed)
+            else:
+                y_score_val = special.expit(model.predict(X_val_processed))
+                # y_score_val = clip_sigmoid(model.predict(X_val_processed))
+                # y_score_val = model.predict(X_val_processed)
+
+            # Prédiction de la classe en fonction du seuil de probabilité
+            y_pred_val = pd_pred_prob_to_binary(y_score_val, threshold=threshold_prob)
+
+            tn, fp, fn, tp = confusion_matrix(y_val, y_pred_val).ravel()
+
+            # Mesures sur le jeu de validation
+            dic_val_scores = {}
+            dic_val_scores["auc"] = roc_auc_score(y_val, y_score_val)
+            dic_val_scores["accuracy"] = accuracy_score(y_val, y_pred_val)
+            dic_val_scores["recall"] = recall_score(y_val, y_pred_val)
+            dic_val_scores["penalized_f1"] = penalize_f1(fp=fp, fn=fn, tp=tp)
+            dic_val_scores["business_gain"] = penalize_business_gain(
+                tn=tn, fp=fp, fn=fn, tp=tp
+            )
+
+            dic_val_scores["fit_time"] = fit_time
+            dic_val_scores["tn"] = tn
+            dic_val_scores["fn"] = fn
+            dic_val_scores["tp"] = tp
+            dic_val_scores["fp"] = fp
+
+            del X_train
+            del y_train
+            del X_val
+            del y_val
+            del model
+            gc.collect()
+
+            # Dans optuna, il ne sera loggé par défaut que la métrique à optimiser, pour loguer toutes les métriques,
+            # on personnalise pour enregistrer toutes les métriques
+            print("dic_val_scores", type(dic_val_scores))
+            print(dic_val_scores)
+            mean_scores = {k: np.mean(v) for (k, v) in dic_val_scores.items()}
+            trial.set_user_attr("mean_scores", mean_scores)
+
+            # Fin d'un trial, on loggue dans mlflow
+            mlflow.log_metrics(dic_val_scores)
+
+            # On ne logue le dataset que dans le best_run
+            # self.track_dataset()
+
+        return dic_val_scores[self.metric]
+
+    # confusion modèle avec sklearn / lgb direct (si on teste dart, pas de early_stopping -> trop long)
+    # cross_evaluation -> trop long
+    def objective_old(self, trial):
         # parent_run_name = "best"
         # Attention les n° de trial ne correspondent pas à ceux fournis en logging stdout
         with mlflow.start_run(
@@ -244,8 +692,17 @@ class SearchLgb(ExpSearch):
             )
             max_bin = trial.suggest_int("max_bin", 128, 512, step=32)
             n_estimators = trial.suggest_int("n_estimators", 40, 400, step=20)
-            # On concentre la recherche du seuil autour de 0.5 avec la distribution Beta
-            threshold_prob = self.suggest_beta("threshold_prob", low=0.1, high=0.9)
+            threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
+
+            # Si on n'a pas d'oversampling ni d'undersampling, on fait une cross validation avec 5 folds,
+            # Si on a de l'oversampling ou de l'undersampling on ne fait que 2 folds pour diminuer les temps de calcul
+            if self.meta.balance == "none":
+                n_folds = 5
+                k_neighbors = 0
+            else:
+                n_folds = 2
+                k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
+                # all_params["k_neighbors"] = k_neighbors
 
             hyperparams = {
                 "boosting_type": boosting_type,
@@ -260,6 +717,9 @@ class SearchLgb(ExpSearch):
                 "max_bin": max_bin,
                 "n_estimators": n_estimators,
                 "threshold_prob": threshold_prob,
+                "loss": self.objective_name,
+                "balance": self.meta.balance,
+                "k_neighbors": k_neighbors,
             }
 
             # 'binary' est la métrique d'erreur
@@ -273,7 +733,7 @@ class SearchLgb(ExpSearch):
             # On n'utilise pas cross_val_score pour des problèmes de RAM
             # scores = cross_val_score(model, X, y, scoring="f1_macro", cv=5)
             folds = StratifiedKFold(
-                n_splits=5, shuffle=True, random_state=self.random_state
+                n_splits=n_folds, shuffle=True, random_state=self.random_state
             )
             dic_val_scores = {
                 "auc": [],
@@ -294,19 +754,71 @@ class SearchLgb(ExpSearch):
 
             # Dans le split, la copie est indispensable car sinon on a une Vue array avec FLAG qui rend l'array immutable et
             # provoque l'erreur 'cannot set WRITEABLE flag to True of this array'.
-            for _, (train_idx, valid_idx) in enumerate(
+            for i_fold, (train_idx, valid_idx) in enumerate(
                 folds.split(
                     # Pour construire les indices de folds, nous n'avons besoin pour X que de 2 variables afin d'obtenir un DataFrame,
                     # En choisir seulement 2 (si copie) accélère émormément les traitements
                     self.X[predictors[:2]].to_numpy(copy=True),
                     self.y.to_numpy(copy=True),
+                    # self.X[predictors[:2]],
+                    # self.y,
                 )
             ):
                 # Ici on transforme en array et on copie car cela accélère la parallélisation
-                X_train = self.X.loc[train_idx, predictors].to_numpy(copy=True)
-                y_train = self.y.loc[train_idx].to_numpy(copy=True)
-                X_val = self.X.loc[valid_idx, predictors].to_numpy(copy=True)
-                y_val = self.y.loc[valid_idx].to_numpy(copy=True)
+                X_train = self.X[predictors].iloc[train_idx].copy()
+                X_val = self.X[predictors].iloc[valid_idx].copy()
+                y_train = self.y.iloc[train_idx].copy()
+                y_val = self.y.iloc[valid_idx].copy()
+
+                # Eventuel pipeline de pré-traitement
+                if self.pipe_preprocess:
+                    pipe = deepcopy(self.pipe_preprocess)
+                    X_train_processed = pipe.fit_transform(X_train)
+                    X_val_processed = pipe.transform(X_val)
+                else:
+                    X_train_processed = X_train
+                    X_val_processed = X_val
+
+                # Eventuel rééquilibrage avec SMOTE ou NearMiss
+                if self.meta.balance == "none":
+                    X_train_balanced = X_train_processed
+                    y_train_balanced = y_train
+                elif self.meta.balance == "smote":
+                    # Si la sampling_strategy n'a pas été définie, on utilise par défaut 0.7
+                    # Cela ne rééquilibre pas à 50% (trop long, trop de ram) mais c'est suffisant.
+                    if self.meta.sampling_strategy == 0:
+                        self.meta.sampling_strategy = 0.7
+                    X_train_balanced, y_train_balanced = balance_smote(
+                        X_train_processed,
+                        y_train,
+                        k_neighbors=k_neighbors,
+                        sampling_strategy=0.7,
+                        random_state=VAL_SEED,
+                        verbose=False,
+                    )
+                elif self.meta.balance == "nearmiss":
+                    X_train_balanced, y_train_balanced, features_null_var = (
+                        balance_nearmiss(
+                            X_train_processed,
+                            y_train,
+                            k_neighbors=k_neighbors,
+                            verbose=False,
+                        )
+                    )
+                else:
+                    print(
+                        f"{self.meta.balance} est une valeur incorrecte pour balance. Les valeurs possibles sont 'none', 'smote' ou 'nearmiss'"
+                    )
+
+                # On transforme en numpy array car cela accélère les traitements en parralélisation
+                """X_train_balanced = X_train_balanced.to_numpy(copy=True)
+                X_val_processed = X_val_processed.to_numpy(copy=True)
+                y_train_balanced = y_train_balanced.to_numpy(copy=True)
+                y_val = y_val.to_numpy(copy=True)"""
+                X_train_balanced = X_train_balanced.to_numpy()
+                X_val_processed = X_val_processed.to_numpy()
+                y_train_balanced = y_train_balanced.to_numpy()
+                y_val = y_val.to_numpy()
 
                 model = lgb.LGBMClassifier(
                     # force_row_wise=True,
@@ -330,33 +842,34 @@ class SearchLgb(ExpSearch):
                 )
                 t0_fit_time = time.time()
                 model.fit(
-                    X_train,
-                    y_train,
+                    X_train_balanced,
+                    y_train_balanced,
                     # eval_set=[(X_train, y_train), (X_val, y_val)],
-                    eval_set=(X_val, y_val),
+                    eval_set=(X_val_processed, y_val),
                     eval_metric=self.metric,
                 )
                 fit_time = time.time() - t0_fit_time
 
                 # y_score = np.array(model.predict_proba(X_val_np)[:, 1], copy=True)
                 # La copie a tendance à augmenter la rapidité ? Bizarre
-                y_score_val = model.predict_proba(X_val)[:, 1]
+                y_score_val = model.predict_proba(X_val_processed)[:, 1]
                 # Prédiction de la classe en fonction du seuil de probabilité
 
                 y_pred_val = pd_pred_prob_to_binary(
                     y_score_val, threshold=threshold_prob
                 )
 
+                tn, fp, fn, tp = confusion_matrix(y_val, y_pred_val).ravel()
+
                 # Mesures sur le jeu de validation
                 dic_val_scores["auc"].append(roc_auc_score(y_val, y_score_val))
                 dic_val_scores["accuracy"].append(accuracy_score(y_val, y_pred_val))
                 dic_val_scores["recall"].append(recall_score(y_val, y_pred_val))
-                dic_val_scores["penalized_f1"].append(penalize_f1(y_val, y_pred_val))
+                dic_val_scores["penalized_f1"].append(penalize_f1(fp=fp, fn=fn, tp=tp))
                 dic_val_scores["business_gain"].append(
-                    penalize_business_gain(y_val, y_pred_val)
+                    penalize_business_gain(tn=tn, fp=fp, fn=fn, tp=tp)
                 )
                 dic_val_scores["fit_time"].append(fit_time)
-                tn, fp, fn, tp = confusion_matrix(y_val, y_pred_val).ravel()
                 dic_val_scores["tn"].append(tn)
                 dic_val_scores["fn"].append(fn)
                 dic_val_scores["tp"].append(tp)
@@ -374,19 +887,48 @@ class SearchLgb(ExpSearch):
             gc.collect()
             dic_metrics = {k: np.mean(v) for (k, v) in dic_val_scores.items()}
 
-            # Pour logguer les métriques additionnelles dans optuna_db :
-            # trial.set_user_attr("constraint", [c0])
+            # mlflow.log_metrics(dic_metrics)
+            # mlflow.log_params(hyperparams)
 
-            """for k, v in dic_metrics.items():
-                mlflow.log_metric(k, v)"""
-            mlflow.log_metrics(dic_metrics)
+            # mean_scores = scores.mean(axis=0)
+            mean_scores = {k: np.mean(v) for (k, v) in dic_val_scores.items()}
+
+            # Dans optuna, il ne sera loggé par défaut que la métrique à optimiser, pour loguer toutes les métriques,
+            # on personnalise pour enregistrer toutes les métriques
+            trial.set_user_attr("mean_scores", mean_scores)
+
+            # Fin d'un trial, on loggue dans mlflow
+            mlflow.log_metrics(mean_scores)
+
             mlflow.log_params(hyperparams)
-        return dic_metrics[self.metric]
+            # On ne logue le dataset que dans le best_run
+            # self.track_dataset()
 
-    def run_lgb_trials(self, n_trials=10, reseed_sampler=False):
+        return mean_scores[self.metric]
+
+    def hide_lgb_log(self):
+        log_stream = io.StringIO()
+        logging.basicConfig(stream=log_stream, level=logging.INFO, format="%(message)s")
+        logger = logging.getLogger("lightgbm")
+        logger.setLevel(logging.WARNING)  # Pour capturer les warnings
+        # Configurer LightGBM pour utiliser ce logger
+        lgb.register_logger(logger)
+        return
+
+    def run_lgb_trials(self, n_trials=10, reseed_sampler=True, verbose=False):
+
+        # La verbosité dans les params ne fonctionnennt pas, donc pour ne pas afficher tout à l'écran, on redirige les logs vers une chaine de caractères.
+        if not verbose:
+            self.hide_lgb_log()
+
+        if n_trials > 10:
+            self.optuna_verbosity = optuna.logging.ERROR
+        else:
+            self.optuna_verbosity = optuna.logging.INFO
+        optuna.logging.set_verbosity(self.optuna_verbosity)
         if reseed_sampler:
             self._study.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
-            self._study.sampler.reseed_rng()
+            # self._study.sampler.reseed_rng()
         else:
             self._study.sampler = optuna.samplers.TPESampler()
 
@@ -394,6 +936,40 @@ class SearchLgb(ExpSearch):
             self.objective, n_trials=n_trials, n_jobs=1, gc_after_trial=True
         )
 
+    def run(self, n_trials=10, verbose=False, lgb_n_threads=None):
+        t0 = time.time()
+        if lgb_n_threads:
+            self.lgb_n_threads = lgb_n_threads
+        self.run_lgb_trials(n_trials=n_trials, reseed_sampler=True, verbose=verbose)
+        print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+        self.create_best_run()
+
+    """def get_params_of_model(self):
+        return {
+            k: v
+            for k, v in self.get_suggested_params().items()
+            if k not in ["threshold_prob", "k_neighbors"] and not pd.isna(v)
+        }"""
+
+    def get_params_of_model(self):
+        all_params = self.get_all_params()
+        all_params["objective"] = self.loss
+        all_params["force_col_wise"] = True
+        all_params["is_unbalanced"] = False
+        default_model = lgb.LGBMClassifier()
+        default_param_keys = default_model.get_params().keys()
+        default_param_names = [k for k in default_param_keys] + [
+            "force_col_wise",
+            "is_unbalanced",
+        ]
+        return {k: v for k, v in all_params.items() if k in default_param_names}
+
+    def get_model(self):
+        params_of_model = self.get_params_of_model()
+        return lgb.LGBMClassifier(**params_of_model)
+
+    # Si on parallélise, on ne peut pas utiliser le callback de pruning sur la métrique (intégration lgbm dans optuna), ni les threads dnas le modèle.
+    # en définitive on ne parallélise pas.
     # Pourquoi Lgbm sur CPU et pas cuda / gpu contrairement aux modèles linéaires ?
     # RAPID avec cudf ou cuml ne supporte pas lightgbm puisque lightgbm apporte son propre support GPU. Cependant,
     # Lgbm existe sur GPU mais n'est pas performant du tout si beaucoup de vraiables en OneHot.
@@ -401,7 +977,6 @@ class SearchLgb(ExpSearch):
     # On choisit donc CPU pour ce modèle, mais on tente de paralléliser.
 
     # Parallélisation des jobs sur CPU :
-    # La vraie parallélisation est beaucoup plus rapide que le multithread (multithread optuna = optimize avec n_jobs > 1)
     # share_sampler_seed permet de s'assurer que le sampler ne va pas proposer les mêmes combinaisons de paramètres dans chaque workers,
     # grâce à la méthode optuna .reseed_rng().
     # cependant, les traitements sont alors VRAIMENT beaucoup plus LONGS
@@ -412,7 +987,7 @@ class SearchLgb(ExpSearch):
     # C'est BEAUCOUP PLUS RAPIDE (du simple au double au minimum).
     # Les résultats ne sont pas reproductibles en parallélisation quelque soit la valeur de share_sampler_seed (True ou False), Mais
     # les résultats sont souvent (pas toujours !) un PETIT PEU MEILLEURS avec share_sampler_seed=True qu'avec share_sampler_seed=False .
-    def optimize(
+    def run_parallel(
         self,
         n_workers=4,
         n_trials_per_worker=10,
@@ -420,6 +995,7 @@ class SearchLgb(ExpSearch):
         verbose=True,
     ):
         t0 = time.time()
+        self.lgb_n_threads = 1
         sampler_type = self._study.sampler.__class__
 
         if verbose:
