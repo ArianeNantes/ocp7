@@ -1,17 +1,30 @@
 import numpy as np
+import pandas as pd
 
 import cudf
 import cuml
+import cupy as cp
 import sklearn
 from cuml.preprocessing import RobustScaler, MinMaxScaler, StandardScaler
+from cuml.neighbors import NearestNeighbors
 from sklearn.base import BaseEstimator, TransformerMixin, check_is_fitted
 from imblearn.under_sampling import NearMiss
 from imblearn.over_sampling import SMOTE, SMOTENC
+import gc
+import warnings
 
 from copy import deepcopy
 
 # from sklearn.cluster import AgglomerativeClustering
 # from collections import defaultdict
+
+from src.p7_constantes import VAL_SEED
+
+
+warnings.filterwarnings(
+    "ignore",
+    message="Unused keyword parameter: n_jobs during cuML estimator initialization",
+)
 
 
 class Imputer(BaseEstimator, TransformerMixin):
@@ -459,7 +472,7 @@ def check_no_nan(df):
         )
 
 
-def check_variances(df, raise_error=True):
+def check_variances(df, raise_error=True, verbose=True):
     null_var = []
     dtype_list = df.dtypes.value_counts().index.to_numpy().tolist()
     # Pour chaque type de colonnes, on calcule les variances et on sélectionne les features de variance trop faibles
@@ -472,12 +485,13 @@ def check_variances(df, raise_error=True):
                 f"Eliminez d'abord les variables de variance nulle, {len(null_var)} features :\n{null_var}"
             )
         else:
-            print(
-                f"WARNING : {len(null_var)} variables de variance nulle :\n{null_var}"
-            )
-            return null_var
-    else:
-        return
+            if verbose:
+                print(
+                    f"WARNING : {len(null_var)} variables de variance nulle :\n{null_var}"
+                )
+    return null_var
+    """else:
+        return []"""
 
 
 def get_binary_features(df):
@@ -485,12 +499,20 @@ def get_binary_features(df):
     features_bool = df[features].select_dtypes(include="bool").columns.tolist()
     features_not_bool = [f for f in features if f not in features_bool]
 
-    features_bin_not_bool = [
-        f
-        for f in features_not_bool
-        if df[f].dropna().nunique() <= 2
-        and all(value in [0, 1] for value in df[f].dropna().unique().to_numpy())
-    ]
+    if isinstance(df, (cudf.core.dataframe.DataFrame, cudf.core.series.Series)):
+        features_bin_not_bool = [
+            f
+            for f in features_not_bool
+            if df[f].dropna().nunique() <= 2
+            and all(value in [0, 1] for value in df[f].dropna().unique().to_numpy())
+        ]
+    else:
+        features_bin_not_bool = [
+            f
+            for f in features_not_bool
+            if df[f].dropna().nunique() <= 2
+            and all(value in [0, 1] for value in df[f].dropna().unique())
+        ]
     binary_features = features_bool + features_bin_not_bool
     return binary_features
 
@@ -522,6 +544,8 @@ def train_test_split_nan(df, y=None, test_size=0.25, shuffle=True, random_state=
 
     # Si le dataset est un cudf
     if isinstance(X, (cudf.core.dataframe.DataFrame, cudf.core.series.Series)):
+        if test_size == 0:
+            return X, None, y, None
         n_missing = df.isna().sum().sum()
         # train_test_split de cuml n'autorise pas les nan
         # Si'il n'y a pas de nan, on utilise train_test_split de cuml
@@ -574,117 +598,192 @@ def train_test_split_nan(df, y=None, test_size=0.25, shuffle=True, random_state=
 
 
 def balance_nearmiss(
-    df,
-    random_state=42,
+    X,
+    y,
+    k_neighbors=3,
+    drop_null_var=False,
     verbose=True,
 ):
-    """Rééquilibre un df/cudf avec de l'undersampling NearMiss
 
-    Args:
-        df (df ou cudf): DataFrame contenant les données y compris la target
-        random_state (int, optional): Graine de hasard pour la reproductibilité des résultats. Defaults to 42.
+    check_no_nan(X)
 
-    Returns:
-        (df ou cudf): le DataFrame rééquilibré en nombre d'observations
-    """
-    check_no_nan(df)
+    not_predictors = [
+        f for f in X.columns if f in ["SK_ID_CURR", "TARGET", "Unnamed: 0"]
+    ]
+    if not_predictors:
+        print(f"WARNING {not_predictors} ne doivent pas figurer dans les colonnes de X")
+    if isinstance(X, (cudf.core.dataframe.DataFrame, cudf.core.series.Series)):
+        y_ = y.to_pandas()
+        X_ = X.to_pandas()
+    else:
+        # La copie est nécessaire pour pouvoir paralléliser les jobs
+        y_ = y.copy()
+        X_ = X.copy()
 
-    # Si la target n'est pas présente dans X, on sort car on en a besoin dans y
-    if not "TARGET" in df.columns:
-        print("La colonne 'TARGET' ne figure pas dans les données")
-        return
-    # On sépare la target des données (on laisse l'ID)
-    features = [f for f in df.columns if f not in ["TARGET"]]
-    y = df["TARGET"].to_numpy()
-    X = df[features].to_numpy()
+    nm = NearMiss(n_neighbors=k_neighbors)
+    X_resampled, y_resampled = nm.fit_resample(X_, y_)
 
-    nm = NearMiss()
-    X_resampled, y_resampled = nm.fit_resample(X, y)
-
-    cu_df = cudf.DataFrame(X_resampled, columns=features)
-    cu_df["TARGET"] = y_resampled
+    if isinstance(X, (cudf.core.dataframe.DataFrame, cudf.core.series.Series)):
+        y_resampled = cudf.from_pandas(y_resampled)
+        X_resampled = cudf.from_pandas(X_resampled)
 
     if verbose:
         print(
-            f"Avant rééquilibrage : Nb observations = {df['TARGET'].shape[0]:_}, ratio défauts = {df['TARGET'].value_counts(normalize=True)[1]:.2%}"
+            f"Avant rééquilibrage : Nb observations = {X.shape[0]:_}, ratio défauts = {y.value_counts(normalize=True)[1]:.2%}"
         )
         print(
-            f"Après NEARMISS : Nb observations = {cu_df['TARGET'].shape[0]:_}, ratio défauts = {cu_df['TARGET'].value_counts(normalize=True)[1]:.2%}"
+            f"Après NEARMISS : Nb observations = {X_resampled.shape[0]:_}, ratio défauts = {y_resampled.value_counts(normalize=True)[1]:.2%}"
         )
+
     # On vérifie les variables de variance nulle
-    check_variances(cu_df, raise_error=False)
+    features_null_var = check_variances(X_resampled, raise_error=False, verbose=verbose)
+    if drop_null_var:
+        X_resampled = X_resampled.drop(features_null_var, axis=1)
+    return X_resampled, y_resampled, features_null_var
 
-    return cu_df
 
-
+# Bon article (en français !) sur SMOTE : https://kobia.fr/imbalanced-data-smote/
+# Sur CUDA :
+# il peut y avoir une erreur d'allocation 'pinned-memory' :
+# L'algo effectue des transfers de mem cpu vers gpu, cela exige de la syncronisation CPU/GPU,
+# (contrairement à de la mem qui reste sur GPU) donc de la 'pinned memory'.
+# Les ressources en pinned memory sont limitées et sont partagées avec les autres applications.
+# (une appli peut en réserver pour soi-même en oubliant les autres sans nettoyer,
+# fonctionne par pooling qu'on peut s'octroyer)
+# Plus de détail : https://docs.cupy.dev/en/stable/user_guide/memory.html
+# ==> Si tu vois l'erreur 'pinned memory',
+# ferme toutes les autres applis, et si cela ne suffit pas, redémarre.
+# Le sampling_strategy=1 (pour arriver à un rééquilibragee default_ratio=50%)
+# n'est pas la cause de l'erreur/warning 'pinned_mem',
+# Toutefois + on augmente le % + c'est looooong. (vraiment très long !)
 def balance_smote(
-    df,
+    X,
+    y,
+    k_neighbors=3,
+    # On ne rééquilibre pas complètement pour limiter le tempsde traitement.
+    sampling_strategy=0.7,
     random_state=42,
+    binary_features=[],
     add_to_categorical=["AGE_RANGE"],
-    verbose=True,
+    discrete_features=[],
+    verbose=False,
 ):
     """Rééquilibre un df/cudf avec de l'OverSampling SMOTE en fonction de 'TARGET'
 
     Args:
-        df (df ou cudf): DataFrame contenant les données y compris la target
-        strategy (str, optional): Stratégie de rééquilibrage : NearMiss ou SMOTE. Defaults to "nearmiss".
+        X (df ou cudf): DataFrame contenant les données
+        y (pd.Series ou cudf.Series): Série contenant la target
+        binary_features (list) : Liste de features booléennes, considérées comme catégorielles.
+        add_to_categorical (list): Liste de features à considérer comme catégorielles en plus des features booléennes issues du OneHot.
         random_state (int, optional): Graine de hasard pour la reproductibilité des résultats. Defaults to 42.
 
     Returns:
         (df ou cudf): le DataFrame rééquilibré en nombre d'observations
     """
-    check_no_nan(df)
+    # Finalement, pour gagner en temps de calcul on ne vérifie pas l'absence de NaN.
+    # check_no_nan(X)
 
-    # Si la target n'est pas présente dans X, on en a besoin dans y
-    if not "TARGET" in df.columns:
-        print("La colonne 'TARGET' ne figure pas dans les données")
-        return
+    pinned_mempool = cp.get_default_pinned_memory_pool()
+    pinned_mempool.free_all_blocks()
+    gc.collect()
 
-    # On sépare la target des données
-    features = [f for f in df.columns if f not in ["SK_ID_CURR", "TARGET"]]
-    y = df["TARGET"].to_numpy()
-    X = df[features].to_numpy()
+    # L'utilisation de cuml pour les plus proches voisins améliore nettement les temps de calculs
+    # On enlève les warnings car sinon "Unused keyword parameter: n_jobs during cuML estimator initialization" dans optuna alors que n_jobs=1
+    cuml.common.logger.set_level(2)
+    cu_nn = NearestNeighbors(n_neighbors=k_neighbors)
+    features = [f for f in X.columns if f not in ["SK_ID_CURR", "TARGET"]]
+
+    # La copie est imérative pour pouvoir paralléliser les jobs en mode CPU
+    y_ = y.to_numpy(copy=True)
+    X_ = X[features].to_numpy(copy=True)
+    # print("\ndtype X")
+    # print(X[features].dtypes.value_counts())
 
     recast_categorical = False
-    features_bool = get_binary_features(df[features])
-    categorical_features = features_bool + add_to_categorical
+    if not binary_features:
+        features_bool = get_binary_features(X[features])
+    else:
+        features_bool = [f for f in binary_features if f in features]
+
+    _add_to_categorical = [f for f in add_to_categorical if f in features]
+    categorical_features = features_bool + _add_to_categorical
+    # print("categorical_features", categorical_features)
     if categorical_features:
         recast_categorical = True
         categorical_id = [
-            df[features].columns.get_loc(name) for name in categorical_features
+            X[features].columns.get_loc(name) for name in categorical_features
         ]
 
         # Contrairement à SMOTE, SMOTENC ne rajoutera pas des valeurs floats intermédiaires pour les variables categorical
         # Cependant, le traitement est nettement plus long
-        smote = SMOTENC(categorical_features=categorical_id, random_state=random_state)
+        smote = SMOTENC(
+            categorical_features=categorical_id,
+            k_neighbors=cu_nn,
+            # k_neighbors=k_neighbors,
+            sampling_strategy=sampling_strategy,
+            random_state=random_state,
+            # n_jobs=1,
+        )
     else:
         recast_categorical = False
-        smote = SMOTE(random_state=random_state)
+        smote = SMOTE(
+            k_neighbors=cu_nn,
+            # k_neighbors=k_neighbors,
+            sampling_strategy=sampling_strategy,
+            random_state=random_state,
+        )
 
-    X_resampled, y_resampled = smote.fit_resample(X, y)
-    cu_df = cudf.DataFrame(X_resampled, columns=features)
+    X_resampled, y_resampled = smote.fit_resample(X_, y_)
+    # Si au départ on a un cudf on renvoie un cudf, sinon on renvoie un ps.Dataframe
+    if isinstance(X, (cudf.core.dataframe.DataFrame, cudf.core.series.Series)):
+        df_X = cudf.DataFrame(X_resampled, columns=features)
+        df_y = cudf.Series(y_resampled)
+    else:
+        df_X = pd.DataFrame(X_resampled, columns=features)
+        df_y = pd.Series(y_resampled)
+        # print("dtypes df_X")
+        # print(df_X.dtypes.value_counts())
+        # print("valeurs manquantes dans df_X")
+        # print(df_X.isna().sum().sum())
+        # print(df_X.head())
+        dtypes_before_smote = X[features].dtypes
+        df_X = df_X.astype(dtypes_before_smote)
+        # print("dtypes df_X après astype")
+        # print(df_X.dtypes.value_counts())
+    df_y.name = "TARGET"
 
     if recast_categorical:
         # On recaste les variables catégorielles qui sont devenues des float64
-        cu_df[features_bool] = cu_df[features_bool].astype("bool")
-        cu_df[add_to_categorical] = cu_df[add_to_categorical].astype("int16")
+        df_X[features_bool] = df_X[features_bool].astype("bool")
+        df_X[_add_to_categorical] = df_X[_add_to_categorical].astype("int16")
 
-    # On repositionne la target à l'intérieur du df
-    cu_df["TARGET"] = y_resampled
+    # On arrondit les variables numériques discrètes à l'entier le plus proche (exemple CNT_CHILDREN)
+    # Ne pas utiliser si ces variables ont été scalées et devenues floats
+    if discrete_features:
+        discrete_features_ = [f for f in discrete_features if f in X.columns]
+        discrete_id = [X[features].columns.get_loc(name) for name in discrete_features_]
+        for f in discrete_features:
+            df_X[f] = np.round(df_X[f], decimals=0)
+        df_X[discrete_features_] = df_X[discrete_features].astype(int)
 
-    # On repositionne l'index. Les nouvelles lignes ont un index manquant
-    cu_df["SK_ID_CURR"] = df["SK_ID_CURR"]
-    # On remplit les nouveaux index (manquants) par une valeur incrémentale
-    start_value = 900_000
-    missing_indices = cu_df["SK_ID_CURR"].isna()
-    increment_values = np.arange(start_value, start_value + missing_indices.sum())
-    cu_df.loc[missing_indices, "SK_ID_CURR"] = increment_values
+    # Si l'index était dans les colonnes, on le repositionne. Les nouvelles lignes ont un index manquant
+    if "SK_ID_CURR" in X.columns:
+        df_X["SK_ID_CURR"] = X["SK_ID_CURR"]
+        # On remplit les nouveaux index (manquants) par une valeur incrémentale
+        start_value = 900_000
+        missing_indices = df_X["SK_ID_CURR"].isna()
+        increment_values = np.arange(start_value, start_value + missing_indices.sum())
+        df_X.loc[missing_indices, "SK_ID_CURR"] = increment_values
 
     if verbose:
         print(
-            f"Avant rééquilibrage : Nb observations = {df['TARGET'].shape[0]:_}, ratio défauts = {df['TARGET'].value_counts(normalize=True)[1]:.2%}"
+            f"Avant rééquilibrage : Nb observations = {y.shape[0]:_}, ratio défauts = {y.value_counts(normalize=True)[1]:.2%}"
         )
+        """print(
+            f"Après SMOTE : Nb observations = {df_y.shape[0]:_}, ratio défauts = {df_y.value_counts(normalize=True)[1]:.2%}"
+        )"""
         print(
-            f"Après SMOTE : Nb observations = {cu_df['TARGET'].shape[0]:_}, ratio défauts = {cu_df['TARGET'].value_counts(normalize=True)[1]:.2%}"
+            f"Après SMOTE : Nb observations = {len(y_resampled):_}, ratio défauts = {np.mean(y_resampled):.2%}"
         )
-    return cu_df
+    gc.collect()
+    return df_X, df_y
