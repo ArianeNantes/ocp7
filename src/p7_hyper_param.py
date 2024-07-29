@@ -208,6 +208,9 @@ class SearchLogReg(ExpSearch):
             debug=debug,
             loss="binary",
         )
+        self.meta.description2 = (
+            f"Optimisation de {metric}, Fonction de perte : 'binary'"
+        )
         self.device = "cuda"
         # Comme CUDA est utilisé, on ne parallélise pas, on peut donc fiwxer la graine du sampler
         # self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
@@ -386,6 +389,7 @@ class SearchLgb(ExpSearch):
             loss=loss,
         )
         self.meta.balance = "none"
+        self.meta.description2 = f"Optimisation de {metric}, Fonction de perte : {loss}"
         self.device = "cpu"
         # Finalement il n'est pas intéressant de paralléliser, on fixe donc la graine du sampler
         # self.sampler = optuna.samplers.TPESampler(VAL_SEED)
@@ -404,27 +408,6 @@ class SearchLgb(ExpSearch):
             "bagging_freq",
             "threshold_prob",
         ]
-        self._param_names_model = [
-            "boosting_type",
-            "force_col_wise",
-            "is_unbalanced",
-            "objective",
-            "reg_alpha",
-            "reg_lambda",
-            "num_leaves",
-            "feature_fraction",
-            "bagging_fraction",
-            "bagging_freq",
-            "min_child_samples",
-            "learning_rate",
-            "n_estimators",
-        ]
-        self._param_names_train = ["feval"]
-        """self.meta.extra_tags = {
-            "direction": self.direction,
-            "metric": self.metric,
-            "loss": self.loss,
-        }"""
 
     # On ne teste pas boosting_type dart car pas de early_stopping et c'est trop long
     # Pas de validation croisée car c'est trop long
@@ -714,11 +697,13 @@ class SearchLgb(ExpSearch):
         )
 
     def run(self, n_trials=10, verbose=False, lgb_n_threads=None):
+        print(f"Optimisation de {n_trials} trials sur CPU...")
         t0 = time.time()
         if lgb_n_threads:
             self.lgb_n_threads = lgb_n_threads
         self.run_lgb_trials(n_trials=n_trials, verbose=verbose)
         print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+        print()
         self.print_best_trial()
         self.create_best_run()
 
