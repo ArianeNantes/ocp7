@@ -675,8 +675,8 @@ class SearchLgb(ExpSearch):
 
             # Dans optuna, il ne sera loggé par défaut que la métrique à optimiser, pour loguer toutes les métriques,
             # on personnalise pour enregistrer toutes les métriques
-            print("dic_val_scores", type(dic_val_scores))
-            print(dic_val_scores)
+            # print("dic_val_scores", type(dic_val_scores))
+            # print(dic_val_scores)
             mean_scores = {k: np.mean(v) for (k, v) in dic_val_scores.items()}
             trial.set_user_attr("mean_scores", mean_scores)
 
@@ -687,241 +687,6 @@ class SearchLgb(ExpSearch):
             # self.track_dataset()
 
         return dic_val_scores[self.metric]
-
-    # confusion modèle avec sklearn / lgb direct (si on teste dart, pas de early_stopping -> trop long)
-    # cross_evaluation -> trop long
-    def objective_old(self, trial):
-        # parent_run_name = "best"
-        # Attention les n° de trial ne correspondent pas à ceux fournis en logging stdout
-        with mlflow.start_run(
-            experiment_id=self._mlflow_id, run_name=f"{trial.number}", nested=True
-        ):
-            boosting_type = trial.suggest_categorical("boosting_type", ["dart", "gbdt"])
-            lambda_l1 = (trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True),)
-            lambda_l2 = (trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True),)
-            num_leaves = (trial.suggest_int("num_leaves", 8, 256),)
-            feature_fraction = (trial.suggest_float("feature_fraction", 0.4, 1.0),)
-            bagging_fraction = (trial.suggest_float("bagging_fraction", 0.4, 1.0),)
-            bagging_freq = (trial.suggest_int("bagging_freq", 1, 7),)
-            min_child_samples = (trial.suggest_int("min_child_samples", 5, 100),)
-            learning_rate = (
-                trial.suggest_float("learning_rate", 0.0001, 0.5, log=True),
-            )
-            max_bin = trial.suggest_int("max_bin", 128, 512, step=32)
-            n_estimators = trial.suggest_int("n_estimators", 40, 400, step=20)
-            threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
-
-            # Si on n'a pas d'oversampling ni d'undersampling, on fait une cross validation avec 5 folds,
-            # Si on a de l'oversampling ou de l'undersampling on ne fait que 2 folds pour diminuer les temps de calcul
-            if self.meta.balance == "none":
-                n_folds = 5
-                k_neighbors = 0
-            else:
-                n_folds = 2
-                k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
-                # all_params["k_neighbors"] = k_neighbors
-
-            hyperparams = {
-                "boosting_type": boosting_type,
-                "lambda_l1": lambda_l1,
-                "lambda_l2": lambda_l2,
-                "num_leaves": num_leaves,
-                "feature_fraction": feature_fraction,
-                "bagging_fraction": bagging_fraction,
-                "bagging_freq": bagging_freq,
-                "min_child_samples": min_child_samples,
-                "learning_rate": learning_rate,
-                "max_bin": max_bin,
-                "n_estimators": n_estimators,
-                "threshold_prob": threshold_prob,
-                "loss": self.objective_name,
-                "balance": self.meta.balance,
-                "k_neighbors": k_neighbors,
-            }
-
-            # 'binary' est la métrique d'erreur
-            pruning_callback = optuna.integration.LightGBMPruningCallback(
-                trial, self.objective_name
-            )
-
-            # Pour intégration optuna mlflow avec nested runs voir :
-            # https://mlflow.org/docs/latest/traditional-ml/hyperparameter-tuning-with-child-runs/notebooks/hyperparameter-tuning-with-child-runs.html?highlight=run%20description
-
-            # On n'utilise pas cross_val_score pour des problèmes de RAM
-            # scores = cross_val_score(model, X, y, scoring="f1_macro", cv=5)
-            folds = StratifiedKFold(
-                n_splits=n_folds, shuffle=True, random_state=self.random_state
-            )
-            dic_val_scores = {
-                "auc": [],
-                "accuracy": [],
-                "recall": [],
-                "penalized_f1": [],
-                "business_gain": [],
-                "fit_time": [],
-                "tn": [],
-                "tp": [],
-                "fn": [],
-                "fp": [],
-            }
-
-            predictors = [
-                f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]
-            ]
-
-            # Dans le split, la copie est indispensable car sinon on a une Vue array avec FLAG qui rend l'array immutable et
-            # provoque l'erreur 'cannot set WRITEABLE flag to True of this array'.
-            for i_fold, (train_idx, valid_idx) in enumerate(
-                folds.split(
-                    # Pour construire les indices de folds, nous n'avons besoin pour X que de 2 variables afin d'obtenir un DataFrame,
-                    # En choisir seulement 2 (si copie) accélère émormément les traitements
-                    self.X[predictors[:2]].to_numpy(copy=True),
-                    self.y.to_numpy(copy=True),
-                    # self.X[predictors[:2]],
-                    # self.y,
-                )
-            ):
-                # Ici on transforme en array et on copie car cela accélère la parallélisation
-                X_train = self.X[predictors].iloc[train_idx].copy()
-                X_val = self.X[predictors].iloc[valid_idx].copy()
-                y_train = self.y.iloc[train_idx].copy()
-                y_val = self.y.iloc[valid_idx].copy()
-
-                # Eventuel pipeline de pré-traitement
-                if self.pipe_preprocess:
-                    pipe = deepcopy(self.pipe_preprocess)
-                    X_train_processed = pipe.fit_transform(X_train)
-                    X_val_processed = pipe.transform(X_val)
-                else:
-                    X_train_processed = X_train
-                    X_val_processed = X_val
-
-                # Eventuel rééquilibrage avec SMOTE ou NearMiss
-                if self.meta.balance == "none":
-                    X_train_balanced = X_train_processed
-                    y_train_balanced = y_train
-                elif self.meta.balance == "smote":
-                    # Si la sampling_strategy n'a pas été définie, on utilise par défaut 0.7
-                    # Cela ne rééquilibre pas à 50% (trop long, trop de ram) mais c'est suffisant.
-                    if self.meta.sampling_strategy == 0:
-                        self.meta.sampling_strategy = 0.7
-                    X_train_balanced, y_train_balanced = balance_smote(
-                        X_train_processed,
-                        y_train,
-                        k_neighbors=k_neighbors,
-                        sampling_strategy=0.7,
-                        random_state=VAL_SEED,
-                        verbose=False,
-                    )
-                elif self.meta.balance == "nearmiss":
-                    X_train_balanced, y_train_balanced, features_null_var = (
-                        balance_nearmiss(
-                            X_train_processed,
-                            y_train,
-                            k_neighbors=k_neighbors,
-                            verbose=False,
-                        )
-                    )
-                else:
-                    print(
-                        f"{self.meta.balance} est une valeur incorrecte pour balance. Les valeurs possibles sont 'none', 'smote' ou 'nearmiss'"
-                    )
-
-                # On transforme en numpy array car cela accélère les traitements en parralélisation
-                """X_train_balanced = X_train_balanced.to_numpy(copy=True)
-                X_val_processed = X_val_processed.to_numpy(copy=True)
-                y_train_balanced = y_train_balanced.to_numpy(copy=True)
-                y_val = y_val.to_numpy(copy=True)"""
-                X_train_balanced = X_train_balanced.to_numpy()
-                X_val_processed = X_val_processed.to_numpy()
-                y_train_balanced = y_train_balanced.to_numpy()
-                y_val = y_val.to_numpy()
-
-                model = lgb.LGBMClassifier(
-                    # force_row_wise=True,
-                    force_col_wise=True,
-                    objective=self.objective_name,
-                    is_unbalanced=False,
-                    boosting_type=boosting_type,
-                    n_estimators=n_estimators,
-                    lambda_l1=lambda_l1,
-                    lambda_l2=lambda_l2,
-                    num_leaves=num_leaves,
-                    feature_fraction=feature_fraction,
-                    bagging_fraction=bagging_fraction,
-                    bagging_freq=bagging_freq,
-                    min_child_samples=min_child_samples,
-                    learning_rate=learning_rate,
-                    max_bin=max_bin,
-                    callbacks=[pruning_callback],
-                    random_state=VAL_SEED,
-                    verbose=-1,
-                )
-                t0_fit_time = time.time()
-                model.fit(
-                    X_train_balanced,
-                    y_train_balanced,
-                    # eval_set=[(X_train, y_train), (X_val, y_val)],
-                    eval_set=(X_val_processed, y_val),
-                    eval_metric=self.metric,
-                )
-                fit_time = time.time() - t0_fit_time
-
-                # y_score = np.array(model.predict_proba(X_val_np)[:, 1], copy=True)
-                # La copie a tendance à augmenter la rapidité ? Bizarre
-                y_score_val = model.predict_proba(X_val_processed)[:, 1]
-                # Prédiction de la classe en fonction du seuil de probabilité
-
-                y_pred_val = pd_pred_prob_to_binary(
-                    y_score_val, threshold=threshold_prob
-                )
-
-                tn, fp, fn, tp = confusion_matrix(y_val, y_pred_val).ravel()
-
-                # Mesures sur le jeu de validation
-                dic_val_scores["auc"].append(roc_auc_score(y_val, y_score_val))
-                dic_val_scores["accuracy"].append(accuracy_score(y_val, y_pred_val))
-                dic_val_scores["recall"].append(recall_score(y_val, y_pred_val))
-                dic_val_scores["penalized_f1"].append(penalize_f1(fp=fp, fn=fn, tp=tp))
-                dic_val_scores["business_gain"].append(
-                    penalize_business_gain(tn=tn, fp=fp, fn=fn, tp=tp)
-                )
-                dic_val_scores["fit_time"].append(fit_time)
-                dic_val_scores["tn"].append(tn)
-                dic_val_scores["fn"].append(fn)
-                dic_val_scores["tp"].append(tp)
-                dic_val_scores["fp"].append(fp)
-
-                del X_train
-                del y_train
-                del X_val
-                del y_val
-                del model
-                gc.collect()
-
-            # Fin d'un trial
-            del folds
-            gc.collect()
-            dic_metrics = {k: np.mean(v) for (k, v) in dic_val_scores.items()}
-
-            # mlflow.log_metrics(dic_metrics)
-            # mlflow.log_params(hyperparams)
-
-            # mean_scores = scores.mean(axis=0)
-            mean_scores = {k: np.mean(v) for (k, v) in dic_val_scores.items()}
-
-            # Dans optuna, il ne sera loggé par défaut que la métrique à optimiser, pour loguer toutes les métriques,
-            # on personnalise pour enregistrer toutes les métriques
-            trial.set_user_attr("mean_scores", mean_scores)
-
-            # Fin d'un trial, on loggue dans mlflow
-            mlflow.log_metrics(mean_scores)
-
-            mlflow.log_params(hyperparams)
-            # On ne logue le dataset que dans le best_run
-            # self.track_dataset()
-
-        return mean_scores[self.metric]
 
     def hide_lgb_log(self):
         log_stream = io.StringIO()
@@ -954,6 +719,7 @@ class SearchLgb(ExpSearch):
             self.lgb_n_threads = lgb_n_threads
         self.run_lgb_trials(n_trials=n_trials, verbose=verbose)
         print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+        self.print_best_trial()
         self.create_best_run()
 
     """def get_params_of_model(self):
@@ -964,21 +730,17 @@ class SearchLgb(ExpSearch):
         }"""
 
     def get_params_of_model(self):
-        all_params = self.get_all_params()
-        all_params["objective"] = self.loss
-        all_params["force_col_wise"] = True
-        all_params["is_unbalanced"] = False
-        default_model = lgb.LGBMClassifier()
-        default_param_keys = default_model.get_params().keys()
-        default_param_names = [k for k in default_param_keys] + [
-            "force_col_wise",
-            "is_unbalanced",
-        ]
-        return {k: v for k, v in all_params.items() if k in default_param_names}
-
-    def get_model(self):
-        params_of_model = self.get_params_of_model()
-        return lgb.LGBMClassifier(**params_of_model)
+        suggested_params = self.get_suggested_params()
+        params_of_model = {
+            k: v
+            for k, v in suggested_params.items()
+            if k not in ["threshold_prob", "k_neighbors", "balance"]
+        }
+        # On ajoute les paramètres du modèle que l'on a fixé :
+        params_of_model["force_col_wise"] = True
+        params_of_model["boosting_type"] = "gbdt"
+        params_of_model["loss"] = self.loss
+        return params_of_model
 
 
 """

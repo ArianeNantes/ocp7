@@ -1090,7 +1090,15 @@ class ExpSearch(ExpMlFlow):
         self._parent_run_id = parent_run.info.run_id
         mlflow.end_run()
 
+    def print_best_trial(self, print_params=True):
+        # best_scores = self._study.best_trial.user_attrs.get("mean_scores")
+        print("N° du Meilleur trial :", self._study.best_trial.number)
+        print(f"Meilleur {self.metric} : {self._study.best_trial.value:.4f}")
+        if print_params:
+            self.print_suggested_params()
+
     def create_best_run(self, verbose=True):
+        print("Création du meilleur run...")
         self._best_run_name = f"T_{self._study.best_trial.number}_best_of_{len(self._study.get_trials())}_trials"
         with mlflow.start_run(
             experiment_id=self._mlflow_id,
@@ -1207,8 +1215,26 @@ class ExpSearch(ExpMlFlow):
         return {
             k: v
             for k, v in self.get_suggested_params().items()
-            if k not in ["threshold_prob", "k_neighbors"] and not pd.isna(v)
+            if k not in ["threshold_prob", "k_neighbors", "balance"] and not pd.isna(v)
         }
+
+    def print_all_params(self):
+        params = self.get_all_params()
+        print("Tous les paraamètres :")
+        for k in params.keys():
+            print(f"\t{k} : {params[k]}")
+
+    def print_params_of_model(self):
+        params_of_model = self.get_params_of_model()
+        print("Paramètres du modèle :")
+        for k in params_of_model.keys():
+            print(f"\t{k} : {params_of_model[k]}")
+
+    def print_suggested_params(self):
+        params = self.get_suggested_params()
+        print("Paramètres suggérés :")
+        for k in params.keys():
+            print(f"\t{k} : {params[k]}")
 
     # Inutile, on va plutôt faire un run parent
     def track_best_run(self):
