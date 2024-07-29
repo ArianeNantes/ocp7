@@ -74,6 +74,7 @@ from src.p7_metric import (
     pd_pred_prob_to_binary,
     penalize_f1,
     penalize_business_gain,
+    make_objective_weighted_logloss,
 )
 from src.p7_evaluate import (
     cuml_cross_validate,
@@ -84,7 +85,12 @@ from src.p7_evaluate import (
 from src.p7_evaluate import CuDummyClassifier
 from src.p7_preprocess import train_test_split_nan
 from src.p7_tracking import ExpMetaData, ExpMlFlow, ExpSearch
-from src.p7_metric import logloss_objective, logloss_metric, feval_auc
+from src.p7_metric import (
+    logloss_objective,
+    logloss_metric,
+    feval_auc,
+    make_feval_business_gain,
+)
 
 
 class SearchCuDummy(ExpSearch):
@@ -93,7 +99,7 @@ class SearchCuDummy(ExpSearch):
             model_name="dummy", metric=metric, direction=direction, debug=debug
         )
         self.device = "cuda"
-        self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
+        # self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
         # Liste des paramètres qu'on veut voir affichés dans le parrallel plot fait par optuna
         self._params_to_plot_in_parallel = []
 
@@ -204,7 +210,7 @@ class SearchLogReg(ExpSearch):
         )
         self.device = "cuda"
         # Comme CUDA est utilisé, on ne parallélise pas, on peut donc fiwxer la graine du sampler
-        self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
+        # self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
         # Liste des paramètres qu'on veut voir affichés dans le parrallel plot fait par optuna
         self._params_to_plot_in_parallel = [
             "C",
@@ -381,7 +387,8 @@ class SearchLgb(ExpSearch):
         )
         self.meta.balance = "none"
         self.device = "cpu"
-        self.sampler = optuna.samplers.TPESampler(VAL_SEED)
+        # Finalement il n'est pas intéressant de paralléliser, on fixe donc la graine du sampler
+        # self.sampler = optuna.samplers.TPESampler(VAL_SEED)
         # Grand maximum en séquentiel
         self.lgb_n_threads = 12
         # Turn off optuna log notes.
@@ -425,41 +432,64 @@ class SearchLgb(ExpSearch):
         with mlflow.start_run(
             experiment_id=self._mlflow_id, run_name=f"{trial.number}", nested=True
         ):
+            threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
             learning_rate = trial.suggest_float("learning_rate", 0.0001, 0.5, log=True)
             max_bin = trial.suggest_int("max_bin", 128, 512, step=32)
             n_estimators = trial.suggest_int("n_estimators", 40, 400, step=20)
 
+            # On définit la métrique sur laquelle va s'exercer le early_stopping et le pruning
+            if self.metric in ["auc", "business_gain"]:
+                metrics = [self.metric]
+            else:
+                raise ValueError(
+                    f"La métrique '{self.metric}' n'est pas autorisée. Métriques possibles à optimiser : ['auc', 'business_gain']"
+                )
+
+            # On définit le callback de pruning pour interrompre l'essai optuna s'il n'est pas prometteur
+            # et le callback de early_stopping pour interrompre l'entraînement si la métrique d'évaluation n'évolue plus
+            pruning_callback = optuna.integration.LightGBMPruningCallback(
+                trial, self.metric
+            )
+            eval_results = {}
+            callbacks = [
+                lgb.early_stopping(stopping_rounds=20, verbose=True),
+                # pruning_callback,
+                # lgb.log_evaluation(period=5),
+                lgb.record_evaluation(eval_results),
+            ]
+
+            # Si on utilise la fonction de perte binary_logloss
             if self.loss == "binary":
                 lgb_objective = "binary"
-                feval = None
-                alpha = 1.0
-                num_leaves = trial.suggest_int("num_leaves", 8, 256)
-                min_child_samples = trial.suggest_int("min_child_samples", 5, 100)
-                metrics = [
-                    "binary_logloss",
-                    self.metric,
-                ]
-            elif self.loss == "logloss_objective":
-                lgb_objective = logloss_objective
-                # Le early_stopping s'effectue sur la loss mais
-                # le pruning s'effectue sur la métrique à optimiser (auc...) calculée dans feval
-                metrics = ["logloss"]
-                feval = [logloss_metric, feval_auc]
+                if self.metric == "auc":
+                    feval = None
+                else:
+                    # La fonction de perte étant "buit-in", le modèle renvoie des probas et non des logits
+                    feval_business = make_feval_business_gain(
+                        threshold_prob, preds_are_logits=False
+                    )
+                    feval = [feval_business]
+
                 alpha = 1.0
                 num_leaves = trial.suggest_int("num_leaves", 8, 256)
                 min_child_samples = trial.suggest_int("min_child_samples", 5, 100)
 
-            elif self.loss == "weighted_cross_entropy":
+            # Si on utilise une fonction de perte personnalisée qui pondère la binary_cross_entropy
+            elif self.loss == "weighted_logloss":
                 # alpha < 1.0 réduit le nombre de faux négatifs, 1 équivaut à loss="binary" (à condition de boost_from_average=False)
                 # et alpha > 1 réduirait le nombre de faux positifs
-                alpha = trial.suggest_float("alpha", 0.1, 1.0, step=0.1)
-
-                lgb_objective = logloss_objective
-                metrics = [logloss_metric]
-                feval = [logloss_metric, feval_auc]
-                """lgb_objective = WeightedCrossEntropyLoss(alpha=alpha)
-                metrics = [WeightedCrossEntropyMetric(alpha=alpha)]
-                feval = [WeightedCrossEntropyMetric(alpha=alpha), feval_auc]"""
+                alpha = trial.suggest_float("alpha", 0.05, 1.0)
+                lgb_objective = make_objective_weighted_logloss(alpha)
+                if self.metric == "auc":
+                    feval = [feval_auc]
+                else:
+                    # La fonction de perte étant personnalisée, le modèle renvoie des logits et non des probas
+                    feval_business = make_feval_business_gain(
+                        threshold_prob, preds_are_logits=True
+                    )
+                    feval = [feval_business]
+                # On réduit l'espace de recherche si alpha < 1, car le modèle ne peut plus fitter sur des grandes valeurs
+                # Fonctionne mais provoque le warning [LightGBM] [Warning] No further splits with positive gain, best gain: -inf
                 num_leaves = trial.suggest_int("num_leaves", 8, 64)
                 min_child_samples = trial.suggest_int("min_child_samples", 5, 20)
 
@@ -477,8 +507,6 @@ class SearchLgb(ExpSearch):
                 "bagging_fraction", 0.4, 1.0, step=0.1
             )
             bagging_freq = trial.suggest_int("bagging_freq", 1, 7)
-
-            threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
 
             # Si on a de l'oversampling ou de l'undersampling, on recherche le nombre de voisins,
             # On ne recherche pas la sampling_strategy car on n'a pas la puissance de calcul
@@ -530,17 +558,6 @@ class SearchLgb(ExpSearch):
             all_params["k_neigbors"] = k_neighbors
             mlflow.log_params(all_params)
 
-            pruning_callback = optuna.integration.LightGBMPruningCallback(
-                trial, self.metric
-            )
-            eval_results = {}
-            lgb_callbacks = [
-                lgb.early_stopping(stopping_rounds=20, verbose=True),
-                # pruning_callback,
-                # lgb.log_evaluation(period=5),
-                lgb.record_evaluation(eval_results),
-            ]
-
             predictors = [
                 f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]
             ]
@@ -576,7 +593,7 @@ class SearchLgb(ExpSearch):
                     X_train_processed,
                     y_train,
                     k_neighbors=k_neighbors,
-                    sampling_strategy=0.7,
+                    sampling_strategy=self.meta.sampling_strategy,
                     random_state=VAL_SEED,
                     verbose=False,
                 )
@@ -615,7 +632,7 @@ class SearchLgb(ExpSearch):
                 valid_sets=[lgb_val],
                 num_boost_round=n_estimators,
                 feval=feval,
-                callbacks=lgb_callbacks,
+                callbacks=callbacks,
             )
             fit_time = time.time() - t0_fit_time
 
@@ -915,7 +932,7 @@ class SearchLgb(ExpSearch):
         lgb.register_logger(logger)
         return
 
-    def run_lgb_trials(self, n_trials=10, reseed_sampler=True, verbose=False):
+    def run_lgb_trials(self, n_trials=10, verbose=False):
 
         # La verbosité dans les params ne fonctionnennt pas, donc pour ne pas afficher tout à l'écran, on redirige les logs vers une chaine de caractères.
         if not verbose:
@@ -926,11 +943,6 @@ class SearchLgb(ExpSearch):
         else:
             self.optuna_verbosity = optuna.logging.INFO
         optuna.logging.set_verbosity(self.optuna_verbosity)
-        if reseed_sampler:
-            self._study.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
-            # self._study.sampler.reseed_rng()
-        else:
-            self._study.sampler = optuna.samplers.TPESampler()
 
         self._study.optimize(
             self.objective, n_trials=n_trials, n_jobs=1, gc_after_trial=True
@@ -940,7 +952,7 @@ class SearchLgb(ExpSearch):
         t0 = time.time()
         if lgb_n_threads:
             self.lgb_n_threads = lgb_n_threads
-        self.run_lgb_trials(n_trials=n_trials, reseed_sampler=True, verbose=verbose)
+        self.run_lgb_trials(n_trials=n_trials, verbose=verbose)
         print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
         self.create_best_run()
 
@@ -967,62 +979,6 @@ class SearchLgb(ExpSearch):
     def get_model(self):
         params_of_model = self.get_params_of_model()
         return lgb.LGBMClassifier(**params_of_model)
-
-    # Si on parallélise, on ne peut pas utiliser le callback de pruning sur la métrique (intégration lgbm dans optuna), ni les threads dnas le modèle.
-    # en définitive on ne parallélise pas.
-    # Pourquoi Lgbm sur CPU et pas cuda / gpu contrairement aux modèles linéaires ?
-    # RAPID avec cudf ou cuml ne supporte pas lightgbm puisque lightgbm apporte son propre support GPU. Cependant,
-    # Lgbm existe sur GPU mais n'est pas performant du tout si beaucoup de vraiables en OneHot.
-    # Dans notre cas (beaucoup de OneHot), le traitement GPU est plus long que le le traitement CPU.
-    # On choisit donc CPU pour ce modèle, mais on tente de paralléliser.
-
-    # Parallélisation des jobs sur CPU :
-    # share_sampler_seed permet de s'assurer que le sampler ne va pas proposer les mêmes combinaisons de paramètres dans chaque workers,
-    # grâce à la méthode optuna .reseed_rng().
-    # cependant, les traitements sont alors VRAIMENT beaucoup plus LONGS
-    # (simple au double dans le meilleur des cas mais souvent facteur beaucoup plus grand),
-    # (comme le sampler doit être partagé entre les workers, il s'agit probbablement de multithrading).
-
-    # Si share_sampler_seed est false, on applique tout simplement un sampler avec une graine différente dans chaque worker,
-    # C'est BEAUCOUP PLUS RAPIDE (du simple au double au minimum).
-    # Les résultats ne sont pas reproductibles en parallélisation quelque soit la valeur de share_sampler_seed (True ou False), Mais
-    # les résultats sont souvent (pas toujours !) un PETIT PEU MEILLEURS avec share_sampler_seed=True qu'avec share_sampler_seed=False .
-    def run_parallel(
-        self,
-        n_workers=4,
-        n_trials_per_worker=10,
-        share_sampler_seed=False,
-        verbose=True,
-    ):
-        t0 = time.time()
-        self.lgb_n_threads = 1
-        sampler_type = self._study.sampler.__class__
-
-        if verbose:
-            print(
-                f"Optimisation {n_trials_per_worker * n_workers} trials sur CPU. Parallélisation : {n_workers} workers de {n_trials_per_worker} trials chacun..."
-            )
-        if share_sampler_seed:
-            print(
-                f"Seed du Sampler {sampler_type} recalculée et partagée entre workers"
-            )
-            Parallel(n_jobs=n_workers)(
-                delayed(self.run_lgb_trials)(n_trials_per_worker, True)
-                for _ in range(n_workers)
-            )
-        else:
-            print(
-                f"Seed aléatoire du Sampler {sampler_type} indépendante pour chaque worker."
-            )
-
-            Parallel(n_jobs=n_workers)(
-                delayed(self.run_lgb_trials)(n_trials_per_worker, False)
-                for i in range(n_workers)
-            )
-
-        if verbose:
-            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
-        self.create_best_run()
 
 
 """
