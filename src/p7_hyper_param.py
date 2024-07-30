@@ -405,9 +405,11 @@ class SearchLgb(ExpSearch):
             "lambda_l2",
             "num_leaves",
             "feature_fraction",
-            "bagging_freq",
+            # "is_unbalance",
+            "scale_pos_weight",
             "threshold_prob",
         ]
+        self.min_delta = 0.001
 
     # On ne teste pas boosting_type dart car pas de early_stopping et c'est trop long
     # Pas de validation croisée car c'est trop long
@@ -435,8 +437,10 @@ class SearchLgb(ExpSearch):
             )
             eval_results = {}
             callbacks = [
-                lgb.early_stopping(stopping_rounds=20, verbose=True),
-                # pruning_callback,
+                lgb.early_stopping(
+                    stopping_rounds=10, min_delta=self.min_delta, verbose=True
+                ),
+                pruning_callback,
                 # lgb.log_evaluation(period=5),
                 lgb.record_evaluation(eval_results),
             ]
@@ -461,7 +465,7 @@ class SearchLgb(ExpSearch):
             elif self.loss == "weighted_logloss":
                 # alpha < 1.0 réduit le nombre de faux négatifs, 1 équivaut à loss="binary" (à condition de boost_from_average=False)
                 # et alpha > 1 réduirait le nombre de faux positifs
-                alpha = trial.suggest_float("alpha", 0.05, 1.0)
+                alpha = trial.suggest_float("alpha", 1.0, 20.0)
                 lgb_objective = make_objective_weighted_logloss(alpha)
                 if self.metric == "auc":
                     feval = [feval_auc]
@@ -477,7 +481,8 @@ class SearchLgb(ExpSearch):
                 min_child_samples = trial.suggest_int("min_child_samples", 5, 20)
 
             # équivallent class_weight mais pour classfification binaire
-            is_unbalance = trial.suggest_categorical("is_unbalance", [True, False])
+            # is_unbalance = trial.suggest_categorical("is_unbalance", ["true", "false"])
+            scale_pos_weight = trial.suggest_float("scale_pos_weight", 1.0, 10.0)
             lambda_l1 = trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True)
             lambda_l2 = trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True)
             # Permet d'utiliser un sous-ensemble des features sélectionnées aléatoirement
@@ -506,7 +511,8 @@ class SearchLgb(ExpSearch):
                 # "deterministic": True,
                 "objective": lgb_objective,
                 "metrics": metrics,
-                "is_unbalance": is_unbalance,
+                # "is_unbalance": is_unbalance,
+                "scale_pos_weight": scale_pos_weight,
                 "lambda_l1": lambda_l1,
                 "lambda_l2": lambda_l2,
                 "num_leaves": num_leaves,
@@ -697,10 +703,13 @@ class SearchLgb(ExpSearch):
         )
 
     def run(self, n_trials=10, verbose=False, lgb_n_threads=None):
-        print(f"Optimisation de {n_trials} trials sur CPU...")
-        t0 = time.time()
         if lgb_n_threads:
             self.lgb_n_threads = lgb_n_threads
+        print(
+            f"Optimisation de {n_trials} trials sur CPU ({self.lgb_n_threads} threads)..."
+        )
+        t0 = time.time()
+
         self.run_lgb_trials(n_trials=n_trials, verbose=verbose)
         print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
         print()
