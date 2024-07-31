@@ -29,6 +29,7 @@ from sklearn.metrics import (
     recall_score,
     precision_score,
 )
+from scipy import special
 from IPython.display import display
 import warnings
 from copy import deepcopy
@@ -44,7 +45,7 @@ from src.p7_metric import (
     cupd_recall_score,
 )
 from src.p7_preprocess import Imputer, VarianceSelector, CuRobustScaler, CuMinMaxScaler
-from src.p7_preprocess import get_binary_features
+from src.p7_preprocess import get_binary_features, balance_smote, balance_nearmiss
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
@@ -200,6 +201,109 @@ def lgb_cross_evaluate(
             print(f"{k} : {v}")
 
     return cv_results
+
+
+def pre_process_1_fold(
+    X_train,
+    y_train,
+    X_val,
+    pipe_preprocess=None,
+    balance="none",
+    k_neighbors=0,
+    sampling_strategy=0.7,
+):
+    # Eventuel pipeline de pré-traitement
+    if pipe_preprocess:
+        pipe = deepcopy(pipe_preprocess)
+        X_train_processed = pipe.fit_transform(X_train)
+        X_val_processed = pipe.transform(X_val)
+    else:
+        X_train_processed = X_train
+        X_val_processed = X_val
+
+    # Eventuel rééquilibrage avec SMOTE ou NearMiss
+    if balance == "none":
+        X_train_balanced = X_train_processed
+        y_train_balanced = y_train
+    elif balance == "smote":
+        X_train_balanced, y_train_balanced = balance_smote(
+            X_train_processed,
+            y_train,
+            k_neighbors=k_neighbors,
+            sampling_strategy=sampling_strategy,
+            random_state=VAL_SEED,
+            verbose=False,
+        )
+    elif balance == "nearmiss":
+        X_train_balanced, y_train_balanced, features_null_var = balance_nearmiss(
+            X_train_processed,
+            y_train,
+            k_neighbors=k_neighbors,
+            minority_to_majority_ratio=sampling_strategy,
+            verbose=False,
+        )
+    else:
+        print(
+            f"{balance} est une valeur incorrecte pour balance. Les valeurs possibles sont 'none', 'smote' ou 'nearmiss'"
+        )
+    return X_train_balanced, y_train_balanced, X_val_processed
+
+
+# X_train etc. sont déjà pre-processes et resampled. Les features ne sont que des prédicteurs (pas de SK_ID_CURR)
+def lgb_validate_1_fold(X_train, y_train, X_test, y_test, model_params, other_params):
+    # On transforme en dataset lgb
+    lgb_train = lgb.Dataset(
+        X_train,
+        y_train,
+        params={"verbosity": -1},
+        free_raw_data=False,
+    )
+    lgb_val = lgb.Dataset(
+        X_test,
+        y_test,
+        reference=lgb_train,
+        params={"verbosity": -1},
+        free_raw_data=False,
+    )
+    t0_fit_time = time.time()
+    model = lgb.train(
+        params=model_params,
+        train_set=lgb_train,
+        valid_sets=[lgb_val],
+        num_boost_round=other_params["n_estimators"],
+        feval=other_params["feval"],
+        callbacks=other_params["callbacks"],
+    )
+    fit_time = time.time() - t0_fit_time
+
+    # Si on utilise une fonc built-il pour la perte, le modèle renvoie déjà des probas,
+    # Si on utilise les fonc perso, on a des logits et on doit appliquer sigmoid pour obtenir les probas,
+    if other_params["loss"] == "binary":
+        y_score_val = model.predict(X_test)
+    else:
+        y_score_val = special.expit(model.predict(X_test))
+
+    # Prédiction de la classe en fonction du seuil de probabilité
+    y_pred_val = pd_pred_prob_to_binary(
+        y_score_val, threshold=other_params["threshold_prob"]
+    )
+
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred_val).ravel()
+
+    # Mesures sur le jeu de validation
+    dic_val_scores = {}
+    dic_val_scores["auc"] = roc_auc_score(y_test, y_score_val)
+    dic_val_scores["accuracy"] = accuracy_score(y_test, y_pred_val)
+    dic_val_scores["recall"] = recall_score(y_test, y_pred_val)
+    dic_val_scores["penalized_f1"] = penalize_f1(fp=fp, fn=fn, tp=tp)
+    dic_val_scores["business_gain"] = penalize_business_gain(tn=tn, fp=fp, fn=fn, tp=tp)
+
+    dic_val_scores["fit_time"] = fit_time
+    dic_val_scores["tn"] = tn
+    dic_val_scores["fn"] = fn
+    dic_val_scores["tp"] = tp
+    dic_val_scores["fp"] = fp
+    return dic_val_scores
 
 
 def train_and_test_lgbm(train, test, params, plot=True, verbose=True):
@@ -693,8 +797,8 @@ def cuml_cross_validate(
         train_idx = train_idx_array.tolist()
         valid_idx = valid_idx_array.tolist()
         t0_fit_time = time.time()
-        X_train = X_train_and_val.iloc[train_idx]
-        X_val = X_train_and_val.iloc[valid_idx]
+        X_train = X_train_and_val[predictors].iloc[train_idx]
+        X_val = X_train_and_val[predictors].iloc[valid_idx]
 
         if y_train_and_val is None:
             y_train = X_train_and_val.loc[train_idx, "TARGET"]
@@ -751,6 +855,185 @@ def cuml_cross_validate(
     gc.collect()
     # print(dic_val_scores)
     return dic_val_scores
+
+
+def cuml_cross_evaluate(
+    X_train_and_val,
+    pipe_preprocess,
+    cuml_model,
+    balance="none",
+    k_neighbors=5,
+    y_train_and_val=None,
+    train_scores=False,
+    threshold_prob=0.5,
+    n_folds=5,
+    random_state=42,
+    verbose=False,
+):
+
+    predictors = [
+        f
+        for f in X_train_and_val.columns
+        if f not in ["TARGET", "SK_ID_CURR", "Unnamed: 0"]
+    ]
+    # A faire avant le pipe
+    # binary_features = get_binary_features(train_and_val)
+
+    X_tmp = X_train_and_val[["SK_ID_CURR", predictors[0]]].to_numpy()
+    if y_train_and_val is not None:
+        y_tmp = y_train_and_val.to_pandas()
+    else:
+        y_tmp = X_train_and_val["TARGET"].to_pandas()
+
+    folds = StratifiedKFold(
+        n_splits=n_folds,
+        shuffle=True,
+        random_state=random_state,
+    )
+
+    dic_val_scores = {
+        "auc": [],
+        "accuracy": [],
+        "recall": [],
+        "penalized_f1": [],
+        "business_gain": [],
+        "fit_time": [],
+        "tn": [],
+        "tp": [],
+        "fn": [],
+        "fp": [],
+    }
+
+    if train_scores:
+        dic_train_scores = deepcopy(dic_val_scores)
+
+    for train_idx_array, valid_idx_array in folds.split(X_tmp, y_tmp):
+        train_idx = train_idx_array.tolist()
+        valid_idx = valid_idx_array.tolist()
+        t0_fit_time = time.time()
+        X_train = X_train_and_val[predictors].iloc[train_idx]
+        X_val = X_train_and_val[predictors].iloc[valid_idx]
+
+        if y_train_and_val is None:
+            y_train = X_train_and_val.loc[train_idx, "TARGET"]
+            y_val = X_train_and_val.loc[valid_idx, "TARGET"]
+        else:
+            y_train = y_train_and_val.iloc[train_idx]
+            y_val = y_train_and_val.iloc[valid_idx]
+
+        # print(f"\tPrétraitement")
+        pipe = deepcopy(pipe_preprocess)
+        X_train_processed = pipe.fit_transform(X_train)
+        X_val_processed = pipe.transform(X_val)
+
+        # Eventuel rééquilibrage avec SMOTE ou NearMiss
+        if balance == "none":
+            X_train_balanced = X_train_processed
+            y_train_balanced = y_train
+        elif balance == "smote":
+            X_train_balanced, y_train_balanced = balance_smote(
+                X_train_processed,
+                y_train,
+                k_neighbors=k_neighbors,
+                random_state=random_state,
+                verbose=verbose,
+            )
+        elif balance == "nearmiss":
+            X_train_balanced, y_train_balanced, features_null_var = balance_nearmiss(
+                X_train_processed, y_train, k_neighbors=k_neighbors, verbose=verbose
+            )
+        else:
+            print(
+                f"{balance} est une valeur incorrecte pour balance. Les valeurs possibles sont 'none', 'smote' ou 'nearmiss'"
+            )
+
+        # Afin de repartir d'un modèle non fitté, on crée une nouvelle copie du modèle passé en paramètre
+        clf = deepcopy(cuml_model)
+        clf.fit(X_train_balanced, y_train_balanced)
+
+        fit_time = time.time() - t0_fit_time
+
+        ############### Prédictions et mesures sur le Jeu de TRAIN
+        if train_scores:
+
+            # Probabilité d'appartenir à la classe default pour le jeu de train
+            y_score_train = clf.predict_proba(X_train_balanced)[1]
+            # Prédiction de la classe en fonction du seuil de probabilité
+            y_pred_train = cu_pred_prob_to_binary(
+                y_score_train, threshold=threshold_prob
+            )
+
+            # Order C applatit la matrice en ligne comme ravel() de numpy, mais
+            # Attention, ne renvoie pas des scalaires mais des cupy ndarrays
+            mat = cuml.metrics.confusion_matrix(y_train_balanced, y_pred_train)
+            tn_array, fp_array, fn_array, tp_array = mat.ravel(order="C")
+            # On extrait les scalaires des cupy ndarrays()
+            tn = tn_array.item()
+            fp = fp_array.item()
+            fn = fn_array.item()
+            tp = tp_array.item()
+            dic_train_scores["tn"].append(tn)
+            dic_train_scores["fn"].append(fn)
+            dic_train_scores["tp"].append(tp)
+            dic_train_scores["fp"].append(fp)
+
+            # Mesures sur le jeu de train
+            dic_train_scores["auc"].append(
+                cuml.metrics.roc_auc_score(y_train_balanced, y_score_train)
+            )
+            dic_train_scores["accuracy"].append(
+                cuml.metrics.accuracy_score(y_train_balanced, y_pred_train)
+            )
+            dic_train_scores["recall"].append(cupd_recall_score(tp=tp, fn=fn))
+            dic_train_scores["penalized_f1"].append(penalize_f1(tp=tp, fp=fp, fn=fn))
+            dic_train_scores["business_gain"].append(
+                penalize_business_gain(tp=tp, fn=fn, tn=tn, fp=fp)
+            )
+
+            dic_train_scores["fit_time"].append(fit_time)
+
+        ############### Prédictions et mesures sur le Jeu de VALIDATION
+
+        # Probabilité d'appartenir à la classe default pour le jeu de validation
+        y_score_val = clf.predict_proba(X_val_processed)[1]
+        # Prédiction de la classe en fonction du seuil de probabilité
+        y_pred_val = cu_pred_prob_to_binary(y_score_val, threshold=threshold_prob)
+
+        # Order C applatit la matrice en ligne comme ravel() de numpy, mais
+        # Attention, ne renvoie pas des scalaires mais des cupy ndarrays
+        mat = cuml.metrics.confusion_matrix(y_val, y_pred_val)
+        tn_array, fp_array, fn_array, tp_array = mat.ravel(order="C")
+        # On extrait les scalaires des cupy ndarrays()
+        tn = tn_array.item()
+        fp = fp_array.item()
+        fn = fn_array.item()
+        tp = tp_array.item()
+        dic_val_scores["tn"].append(tn)
+        dic_val_scores["fn"].append(fn)
+        dic_val_scores["tp"].append(tp)
+        dic_val_scores["fp"].append(fp)
+
+        # Mesures sur le jeu de validation
+        dic_val_scores["auc"].append(cuml.metrics.roc_auc_score(y_val, y_score_val))
+        dic_val_scores["accuracy"].append(
+            cuml.metrics.accuracy_score(y_val, y_pred_val)
+        )
+        dic_val_scores["recall"].append(cupd_recall_score(tp=tp, fn=fn))
+        dic_val_scores["penalized_f1"].append(penalize_f1(tp=tp, fp=fp, fn=fn))
+        dic_val_scores["business_gain"].append(
+            penalize_business_gain(tp=tp, fn=fn, tn=tn, fp=fp)
+        )
+
+        dic_val_scores["fit_time"].append(fit_time)
+
+    del pipe
+    del clf
+    gc.collect()
+    # print(dic_val_scores)
+    if train_scores:
+        return dic_train_scores, dic_val_scores
+    else:
+        return dic_val_scores
 
 
 def plot_roc_curve(y_true, y_score):
@@ -836,7 +1119,15 @@ def plot_confusion_matrix_mean(tn, fp, fn, tp, figsize=(5, 4)):
 
 
 def plot_recall_mean(
-    tn, fp, fn, tp, title="Recall moyen (% par ligne)", subtitle="", n_samples=True
+    tn,
+    fp,
+    fn,
+    tp,
+    title="Recall moyen (% par ligne)",
+    subtitle="",
+    figsize=(5, 5),
+    n_samples=True,
+    verbose=False,
 ):
     """Plotte le Recall (=la matrice de confusion en pourcentage par lignes) à partir des valeurs présentes dans la matrice de confusion binaire.
     Utilisée pour une cross_validation (matrice de confusion moyenne à travers les folds) ou si CUDA
@@ -853,7 +1144,7 @@ def plot_recall_mean(
     Returns:
         matplotlib.figure.Figure: figure à afficher dans le notebook ou à logguer dans mlflow
     """
-    figsize = (5, 4)
+
     if subtitle:
         figsize = (5, 4.3)
     values = [tn, fp, fn, tp]
@@ -919,7 +1210,8 @@ def plot_recall_mean(
     ax.set_ylabel("Vraie catégorie")
 
     # Si on ne veut pas afficher la figure dans le notebook lors de l'appel de la fonc
-    # plt.close(fig)
+    if not verbose:
+        plt.close(fig)
     return fig
 
 
@@ -1033,3 +1325,186 @@ def plot_recall(y_true, y_pred, figsize=(5, 4)):
     ax.set_xlabel("Prédiction")
     ax.set_ylabel("Vraie catégorie")
     return fig
+
+
+def set_vertical_margins(ax, top=0.15, bottom=0.05):
+    """Ajoute des marges haute et basse inégales à un graphique
+
+    Args:
+        ax (Axes): Sous-plot matplotlib
+        top (float, optional): Marge haute. Defaults to 0.15.
+        bottom (float, optional): Marge basse. Defaults to 0.05.
+    """
+    ax.set_ymargin(0)
+    ax.autoscale_view()
+    lim = ax.get_ylim()
+    delta = np.diff(lim)
+    top = lim[0] - delta * top
+    bottom = lim[1] + delta * bottom
+    ax.set_ylim(top, bottom)
+
+
+def plot_evaluation_scores(
+    train_scores,
+    val_scores,
+    title="Scores de validation croisée\n",
+    subtitle="",
+    figsize=(8, 5),
+    verbose=True,
+):
+
+    not_to_plot = ["fp", "fn", "tp", "tn", "fit_time"]
+    metric_names = [k for k in train_scores.keys() if k not in not_to_plot]
+
+    # Les dictionnaires en paramètres contiennent des listes de scores pour pour tous les folds,
+    # On construit le dictionnaire contenant les scores moyens pour le train et la validation
+    mean_scores = {
+        "Train": [np.mean(v) for k, v in train_scores.items() if k not in not_to_plot],
+        "Validation": [
+            np.mean(v) for k, v in val_scores.items() if k not in not_to_plot
+        ],
+    }
+    # On calcule les écart_types pour les afficher sous forme de barre d'erreur
+    errors = {
+        "Train": [np.std(v) for k, v in train_scores.items() if k not in not_to_plot],
+        "Validation": [
+            np.std(v) for k, v in val_scores.items() if k not in not_to_plot
+        ],
+    }
+
+    fig, ax = plt.subplots(figsize=figsize)
+    fig.suptitle(title)
+
+    if subtitle:
+        ax.set_title(
+            subtitle,
+            ha="left",
+            x=0,
+            fontsize=ax.xaxis.label.get_fontsize(),
+        )
+
+    # Graphique en barres horizontales
+    y_pos = np.arange(len(metric_names))  # Cordonnée verticale des groupes de barres
+    bar_height = 0.4  # Epaisseur des barres
+    multiplier = 0
+
+    for jdd, mean_score in mean_scores.items():
+        offset = bar_height * multiplier
+        rects = ax.barh(
+            y=y_pos + offset,
+            width=mean_score,
+            height=-bar_height,
+            label=jdd,
+            align="edge",
+            xerr=errors[jdd],
+        )
+        ax.bar_label(rects, fmt="%0.3f", padding=5)
+        multiplier += 1
+
+    ax.set_xlabel("Score")
+    ax.set_ylabel("Métrique")
+    ax.set_xlim(0, 1)
+    ax.set_yticks(y_pos, metric_names)
+    ax.set_xlim(0, 1.05)
+    # On place une marge en haut et on affiche la légende au dessus des barres
+    set_vertical_margins(ax=ax, top=0.15, bottom=0.05)
+    ax.invert_yaxis()
+    plt.legend(loc="upper center", ncol=2)
+    plt.tight_layout()
+    if not verbose:
+        plt.close()
+    return fig
+
+
+# En définitive, avec les boxplots on ne voit pas assez bien car les folds sont similaires. Préférer les barres
+def plot_evaluation_scores_box(
+    train_scores,
+    val_scores,
+    baseline_scores=None,
+    vline=None,
+    title="Scores de validation croisée\n",
+    subtitle="",
+    figsize=None,
+):
+
+    # Transforme les dic en df et les regroupe en un seul avec une colonne indiquant la provenance
+    df_train_scores = pd.DataFrame(train_scores)
+    df_train_scores["jdd"] = "Train"
+    df_val_scores = pd.DataFrame(val_scores)
+    df_val_scores["jdd"] = "Validation"
+    df_scores = pd.concat([df_train_scores, df_val_scores])
+
+    if baseline_scores:
+        df_baseline_scores = pd.DataFrame(baseline_scores)
+        df_baseline_scores["jdd"] = "Baseline validation"
+        df_scores = pd.concat([df_scores, df_baseline_scores])
+
+    # On calcule les ratios des faux positifs et faux négatifs (par rapport à la totalité) pour les afficher entre 0 et 1
+    df_scores["fn_ratio"] = df_scores["fn"] / (
+        df_scores["tp"] + df_scores["tn"] + df_scores["fp"] + df_scores["fn"]
+    )
+    df_scores["fp_ratio"] = df_scores["fp"] / (
+        df_scores["tp"] + df_scores["tn"] + df_scores["fp"] + df_scores["fn"]
+    )
+    # On drop les scores qui ne sont pas à plotter (ils ne sont pas entre 0 et 1)
+    scores_to_drop = ["fp", "fn", "tp", "tn", "fit_time"]
+    df_scores = df_scores.drop(scores_to_drop, axis=1)
+
+    # On transforme le DataFrame en un format long où chaque ligne représente une observation unique de score.
+    df_melt = pd.melt(df_scores, id_vars=["jdd"], var_name="score", value_name="value")
+
+    if not figsize:
+        if baseline_scores:
+            figsize = (8, 8)
+        else:
+            figsize = (8, 6)
+    fig, ax = plt.subplots(figsize=figsize)
+    fig.suptitle(title)
+
+    sns.boxplot(
+        data=df_melt, x="value", y="score", orient="h", hue="jdd", legend="auto"
+    )
+    if subtitle:
+        ax.set_title(
+            subtitle,
+            ha="left",
+            x=0,
+            fontsize=ax.xaxis.label.get_fontsize(),
+        )
+    if vline:
+        ax.axvline(x=vline, color="k", linestyle="--", label="baseline")
+    ax.set_xlabel("Score")
+    ax.set_ylabel("Métrique")
+    ax.set_xlim(0, 1)
+
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+class CuDummyClassifier:
+    def __init__(self, random_state=VAL_SEED):
+        self.random_state = random_state
+        self.y_scores_default = None
+        self.random_state = random_state
+
+    def fit(self, X, y=None):
+        pass
+
+    def predict_proba(self, X_val, y_val=None):
+        # On fixe la graine de hasard si random_state n'est pas None
+        if self.random_state:
+            np.random.seed(self.random_state)
+
+        # On génère aléatoirement des probas pour la classe default
+        y_scores_default = np.random.rand(X_val.shape[0])
+        y_scores = cudf.DataFrame({1: y_scores_default})
+        # y_scores["0"] = 1 - y_scores["1"]
+        return y_scores
+
+    """def predict(self, threshold_prob=0.5):
+        # Proba d'appartenir à la classe défaut
+        y_pred = self.predict_proba()[1]
+        # Classe de proba 0 ou 1
+        y_pred = (y_pred < threshold_prob).astype(int)
+        return y_pred"""

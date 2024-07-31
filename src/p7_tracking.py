@@ -215,10 +215,11 @@ class ExpMetaData:
 
         # La 3ème ligne concerne les réquilibrage du data_set
         self.description3 = f"Rééquilibrage dataset : {self.balance}"
-        if self.balance != "none":
+        # On n'écrit pas le nombre de voisins car on le recherche
+        """if self.balance != "none":
             self.description3 = (
                 self.description3 + f" {self.balance_k_neighbors} voisins"
-            )
+            )"""
         if self.description3:
             self._description = f"{self._description}\n{self.description3}"
         """if verbose:
@@ -713,6 +714,22 @@ class ExpMlFlow:
             dataset.to_csv(pathfile, index=False)
             print(f"Données sauvegardées dans {pathfile}")
 
+    # Sauvegarde l'expérience comme un objet pkl
+    # Ecrase un fichier existant sans rien demander
+    def save_experiment(self, root_dir=MODEL_DIR, subdir="", verbose=True):
+        if subdir:
+            path = os.path.join(root_dir, subdir)
+        else:
+            path = os.path.join(root_dir, self.meta.model_name)
+
+        # Si le répertoire n'existe pas, on le crèe
+        if not os.path.exists(path):
+            os.mkdir(path)
+        filename = os.path.join(path, f"{self.meta._name}.pkl")
+        joblib.dump(self, filename)
+        if verbose:
+            print(f"Expérience sauvegardée dans {filename}")
+
     def get_ratio_default(self):
         if self.y is not None:
             ratio_default = self.y.value_counts(normalize=True)[1]
@@ -993,6 +1010,7 @@ class ExpSearch(ExpMlFlow):
         # Par défaut on ne loggue pas dans mlflow le plot des params en parallel, cela dépend du modèle,
         # donc à définire dans classe enfant
         self._params_to_plot_in_parallel = []
+        self.n_folds = 4
 
     # Attributs publics de l'objet
     @property
@@ -1008,7 +1026,7 @@ class ExpSearch(ExpMlFlow):
             study_name=self.meta._name,
             direction=self.direction,
             sampler=self.sampler,
-            pruner=self.pruner,
+            # pruner=self.pruner,
             storage=self.storage,
             # On garde True pour load_if_exists au sujet de la study optuna (à ne pas confondre avec l'expérience mlflow)
             # Donc si l'expérience de recherche n'a pas été trackée sur mlflow mais faite uniquement dans optuna,
@@ -1178,13 +1196,17 @@ class ExpSearch(ExpMlFlow):
                     resampling
                     + f" - rééquilibré à 50% avec {self.meta.balance.upper()}"
                 )"""
+            if self.n_folds == 1:
+                title_recall = "Recall (% par ligne)"
+            else:
+                title_recall = f"Recall moyen sur {self.n_folds} folds (% par ligne)"
             if mean_scores:
                 fig = plot_recall_mean(
                     tn=mean_scores["tn"],
                     fp=mean_scores["fp"],
                     fn=mean_scores["fn"],
                     tp=mean_scores["tp"],
-                    # subtitle=f"{self.clf.__class__.__name__}\n{self.direction} {self.metric}",
+                    title=title_recall,
                     subtitle=f"Optuna : '{self.meta._name}'\n{self._resampling_str}\n{name_best_run_in_plot}",
                     verbose=verbose,
                 )
@@ -1235,6 +1257,14 @@ class ExpSearch(ExpMlFlow):
         print("Paramètres suggérés :")
         for k in params.keys():
             print(f"\t{k} : {params[k]}")
+
+    def counts_pruned_trials(self):
+        # On récupère tous les trials de l'étude (deepcopy=False est + efficace en mémore car référence directe aux trials)
+        trials = self._study.get_trials(deepcopy=False)
+        n_pruned_trials = sum(
+            1 for trial in trials if trial.state == optuna.trial.TrialState.PRUNED
+        )
+        return n_pruned_trials
 
     # Inutile, on va plutôt faire un run parent
     def track_best_run(self):

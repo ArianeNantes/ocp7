@@ -81,6 +81,8 @@ from src.p7_evaluate import (
     cuml_cross_evaluate,
     balance_smote,
     balance_nearmiss,
+    lgb_validate_1_fold,
+    pre_process_1_fold,
 )
 from src.p7_evaluate import CuDummyClassifier
 from src.p7_preprocess import train_test_split_nan
@@ -213,7 +215,7 @@ class SearchLogReg(ExpSearch):
         )
         self.device = "cuda"
         # Comme CUDA est utilisé, on ne parallélise pas, on peut donc fiwxer la graine du sampler
-        # self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
+        self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
         # Liste des paramètres qu'on veut voir affichés dans le parrallel plot fait par optuna
         self._params_to_plot_in_parallel = [
             "C",
@@ -392,7 +394,7 @@ class SearchLgb(ExpSearch):
         self.meta.description2 = f"Optimisation de {metric}, Fonction de perte : {loss}"
         self.device = "cpu"
         # Finalement il n'est pas intéressant de paralléliser, on fixe donc la graine du sampler
-        # self.sampler = optuna.samplers.TPESampler(VAL_SEED)
+        self.sampler = optuna.samplers.TPESampler(VAL_SEED)
         # Grand maximum en séquentiel
         self.lgb_n_threads = 12
         # Turn off optuna log notes.
@@ -410,6 +412,11 @@ class SearchLgb(ExpSearch):
             "threshold_prob",
         ]
         self.min_delta = 0.001
+        # self.sampler = optuna.samplers.TPESampler(VAL_SEED)
+        self.n_folds = 4
+
+        # Assure la reproductibilité de l'entraînement lgbm si plusieurs thrreads (ralentit)
+        self.deterministic = False
 
     # On ne teste pas boosting_type dart car pas de early_stopping et c'est trop long
     # Pas de validation croisée car c'est trop long
@@ -421,6 +428,23 @@ class SearchLgb(ExpSearch):
             learning_rate = trial.suggest_float("learning_rate", 0.0001, 0.5, log=True)
             max_bin = trial.suggest_int("max_bin", 128, 512, step=32)
             n_estimators = trial.suggest_int("n_estimators", 40, 400, step=20)
+            num_leaves = trial.suggest_int("num_leaves", 8, 256)
+            min_child_samples = trial.suggest_int("min_child_samples", 5, 100)
+            # k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
+            scale_pos_weight = trial.suggest_float("scale_pos_weight", 1.0, 10.0)
+            lambda_l1 = trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True)
+            lambda_l2 = trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True)
+            # Permet d'utiliser un sous-ensemble des features sélectionnées aléatoirement
+            # et ainsi de varier les arbres. Aide contre surfit et diminue temps de fit
+            feature_fraction = trial.suggest_float(
+                "feature_fraction", 0.4, 1.0, step=0.1
+            )
+            # Idem feature_fraction mais pour les lignes
+            bagging_fraction = trial.suggest_float(
+                "bagging_fraction", 0.4, 1.0, step=0.1
+            )
+            bagging_freq = trial.suggest_int("bagging_freq", 1, 7)
+            alpha = trial.suggest_float("alpha", 1.0, 20.0)
 
             # On définit la métrique sur laquelle va s'exercer le early_stopping et le pruning
             if self.metric in ["auc", "business_gain"]:
@@ -441,6 +465,218 @@ class SearchLgb(ExpSearch):
                     stopping_rounds=10, min_delta=self.min_delta, verbose=True
                 ),
                 pruning_callback,
+                # lgb.log_evaluation(period=5),
+                lgb.record_evaluation(eval_results),
+            ]
+
+            # Si on utilise la fonction de perte binary_logloss
+            if self.loss == "binary":
+                lgb_objective = "binary"
+                if self.metric == "auc":
+                    feval = None
+                else:
+                    # La fonction de perte étant "buit-in", le modèle renvoie des probas et non des logits
+                    feval_business = make_feval_business_gain(
+                        threshold_prob, preds_are_logits=False
+                    )
+                    feval = [feval_business]
+
+                alpha = 1.0
+
+            # Si on utilise une fonction de perte personnalisée qui pondère la binary_cross_entropy
+            elif self.loss == "weighted_logloss":
+                # alpha < 1.0 réduit le nombre de faux négatifs, 1 équivaut à loss="binary" (à condition de boost_from_average=False)
+                # et alpha > 1 réduirait le nombre de faux positifs
+                # alpha = trial.suggest_float("alpha", 1.0, 20.0)
+                lgb_objective = make_objective_weighted_logloss(alpha)
+                if self.metric == "auc":
+                    feval = [feval_auc]
+                else:
+                    # La fonction de perte étant personnalisée, le modèle renvoie des logits et non des probas
+                    feval_business = make_feval_business_gain(
+                        threshold_prob, preds_are_logits=True
+                    )
+                    feval = [feval_business]
+
+            # Si on a de l'oversampling ou de l'undersampling, on recherche le nombre de voisins,
+            # ainsi que le ratio classe minoritaire / classe majoritaire
+            if self.meta.balance == "none":
+                k_neighbors = 0
+                sampling_strategy = 0
+            else:
+                k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
+                sampling_strategy = trial.suggest_float("sampling_strategy", 0.1, 1.0)
+
+            lgb_params = {
+                "force_col_wise": True,
+                "boosting_type": "gbdt",
+                # "boost_from_average": False,
+                "deterministic": self.deterministic,
+                "objective": lgb_objective,
+                "metrics": metrics,
+                "scale_pos_weight": scale_pos_weight,
+                "lambda_l1": lambda_l1,
+                "lambda_l2": lambda_l2,
+                "num_leaves": num_leaves,
+                "feature_fraction": feature_fraction,
+                "bagging_fraction": bagging_fraction,
+                "bagging_freq": bagging_freq,
+                "min_child_samples": min_child_samples,
+                "learning_rate": learning_rate,
+                "max_bin": max_bin,
+                "num_threads": self.lgb_n_threads,
+                "verbosity": -1,
+                "verbose_eval": False,
+            }
+
+            # Paramètres utilisés dans le train et dans le scoring
+            other_params = {
+                "n_estimators": n_estimators,
+                "feval": feval,
+                "callbacks": callbacks,
+                "loss": self.loss,
+                "threshold_prob": threshold_prob,
+            }
+            all_params = {
+                k: v
+                for k, v in lgb_params.items()
+                if k
+                not in [
+                    "random_seed",
+                    "verbosity",
+                    "verbose",
+                    "verbose_eval",
+                    "objective",
+                    "metrics",
+                    "num_threads",
+                ]
+            }
+            all_params["n_estimators"] = n_estimators
+            all_params["loss"] = self.loss
+            all_params["alpha"] = alpha
+            all_params["balance"] = self.meta.balance
+            all_params["k_neigbors"] = k_neighbors
+            all_params["sampling_strategy"] = sampling_strategy
+            mlflow.log_params(all_params)
+
+            predictors = [
+                f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]
+            ]
+
+            # Si on utilise pas la validation croisée (temps de calculs trop longs)
+            if self.n_folds == 1:
+                X_train, X_val, y_train, y_val = train_test_split(
+                    self.X[predictors],
+                    self.y,
+                    stratify=self.y,
+                    test_size=0.25,
+                    random_state=VAL_SEED,
+                )
+                # Conversion des indices en indices positionnels relatifs à self.X
+                train_idx = self.X.index.get_indexer(X_train.index)
+                valid_idx = self.X.index.get_indexer(X_val.index)
+                folds_list = [(train_idx, valid_idx)]
+
+            # Si on utilise la validation croisée:
+            else:
+                folds = StratifiedKFold(
+                    n_splits=self.n_folds,
+                    shuffle=True,
+                    random_state=VAL_SEED,
+                )
+                folds_list = [fold for fold in folds.split(self.X[predictors], self.y)]
+
+            all_scores = {
+                "auc": [],
+                "accuracy": [],
+                "recall": [],
+                "penalized_f1": [],
+                "business_gain": [],
+                "fit_time": [],
+                "tn": [],
+                "tp": [],
+                "fn": [],
+                "fp": [],
+            }
+
+            for train_idx, valid_idx in folds_list:
+                X_train = self.X[predictors].iloc[train_idx]
+                X_val = self.X[predictors].iloc[valid_idx]
+                y_train = self.y.iloc[train_idx]
+                y_val = self.y.iloc[valid_idx]
+
+                X_train_balanced, y_train_balanced, X_val_processed = (
+                    pre_process_1_fold(
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_val=X_val,
+                        pipe_preprocess=self.pipe_preprocess,
+                        balance=self.meta.balance,
+                        k_neighbors=k_neighbors,
+                        sampling_strategy=sampling_strategy,
+                    )
+                )
+
+                fold_scores = lgb_validate_1_fold(
+                    X_train=X_train_balanced,
+                    y_train=y_train_balanced,
+                    X_test=X_val_processed,
+                    y_test=y_val,
+                    model_params=lgb_params,
+                    other_params=other_params,
+                )
+                for k in all_scores.keys():
+                    all_scores[k].append(fold_scores[k])
+
+                del X_train
+                del X_train_balanced
+                del y_train
+                del y_train_balanced
+                del X_val
+                del X_val_processed
+                del y_val
+                del fold_scores
+
+                gc.collect()
+
+            # Dans optuna, il ne sera loggé par défaut que la métrique à optimiser, pour loguer toutes les métriques,
+            # On utilise set_user_attr qui permet de personnaliser ce qu'on veut logguer dans Optuna
+            mean_scores = {k: np.mean(v) for (k, v) in all_scores.items()}
+            trial.set_user_attr("mean_scores", mean_scores)
+
+            # On loggue les scores moyens dans mlflow
+            mlflow.log_metrics(mean_scores)
+
+        return mean_scores[self.metric]
+
+    def objective_old(self, trial):
+        with mlflow.start_run(
+            experiment_id=self._mlflow_id, run_name=f"{trial.number}", nested=True
+        ):
+            threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
+            learning_rate = trial.suggest_float("learning_rate", 0.0001, 0.5, log=True)
+            max_bin = trial.suggest_int("max_bin", 128, 512, step=32)
+            n_estimators = trial.suggest_int("n_estimators", 40, 400, step=20)
+
+            # On définit la métrique sur laquelle va s'exercer le early_stopping et le pruning
+            if self.metric in ["auc", "business_gain"]:
+                metrics = [self.metric]
+            else:
+                raise ValueError(
+                    f"La métrique '{self.metric}' n'est pas autorisée. Métriques possibles à optimiser : ['auc', 'business_gain']"
+                )
+
+            """# On définit le callback de pruning pour interrompre l'essai optuna s'il n'est pas prometteur
+            # et le callback de early_stopping pour interrompre l'entraînement si la métrique d'évaluation n'évolue plus
+            pruning_callback = optuna.integration.LightGBMPruningCallback(
+                trial, self.metric
+            )"""
+            eval_results = {}
+            callbacks = [
+                lgb.early_stopping(
+                    stopping_rounds=10, min_delta=self.min_delta, verbose=True
+                ),
+                # pruning_callback,
                 # lgb.log_evaluation(period=5),
                 lgb.record_evaluation(eval_results),
             ]
@@ -500,7 +736,6 @@ class SearchLgb(ExpSearch):
             # On ne recherche pas la sampling_strategy car on n'a pas la puissance de calcul
             if self.meta.balance != "none":
                 k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
-                # all_params["k_neighbors"] = k_neighbors
             else:
                 k_neighbors = 0
 
@@ -511,7 +746,6 @@ class SearchLgb(ExpSearch):
                 # "deterministic": True,
                 "objective": lgb_objective,
                 "metrics": metrics,
-                # "is_unbalance": is_unbalance,
                 "scale_pos_weight": scale_pos_weight,
                 "lambda_l1": lambda_l1,
                 "lambda_l2": lambda_l2,
@@ -699,21 +933,32 @@ class SearchLgb(ExpSearch):
         optuna.logging.set_verbosity(self.optuna_verbosity)
 
         self._study.optimize(
-            self.objective, n_trials=n_trials, n_jobs=1, gc_after_trial=True
+            self.objective,
+            n_trials=n_trials,
+            n_jobs=1,
+            gc_after_trial=True,
+            # call_backs=pruning_callback,
         )
 
     def run(self, n_trials=10, verbose=False, lgb_n_threads=None):
         if lgb_n_threads:
             self.lgb_n_threads = lgb_n_threads
+
+        if self.n_folds == 1:
+            cv_str = " sans validation croisée"
+        else:
+            cv_str = f" en validation croisée {self.n_folds} folds"
+
         print(
-            f"Optimisation de {n_trials} trials sur CPU ({self.lgb_n_threads} threads)..."
+            f"Optimisation de {n_trials} trials sur CPU ({self.lgb_n_threads} threads){cv_str}..."
         )
         t0 = time.time()
 
         self.run_lgb_trials(n_trials=n_trials, verbose=verbose)
         print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
-        print()
         self.print_best_trial()
+        print("Nombre total de trials élagués (=pruned) :", self.counts_pruned_trials())
+        print()
         self.create_best_run()
 
     """def get_params_of_model(self):
