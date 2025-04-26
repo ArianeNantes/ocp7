@@ -7,10 +7,20 @@ import cupy as cp
 import sklearn
 from cuml.preprocessing import RobustScaler, MinMaxScaler, StandardScaler
 from cuml.neighbors import NearestNeighbors
+from cuml.linear_model import LinearRegression as CuLinearRegression
+from cuml.metrics import r2_score
 from sklearn.base import BaseEstimator, TransformerMixin, check_is_fitted
+from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import train_test_split as sk_train_test_split
+from sklearn.pipeline import Pipeline as skPipeline
+from sklearn.impute import SimpleImputer as skSimpleImputer
+from sklearn.preprocessing import RobustScaler as skRobustScaler
+from sklearn.preprocessing import MinMaxScaler as skMinMaxScaler
+from sklearn.feature_selection import VarianceThreshold as skVarianceThreshold
 from imblearn.under_sampling import NearMiss
 from imblearn.over_sampling import SMOTE, SMOTENC
 import gc
+import os
 import warnings
 
 from copy import deepcopy
@@ -18,13 +28,116 @@ from copy import deepcopy
 # from sklearn.cluster import AgglomerativeClustering
 # from collections import defaultdict
 
-from src.p7_constantes import VAL_SEED
-
+from src.p7_constantes import VAL_SEED, DATA_INTERIM
 
 warnings.filterwarnings(
     "ignore",
     message="Unused keyword parameter: n_jobs during cuML estimator initialization",
 )
+
+
+class WithColNames(BaseEstimator, TransformerMixin):
+    """
+    Wrapper qui contient un estimateur cuml comme StandardScaler mais qui permet de garder les noms des colonnes
+    """
+
+    def __init__(self, estimator):
+        self.estimator = estimator
+
+    def fit(self, X, y=None):
+        self.feature_names_in_ = X.columns.tolist()
+        self.estimator.fit(X)
+        return self
+
+    def transform(self, X, y=None, verbose=False):
+        check_is_fitted(self)
+        X_columns = X.columns
+        if self.estimator.copy:
+            X_ = X.copy()
+        else:
+            X_ = X
+        X_ = self.estimator.transform(X_)
+        X_.columns = X_columns
+        self.feature_names_out_ = X_.columns.tolist()
+        return X_
+
+    def get_feature_names_in(self):
+        check_is_fitted(self)
+        return self.feature_names_in_
+
+    def get_feature_names_out(self):
+        check_is_fitted(self)
+        return self.feature_names_out_
+
+
+# Imputation en fonction du type : Mode pour les Bool, médiane pour les floats, partie entière de la médiane pour les int.
+class ImputerByDtype(BaseEstimator, TransformerMixin):
+    def __init__(self, verbose=True):
+        self.verbose = verbose
+        self.dic_median = {}
+        self.dic_mode = {}
+
+    def fit(self, X, y=None):
+
+        self.bool_features_ = []
+        self.other_features_ = []
+        self.bad_type_features_ = []
+        for f in X.columns:
+            dtype = X[f].dtype
+            dtype_str = str(dtype)
+
+            # Gestion des booléens (imputation par le mode)
+            if "bool" in dtype_str:
+                self.bool_features_.append(f)
+                mode_series = X[f].mode()
+                if len(mode_series) > 0:
+                    self.dic_mode[f] = mode_series[0]
+                else:
+                    self.dic_mode[f] = False  # ou un choix par défaut
+
+            # Autres types (imputation par médiane en respectant le type)
+            else:
+                self.other_features_.append(f)
+                median_val = X[f].dropna().median()
+
+                if dtype == np.float16 or dtype == "float16":
+                    self.dic_median[f] = np.float16(median_val)
+                elif dtype == np.float32 or dtype == "float32":
+                    self.dic_median[f] = np.float32(median_val)
+                elif dtype == np.float64 or dtype == "float64":
+                    self.dic_median[f] = np.float64(median_val)
+                elif "int" in dtype_str:
+                    # On prend la partie entière de la médiane et on la caste au type python correspondant
+                    self.dic_median[f] = X[f].dtype.type(int(median_val))
+                else:
+                    self.bad_type_features_.append(f)
+        if self.verbose and self.bad_type_features_:
+            print(
+                f"WARNING : {len(self.bad_type_features_)} features ont un type non géré par l'imputer"
+            )
+        self.feature_names_in_ = X.columns.tolist()
+        self.feature_names_out_ = X.columns.tolist()
+        return self
+
+    def transform(self, X, y=None):
+        check_is_fitted(self)
+        X_copy = X.copy()
+        for f in self.bool_features_:
+            X_copy[f] = X_copy[f].fillna(self.dic_mode[f])
+        for f in self.other_features_:
+            X_copy[f] = X_copy[f].fillna(self.dic_median[f])
+
+        if self.verbose and X_copy.isna().sum().sum() > 0:
+            print("WARNING : Il reste des NaN")
+        return X_copy
+
+    def get_feature_names_in(self):
+        check_is_fitted(self)
+        return self.feature_names_in_
+
+    def get_feature_names_out(self):
+        check_is_fitted(self)
+        return self.feature_names_out_
 
 
 class Imputer(BaseEstimator, TransformerMixin):
@@ -141,8 +254,9 @@ class VarianceSelector(BaseEstimator, TransformerMixin):
     Supprime les colonnes dont la variance est <= threshold
     """
 
-    def __init__(self, threshold=0, verbose=False):
+    def __init__(self, threshold=0, copy=True, verbose=False):
         self.threshold = threshold
+        self.copy = copy
         self.verbose = verbose
 
     def fit(self, X, y=None):
@@ -168,12 +282,16 @@ class VarianceSelector(BaseEstimator, TransformerMixin):
 
     def transform(self, X, y=None, verbose=False):
         check_is_fitted(self)
-        if self.to_drop_:
-            # On supprime les colonnes de variances trop faibles
-            X_ = X.drop(self.to_drop_, axis=1, inplace=False)
+        if self.copy:
+            X_ = X.copy()
         else:
             X_ = X
-        self.feature_names_out_ = X_.columns.tolist()
+
+        if self.to_drop_:
+            # On supprime les colonnes de variances trop faibles
+            X_.drop(self.to_drop_, axis=1, inplace=True)
+        else:
+            X_ = X
         return X_
 
     def get_feature_names_in(self):
@@ -401,67 +519,33 @@ class CuMinMaxScaler(BaseEstimator, TransformerMixin):
         return self.feature_names_out_
 
 
-class CuMinMaxScaler_old(BaseEstimator, TransformerMixin):
-    """
-    Scale les variables non booléennes avec un MinMaxScaler
-    """
+class Preprocessor:
+    def __init__(self, device="cpu", model_name="logreg"):
+        self.device = device
+        self.model_name = model_name
+        self.numeric_transformer = None
+        self.binary_transformer = None
 
-    def __init__(self, to_scale=[], feature_range=(0, 1), verbose=True):
-        self.to_scale = to_scale
-        self.feature_range = feature_range
-        self.verbose = verbose
-        self.scaler = MinMaxScaler(feature_range=self.feature_range)
-
-    def fit(self, X, y=None):
-        # Si to_scale n'a pas été spécifié, on mettra à l'échelle toutes les variables non booléennes
-        if not self.to_scale:
-            features = [f for f in X.columns if f not in ["SK_ID_CURR", "TARGET"]]
-            features_not_bool = (
-                X[features].select_dtypes(exclude="bool").columns.tolist()
-            )
-            # print("features_not_bool", features_not_bool)
-            features_binary = [
-                f
-                for f in features_not_bool
-                if X[f].dropna().nunique() <= 2
-                and all(value in [0, 1] for value in X[f].dropna().unique().to_numpy())
-            ]
-            self.to_scale = [f for f in features_not_bool if f not in features_binary]
-
-        # Si des varaiables à mettre à l'échelle ont des variances nulles, on lève une erreur
-        check_variances(X[self.to_scale], raise_error=True)
-
-        self.scaler.fit(X[self.to_scale].to_numpy())
-        # Documentation RAPIDS : https://docs.rapids.ai/api/cuml/stable/api/#cuml.preprocessing.MinMaxScaler
-        self.scale_ = self.scaler.scale_
-        self.min_ = self.scaler.min_
-        self.data_range_ = self.scaler.data_range_
-        self.n_samples_seen_ = self.scaler.n_samples_seen_
-
-        self.feature_names_in_ = X.columns.tolist()
-        self.feature_names_out_ = []
-        return self
-
-    def transform(self, X, y=None, verbose=False):
-        check_is_fitted(self)
-        X_ = X.copy()
-        scaled_features = cudf.DataFrame(
-            self.scaler.transform(X_[self.to_scale].to_numpy()),
-            columns=self.to_scale,
-            index=X.index,
-        )
-        for feature in self.to_scale:
-            X_[feature] = scaled_features[feature]
-        self.feature_names_out_ = X_.columns.tolist()
-        return X_
-
-    def get_feature_names_in(self):
-        check_is_fitted(self)
-        return self.feature_names_in_
-
-    def get_feature_names_out(self):
-        check_is_fitted(self)
-        return self.feature_names_out_
+    def build(self):
+        if self.device == "cpu":
+            if self.model_name == "logreg":
+                # Pipeline pour les colonnes numériques
+                self.numeric_transformer = skPipeline(
+                    steps=[
+                        (
+                            "imputer",
+                            skSimpleImputer(strategy="median"),
+                        ),
+                        ("variance_threshold", skVarianceThreshold(threshold=0.0)),
+                        ("robust_scaler", skRobustScaler()),
+                        ("minmax_scaler", skMinMaxScaler()),
+                    ]
+                )
+                # Pipeline pour les colonnes binaires
+                self.binary_transformer = skPipeline(
+                    steps=[("imputer", skSimpleImputer(strategy="most_frequent"))]
+                )
+            return self.binary_transformer, self.numeric_transformer
 
 
 def check_no_nan(df):
@@ -494,9 +578,21 @@ def check_variances(df, raise_error=True, verbose=True):
         return []"""
 
 
+def get_null_variance(df, verbose=True):
+    selector = VarianceSelector(verbose=False)
+    selector.fit(df)
+    if verbose:
+        print(f"{len(selector.to_drop_)} features de variance nulle")
+        if selector.to_drop_:
+            print(selector.to_drop_)
+    return selector.to_drop_
+
+
 def get_binary_features(df):
     features = [f for f in df.columns if f not in ["TARGET", "SK_ID_CURR"]]
-    features_bool = df[features].select_dtypes(include="bool").columns.tolist()
+    features_bool = (
+        df[features].select_dtypes(include=["bool", "bool_"]).columns.tolist()
+    )
     features_not_bool = [f for f in features if f not in features_bool]
 
     if isinstance(df, (cudf.core.dataframe.DataFrame, cudf.core.series.Series)):
@@ -515,6 +611,111 @@ def get_binary_features(df):
         ]
     binary_features = features_bool + features_bin_not_bool
     return binary_features
+
+
+def get_all_binary_features(
+    train_name, test_name, input_dir=DATA_INTERIM, verbose=True
+):
+    train_path = os.path.join(input_dir, train_name)
+    train = cudf.read_csv(train_path)
+    test_path = os.path.join(input_dir, test_name)
+    test = cudf.read_csv(test_path)[train.columns]
+    all_data = cudf.concat([train, test])
+    binary_features = get_binary_features(all_data)
+
+    if verbose:
+        n_binary_features = len(binary_features)
+        n_features = len(
+            [f for f in train.columns if f not in ["TARGET", "SK_ID_CURR"]]
+        )
+        print(
+            f"{n_binary_features} features sur {n_features} sont booléennes (ratio : {n_binary_features / n_features:.1%})"
+        )
+    return binary_features
+
+
+# En fait entre pandas et cudf,
+# c'est juste le get_indexer() qui ne fonctionne pas (sans être remonté dans la stack d'erreur)
+# Il faut donc convertir en pandas
+def cu_build_folds_list(n_folds, X, y, random_state=VAL_SEED, frac_test=0.25):
+    # Si X nest pas un RAPIDS, on sort tout de suite
+    if not isinstance(X, (cudf.core.dataframe.DataFrame, cudf.core.series.Series)):
+        raise ValueError(
+            f"Fonction 'cu_build_folds_list' : 'X' n'est pas un cudf.df, type réel : {type(X)}"
+        )
+        return
+
+    # Si on utilise pas la validation croisée (temps de calculs trop longs)
+    if n_folds == 1:
+        X_train, X_val, y_train, y_val = sk_train_test_split(
+            X.to_pandas(),
+            y.to_pandas(),
+            stratify=y.to_pandas(),
+            test_size=frac_test,
+            random_state=random_state,
+        )
+
+        # On convertit les indices en indices positionnels relatifs à X,
+        # En réalité get_indexer() non supportée pour l'insant par RAPIDS
+        train_idx = X.index.to_pandas().get_indexer(X_train.index)
+        valid_idx = X.index.to_pandas().get_indexer(X_val.index)
+        folds_list = [(train_idx, valid_idx)]
+
+    # Si on utilise la validation croisée:
+    else:
+        folds = StratifiedKFold(
+            n_splits=n_folds,
+            shuffle=True,
+            random_state=random_state,
+        )
+        folds_list = [
+            (train_idx, valid_idx)
+            for train_idx, valid_idx in folds.split(X.to_pandas(), y.to_pandas())
+        ]
+
+    return folds_list
+
+
+# Retourne les indices issus d'un train_test_split pour cudf ou pd.df mais en relatifs et non positionnels,
+# C'est à dire sous la même forme qu'un folds ou kfolds
+def one_k_fold(X, y, test_size=0.25, shuffle=True, random_state=VAL_SEED):
+
+    # Si on est en RAPIDS, train_test_split n'accepte pas les NaN
+    if isinstance(X, (cudf.core.dataframe.DataFrame, cudf.core.series.Series)):
+        # On trouve 2 prédicteurs sans nan dans X (car pas de NaN pour cudf)
+        columns_without_nan = [c for c in X.columns if X[c].isna().sum() == 0]
+        if len(columns_without_nan) < 2:
+            raise ValueError(
+                f"La table Application doit comporter au moins 2 colonnes sans NaN"
+            )
+            return
+        # Si on a suffisemment de colonnes sans nan, on effectue le split sur 2 colonnes pour récupérer les index des splits
+        X_train_tmp, X_test_tmp, y_train, y_test = (
+            cuml.model_selection.train_test_split(
+                X[columns_without_nan[:2]],
+                y,
+                test_size=test_size,
+                shuffle=shuffle,
+                stratify=y,
+                random_state=random_state,
+            )
+        )
+
+    # Si les données d'entrée ne sont pas dans un cudf.df on consière que c'est un pandas dataframe
+    X_train_tmp, X_test_tmp, y_train, y_test = sk_train_test_split(
+        X[:2],
+        y,
+        test_size=test_size,
+        shuffle=shuffle,
+        stratify=y,
+        random_state=random_state,
+    )
+
+    # On convertit les indices "absolus" en indices relatifs positionnels par rapport à X
+    train_idx = X.index.get_indexer(X_train_tmp.index)
+    valid_idx = X.index.get_indexer(X_test_tmp.index)
+    folds_list = [(train_idx, valid_idx)]
+    return folds_list
 
 
 def train_test_split_nan(df, y=None, test_size=0.25, shuffle=True, random_state=42):
@@ -569,7 +770,8 @@ def train_test_split_nan(df, y=None, test_size=0.25, shuffle=True, random_state=
             if len(columns_without_nan) < 2:
                 print("Le dataset doit comporter au moins 2 colonnes sans NaN")
                 return
-            # Si on a suffisemment de colonnes sans nan, on effetue le split sur 2 colonnes pour récupérer les index des slits
+            # Si on a suffisemment de colonnes sans nan, on effectue le split sur 2 colonnes pour récupérer les index des splits
+            # Attention à ne pas passer par un index pandas, via sklearn, car ce ne sont pas les mêmes indexers
             X_train_tmp, X_test_tmp, y_train, y_test = (
                 cuml.model_selection.train_test_split(
                     X[columns_without_nan[:2]],
@@ -587,7 +789,7 @@ def train_test_split_nan(df, y=None, test_size=0.25, shuffle=True, random_state=
     # Si le dataset n'est pas de type cudf, on considère qu'il s'agit d'un pandas df ou un numpy array
     # if isinstance(df, (pd.core.frame.DataFrame, pd.core.frame.Series))
     else:
-        return sklearn.model_selection.train_test_split(
+        return sk_train_test_split(
             X,
             y,
             test_size=test_size,
@@ -601,6 +803,7 @@ def balance_nearmiss(
     X,
     y,
     k_neighbors=3,
+    minority_to_majority_ratio=1.0,
     drop_null_var=False,
     verbose=True,
 ):
@@ -620,7 +823,29 @@ def balance_nearmiss(
         y_ = y.copy()
         X_ = X.copy()
 
-    nm = NearMiss(n_neighbors=k_neighbors)
+    # Le ratio 1 correspond à l'équilibre parfait
+    if minority_to_majority_ratio == 1.0:
+        sampling_strategy = "auto"
+    else:
+        n_samples_1_before = np.sum(y_)
+        n_samples_0_before = len(y_) - n_samples_1_before
+        ratio_before = n_samples_1_before / n_samples_0_before
+        # Si le ratio fourni est plus grand que l'actuel, on diminue la classe majoritaire
+        if minority_to_majority_ratio >= ratio_before:
+            n_samples_0_after = int(
+                np.round(n_samples_1_before / minority_to_majority_ratio, decimals=0)
+            )
+            sampling_strategy = {0: n_samples_0_after}
+        # Si le ratio fourni est plus petit que l'actuel, on diminue encore plus la classe minoritaire
+        else:
+            n_samples_1_after = int(
+                np.round(n_samples_0_before * minority_to_majority_ratio, decimals=0)
+            )
+            sampling_strategy = {1: n_samples_1_after}
+    nm = NearMiss(
+        n_neighbors=k_neighbors,
+        sampling_strategy=sampling_strategy,
+    )
     X_resampled, y_resampled = nm.fit_resample(X_, y_)
 
     if isinstance(X, (cudf.core.dataframe.DataFrame, cudf.core.series.Series)):
@@ -632,7 +857,7 @@ def balance_nearmiss(
             f"Avant rééquilibrage : Nb observations = {X.shape[0]:_}, ratio défauts = {y.value_counts(normalize=True)[1]:.2%}"
         )
         print(
-            f"Après NEARMISS : Nb observations = {X_resampled.shape[0]:_}, ratio défauts = {y_resampled.value_counts(normalize=True)[1]:.2%}"
+            f"Après NEARMISS sampling_strategy {sampling_strategy}: Nb observations = {X_resampled.shape[0]:_}, ratio défauts = {y_resampled.value_counts(normalize=True)[1]:.2%}"
         )
 
     # On vérifie les variables de variance nulle

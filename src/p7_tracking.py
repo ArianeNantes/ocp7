@@ -13,6 +13,8 @@ import inspect
 from PIL import Image
 from IPython.display import display
 from plotly.io.kaleido import scope
+from collections import Counter
+from collections import defaultdict
 
 import psycopg2
 from psycopg2 import OperationalError
@@ -33,7 +35,22 @@ import cudf
 import cuml
 import cupy as cp
 from cuml.linear_model import LogisticRegression
+from cuml.metrics import roc_auc_score as cu_roc_auc_score
+from lightgbm import LGBMClassifier, record_evaluation
+import lightgbm as lgb
+from sklearn.metrics import roc_auc_score as sk_roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+from sklearn.feature_selection import RFECV
+from sklearn.linear_model import LogisticRegression as skLogisticRegression
+from sklearn.pipeline import Pipeline as skPipeline
+from sklearn.impute import SimpleImputer as skSimpleImputer
+from sklearn.preprocessing import RobustScaler as skRobustScaler
+from sklearn.preprocessing import StandardScaler as skStandardScaler
+from sklearn.preprocessing import MinMaxScaler as skMinMaxScaler
+from sklearn.feature_selection import VarianceThreshold as skVarianceThreshold
+from sklearn.compose import ColumnTransformer as skColumnTransformer
+from sklearn.metrics import roc_curve as sk_roc_curve
+from sklearn.metrics import auc as sk_auc
 
 from copy import deepcopy
 import warnings
@@ -56,8 +73,12 @@ from src.p7_preprocess import (
     check_variances,
     balance_smote,
     balance_nearmiss,
+    cu_build_folds_list,
+    get_binary_features,
 )
+
 from src.p7_simple_kernel import get_memory_consumed
+from src.p7_feature_selection import CuCorrSelector, CuPermutSelector
 from src.p7_feature_selection import (
     cluster_features,
     plot_permutation_importance,
@@ -66,15 +87,31 @@ from src.p7_feature_selection import (
     cluster_features_from_linkage_matrix,
     plot_top_correlations,
     build_corr_matrix,
+    build_rcaf_matrix,
     get_features_correlated_above,
 )
 
-from src.p7_evaluate import plot_evaluation_scores
+# from src.p7_evaluate import WrapperLogReg
+from src.p7_evaluate import (
+    plot_evaluation_scores,
+    plot_roc_curve,
+    cuml_cross_evaluate,
+    balance_smote,
+    balance_nearmiss,
+    lgb_validate_1_fold,
+    cuml_validate_1_fold,
+    pre_process_1_fold,
+    pd_build_folds_list,
+    sk_validate_1_fold,
+)
+from src.p7_evaluate import WrapperLgbForCuda
 
 
-# Classe pour fixer les méta données d'une expérience MLFlow :
-# Le nom de l'expérience, les tags et la description
 class ExpMetaData:
+    """Classe pour fixer les méta données d'une expérience MLFlow :
+    Le nom de l'expérience, les tags et la description
+    """
+
     def __init__(self, task, model_name, balance="none", num=0, debug=False):
         self.num = num
         self.task = task
@@ -199,9 +236,11 @@ class ExpMetaData:
         dic_description = {
             "search": "Recherche d'hyperparamètres",
             "corr": "Suppression de features trop similaires 2 à 2",
+            "corrcv": "Suppression de features trop similaires 2 à 2 en validation croisée - Corrélation rcaf",
             "permut": "Suppression de features par permutation importance",
             "eval": "Evaluation de modèle",
             "test": "Test de modèle",
+            "rfecv": "Recursive Feature Elimination with Cross-Validation",
         }
         if not main_description:
             self.main_description = dic_description[self.task]
@@ -254,6 +293,22 @@ class ExpMetaData:
 
 
 class ExpMlFlow:
+    """
+    Classe représentant une expérience à tracer dans mlflow.
+
+    Args :
+        task (str) : la tâche à effectuer (ex : recherche d'hyperparamètres)
+        model_name (str) : logreg ou lgbm
+        debug (bool): true s'il s'agit d'une expérience de débogage, false sinon
+
+    Methods :
+        check_postgresql_server(host="localhost", port=PORT_PG, dbname="optuna_db", user=USER_PG, password=PASSWORD_PG, verbose=True,): vériffie si le serveur postgresql est opérationnel
+        check_mlflow_server(verbose=True): vérifie si le serveur mlflow est opérationnel
+        check_services(verbose=True): vérifie que les serveurs postgesql et mlflow sont opérationnels, démarre le serveur mlflow si nécessaire
+
+
+    """
+
     def __init__(self, task, model_name, debug=False):
         self.input_dir = DATA_INTERIM
         self.train_filename = "00_v3_train.csv"
@@ -272,6 +327,19 @@ class ExpMlFlow:
         self._initialized = False
         # self.parent_run_id = None
         self.device = "cuda"
+        self.n_folds = 4
+        self._all_val_scores = {
+            "auc": [],
+            "accuracy": [],
+            "recall": [],
+            "penalized_f1": [],
+            "business_gain": [],
+            "fit_time": [],
+            "tn": [],
+            "tp": [],
+            "fn": [],
+            "fp": [],
+        }
 
         # self.debug = debug
         self.debug_n_predictors = 20
@@ -420,7 +488,7 @@ class ExpMlFlow:
 
         # On place la target à part
         self.X = all_train.drop("TARGET", axis=1)
-        self.y = all_train["TARGET"]
+        self.y = all_train["TARGET"].astype(int)
 
         # Si debug est activé, on réduit le nombre de prédicteurs et le nombre de lignes
         if self.meta.debug:
@@ -514,6 +582,23 @@ class ExpMlFlow:
                 # print(f"\t{irrelevant_features}")
 
             # print("Nouvelle forme de X", self.X.shape)
+
+    def drop_features(self, to_drop, verbose=True):
+        features_to_drop = [f for f in to_drop if f in self.X.columns]
+        features_not_found = [f for f in to_drop if f not in features_to_drop]
+        if features_to_drop:
+            self.X = self.X.drop(features_to_drop, axis=1)
+        if verbose:
+            if features_not_found:
+                print(
+                    f"{len(features_not_found)} features ne figurent pas dans les colonnes :"
+                )
+                print(features_not_found)
+            print(f"{len(features_to_drop)} features supprimées :")
+            print(features_to_drop)
+            if features_to_drop:
+                print("Nouvelles informations sur le dataset :")
+                print(self.X.info())
 
     def get_pipe_str(self):
         if self.pipe_preprocess:
@@ -611,6 +696,7 @@ class ExpMlFlow:
         ]
 
         # On met à jour les paramètres autorisés pour meta et on initialise meta
+        dic_arg_meta = {}
         for a in args_to_init_in_meta:
             self.meta.__dict__[a] = kwargs[a]
             # print("in meta", a, self.meta.__dict__[a])
@@ -672,15 +758,16 @@ class ExpMlFlow:
             name=self.train_filename,
         )
 
-    def track_dataset(self, context=""):
+    def track_dataset(self, context=None):
         if not self._mlflow_dataset:
             print("Créez d'abord le dataset mlflow avev .create_mlflow_dataset()")
             return
-        if not context:
+        """if not context:
             if self.meta.balance != "none":
                 context = self.meta.balance.upper()
             else:
                 context = "unbalanced"
+                """
         mlflow.log_input(self._mlflow_dataset, context=context)
 
     def save_data(
@@ -958,6 +1045,45 @@ class ExpMlFlow:
         if self.meta.debug:
             print(f"{tab_level0}Mode DEBUG activé")
 
+    def process_n_folds(self, *args, **kwargs):
+        predictors = [f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]]
+
+        # On construit la liste des folds avec des index en position relative
+        if self.device == "cuda":
+            folds_list = cu_build_folds_list(
+                n_folds=self.n_folds,
+                X=self.X[predictors],
+                y=self.y,
+                random_state=self.random_state,
+            )
+        else:
+            folds_list = pd_build_folds_list(
+                n_folds=self.n_folds,
+                X=self.X[predictors],
+                y=self.y,
+                random_state=self.random_state,
+            )
+
+        for i_fold, (train_idx, valid_idx) in enumerate(folds_list):
+            X_train = self.X[predictors].iloc[train_idx]
+            X_val = self.X[predictors].iloc[valid_idx]
+            y_train = self.y.iloc[train_idx]
+            y_val = self.y.iloc[valid_idx]
+
+            self.process_1_fold(X_train, X_val, y_train, y_val, i_fold, *args, **kwargs)
+
+    def process_1_fold(self, X_train, X_val, y_train, y_val, i_fold, *args, **kwargs):
+        if i_fold:
+            print(f"Fold {i_fold}...")
+        print("X_train :")
+        print(X_train.info())
+        print("y_train.shape", y_train.shape)
+        print("X_val.shape", X_val.shape)
+        print("y_val.shape", y_val.shape)
+        raise NotImplementedError(
+            f"La métode 'do_in_1_fold' de la classe {self.__class__.__name__} n'a pas encore été surchagée"
+        )
+
 
 class ExpSearch(ExpMlFlow):
     def __init__(
@@ -968,6 +1094,7 @@ class ExpSearch(ExpMlFlow):
         direction="maximize",
         loss="binary",
     ):
+
         super().__init__(task="search", model_name=model_name, debug=debug)
         self.pipe_preprocess = None
         self.meta.balance = None
@@ -984,16 +1111,20 @@ class ExpSearch(ExpMlFlow):
         self.X = None
         self.y = None
         self._best_run_name = None
+        self._params_balance_list = ["balance", "k_neighbors", "sampling_strategy"]
 
         # Par défaut dans optuna, on loggue les trials à l'écran
         # Pour ne loguer que les trials optuna.logging.WARNING
         # L'affichage des infos ou non sera véritablement effectué lors de l'optimisation en fonction du nombre de trials dans les classes enfantes
         self.optuna_verbosity = optuna.logging.INFO
         optuna.logging.set_verbosity(self.optuna_verbosity)
-        self.sampler = optuna.samplers.TPESampler(VAL_SEED)
-        self.pruner = optuna.pruners.HyperbandPruner(
+        # self.sampler = optuna.samplers.TPESampler(VAL_SEED)
+        """self.pruner = optuna.pruners.HyperbandPruner(
             min_resource=10, max_resource=400, reduction_factor=3
-        )
+        )"""
+        self.n_startup_trials = 5
+        self.sampler = None
+        self.pruner = None
         self.storage = RDBStorage(
             f"postgresql://{USER_PG}:{PASSWORD_PG}@localhost:{PORT_PG}/optuna_db"
         )
@@ -1010,23 +1141,38 @@ class ExpSearch(ExpMlFlow):
         # Par défaut on ne loggue pas dans mlflow le plot des params en parallel, cela dépend du modèle,
         # donc à définire dans classe enfant
         self._params_to_plot_in_parallel = []
+        self._plot_importance_params = True
         self.n_folds = 4
+        self.params_to_optimize = ["threshold_prob"]
 
     # Attributs publics de l'objet
     @property
     def valid_args_exp(self):
         return [k for k in self.__dict__.keys() if not k.startswith("_")]
 
+    def check_required_attributes(self):
+        required_attributes = ["_params_model_list"]
+        for attr in required_attributes:
+            if not hasattr(self, attr):
+                raise NotImplementedError(
+                    f"L'attribut '{attr}' doit être défini dans la sous-classe {self.__class__.__name__}."
+                )
+
     # Appeler meta.init() avant cette fonc, et check_service (pg doit être démarré)
     def create_or_load_study(
         self,
     ):
-
+        if not self.sampler:
+            self.sampler = optuna.samplers.RandomSampler(seed=self.random_state)
+        if not self.pruner:
+            self.pruner = optuna.pruners.MedianPruner(
+                n_startup_trials=self.n_startup_trials
+            )
         study = optuna.create_study(
             study_name=self.meta._name,
             direction=self.direction,
             sampler=self.sampler,
-            # pruner=self.pruner,
+            pruner=self.pruner,
             storage=self.storage,
             # On garde True pour load_if_exists au sujet de la study optuna (à ne pas confondre avec l'expérience mlflow)
             # Donc si l'expérience de recherche n'a pas été trackée sur mlflow mais faite uniquement dans optuna,
@@ -1035,67 +1181,31 @@ class ExpSearch(ExpMlFlow):
         )
         # [TODO] si le temps mettre un warning si la study existe déjà (voir si nécessaire)
         self._study = study
-        return self._study
-
-    # Prendre plutôt initi_config du parent
-    """def init(self, verbose=True, **kwargs):
-        self.meta.init(**kwargs)
-        # La liste des paramètres possibles à passer dans kwargs sont
-        # les attributs qui ne sont pas protégés ni privés et qui ne sont pas des méthodes
-        # Dans cet objet ou dans la l'objet meta imbriqué
-        valid_args_meta = self._meta.valid_args
-
-        # valid_args = [arg for arg in kwargs.keys() if arg in public_attributes]
-        valid_args = [arg for arg in kwargs.keys() if arg in self.valid_args]
-        invalid_args = [arg for arg in kwargs.keys() if arg not in valid_args]
-
-        # On met à jour les paramètres qui sont autorisés
-        for k in valid_args:
-            v = kwargs[k]
-            self.__setattr__(k, v)
-
-        if verbose:
-            # print(f"Les paramètres {valid_args} ont été mis à jour")
-            print(f"Initialisation")
-        if invalid_args:
-            print(
-                f"Les paramètres {invalid_args} ne sont pas valides. Liste des paramètres possibles :"
-            )
-            print(self.valid_args)
-
-        # On ne veut pas ré-initialiser les data pour rien (la lecture évitée)
-        # donc on récupère les arguments de kwargs qui sont aussi dans la signature de init_data
-        # on n'exécute init_data que si les df X ou y sont vides ou si des arguments de data ont été passés dans kwargs, même s'ils ne sont pas différents d'avant
-        data_signature = inspect.signature(self.init_data)
-        data_args = [param.name for param in data_signature.parameters.values()]
-        data_args_to_init = [a for a in kwargs.keys() if k in data_args]
-        if self.X is None or self.y is None or data_args_to_init:
-            self.init_data(verbose=False)
-        print(
-            f"Forme de X : {self.X.shape}, conso mémoire : {get_memory_consumed(self.X, verbose=False):.0f} Mo"
-        )
-        self.check_directories()
-        self.check_services(verbose=True)
-        self.meta.init()
-        self.init_data()
-        optuna.logging.set_verbosity(self.optuna_verbosity)
-
-        if invalid_args:
-            return False
-        else:
-            self._initialized = True
-            return self._initialized"""
+        return
 
     # Appeler les init avant les create
     # On surcharge car pour une experience de recherche il faut créer un objet optuna study
-    def create_or_load(self):
+    def create_or_load(self, verbose=True):
         if self._initialized:
             id_experiment = self.create_or_load_experiment()
             study = self.create_or_load_study()
-            return id_experiment, study
+            if verbose:
+                print(f"\tMétrique à optimiser : {self.metric}")
+                print(f"\tDirection : {self.direction}")
+                str_sampler = self.sampler.__class__.__name__
+                if str_sampler == "RandomSampler":
+                    str_sampler = f"{str_sampler}(seed={self.random_state})"
+                print(f"\tSampler : {str_sampler}")
+                str_pruner = self.pruner.__class__.__name__
+                if str_pruner == "MedianPruner":
+                    str_pruner = (
+                        f"{str_pruner}(n_startup_trials={self.n_startup_trials})"
+                    )
+                print(f"\tPruner : {str_pruner} ")
+                print(f"\tParamètres à optimiser : {self.params_to_optimize}")
         else:
             print("Initialisez d'abord la config avec init.config()")
-            return None
+        return
 
     def create_parent_run(self):
         # On crée un run parent qui va contenir tous les runs (un run enfant par trial)
@@ -1115,7 +1225,14 @@ class ExpSearch(ExpMlFlow):
         if print_params:
             self.print_suggested_params()
 
-    def create_best_run(self, verbose=True):
+    def create_best_run(
+        self,
+        verbose=True,
+        show_parallel=True,
+        show_history=True,
+        show_importance=True,
+        show_recall=True,
+    ):
         print("Création du meilleur run...")
         self._best_run_name = f"T_{self._study.best_trial.number}_best_of_{len(self._study.get_trials())}_trials"
         with mlflow.start_run(
@@ -1132,8 +1249,6 @@ class ExpSearch(ExpMlFlow):
 
             # Par défaut dans optuna, seule la métrique principale est enregistrée (on change ce comprtement dans les classe enfants, méthode objective)
             # Si tous les scores ont été enregistrés dans le trial, on les loggue tous dans mlflow, sinon on loggue juste la métrique à optimiser
-            """if self._study.best_trial.user_attrs.get("mean_scores"):
-                mlflow.log_metrics(self._study.best_trial.user_attrs.get("mean_scores"))"""
             try:
                 mean_scores = self._study.best_trial.user_attrs.get("mean_scores")
                 mlflow.log_metrics(mean_scores)
@@ -1143,59 +1258,42 @@ class ExpSearch(ExpMlFlow):
                 mlflow.log_metric(self.metric, self._study.best_trial.value)
 
             if len(self._study.best_trial.params) > 1:
+                # if self._plot_importance_params:
                 fig = optuna.visualization.plot_param_importances(self._study)
-                # fig.write_html(os.path.join(self.output_dir, "hyperparam_importance.html"))
-                fig.write_image(
-                    os.path.join(self.output_dir, "hyperparam_importance.png"),
-                    format="png",
+                # On logue la figure en html pour que le graphique reste interactif.
+                # Pour la transformer en png, cliquer sur l'icône prévu à cet effet, mais
+                # Si le clic est effectué depuis mlflow, on perd les modifications de l'image.
+                fig.update_layout(
+                    title=f"Importance des hyperparamètres, Exp={self.meta._name}"
                 )
-                if verbose:
+                if show_importance:
                     fig.show()
-                mlflow.log_artifact(
-                    os.path.join(self.output_dir, "hyperparam_importance.png")
+                mlflow.log_figure(fig, "hyperparam_importance.html")
+
+                fig = optuna.visualization.plot_parallel_coordinate(
+                    self._study,
+                    params=self.params_to_optimize,
+                    target_name=self.metric.upper(),
                 )
-                # On ne logue dans ml flow le parallel_plot que si une liste est définie (change en fonction deu modèle)
-                if self._params_to_plot_in_parallel:
-                    fig = optuna.visualization.plot_parallel_coordinate(
-                        self._study,
-                        params=self._params_to_plot_in_parallel,
-                    )
-                    if verbose:
-                        fig.show()
-                    """fig.write_html(
-                        os.path.join(self.output_dir, "parallel_coordinate.html")
-                    )"""
-                    width = scope.default_width * 2
-                    fig.write_image(
-                        os.path.join(self.output_dir, "parallel_coordinate.png"),
-                        format="png",
-                        # scale=2,
-                        width=width,
-                    )
-                    mlflow.log_artifact(
-                        os.path.join(self.output_dir, "parallel_coordinate.png")
-                    )
+                fig.update_layout(title=f"Parallel Plot, Exp={self.meta._name}")
+                if show_parallel:
+                    fig.show()
+
+                mlflow.log_figure(fig, "parallel_coordinate.html")
 
             # On loggue dans mlflow les visualisations qui ne dépendent pas du modèle
-            fig = optuna.visualization.plot_optimization_history(self._study)
-            if verbose:
+            fig = optuna.visualization.plot_optimization_history(
+                self._study, target_name=self.metric.upper()
+            )
+            fig.update_layout(title=f"Historique d'optimisation, Exp={self.meta._name}")
+            if show_history:
                 fig.show()
             # fig.write_html(os.path.join(self.output_dir, "optimization_history.html"))
-            fig.write_image(
-                os.path.join(self.output_dir, "optimization_history.png"), format="png"
-            )
-            mlflow.log_artifact(
-                os.path.join(self.output_dir, "optimization_history.png")
-            )
+            mlflow.log_figure(fig, "optimization_history.html")
+
             # On loggue dans mlflow la matrice Recall moyenne si mean_scores a été enregistré
             # name_best_run_in_plot = f"trial n°{self._study.best_trial.number} best of {len(self._study.get_trials())} trials"
-            name_best_run_in_plot = f"Meilleur {self.metric} (trial n°{self._study.best_trial.number} / {len(self._study.get_trials())}) = {mean_scores[self.metric]:.2f}"
-            """resampling = f"Ratio défaut {self.get_ratio_default():.1%}"
-            if self.meta.balance != "none":
-                resampling = (
-                    resampling
-                    + f" - rééquilibré à 50% avec {self.meta.balance.upper()}"
-                )"""
+            name_best_run_in_plot = f"Meilleur {self.metric} (trial n°{self._study.best_trial.number} / {len(self._study.get_trials())}) = {mean_scores[self.metric]:.3f}"
             if self.n_folds == 1:
                 title_recall = "Recall (% par ligne)"
             else:
@@ -1222,6 +1320,13 @@ class ExpSearch(ExpMlFlow):
                     f"Meilleur {self.metric} (trial n°{self._study.best_trial.number} / {len(self._study.get_trials())}) = {mean_scores[self.metric]:.4f}"
                 )
 
+    def suggest_all_params(self):
+        params = {}
+        raise NotImplementedError(
+            f"La métode 'suggest_all_params' n'a pas encore été surchagée"
+        )
+        return params
+
     def get_suggested_params(self):
         return self._study.best_trial.params
 
@@ -1230,19 +1335,46 @@ class ExpSearch(ExpMlFlow):
         dic_params["balance"] = self.meta.balance
         dic_params["sampling_strategy"] = self.meta.sampling_strategy
         dic_params["search_experiment"] = self.meta._name
+        dic_params["k_neighbors"] = self.meta.balance_k_neighbors
         dic_params["loss"] = self.loss
         return dic_params
 
-    def get_params_of_model(self):
-        return {
-            k: v
-            for k, v in self.get_suggested_params().items()
-            if k not in ["threshold_prob", "k_neighbors", "balance"] and not pd.isna(v)
-        }
+    def get_threshold_prob(self, params):
+        if not "threshold_prob" in params.keys():
+            raise ValueError(
+                f"'threshold_prob' ne figure pas dans les paramètres :\n{params}"
+            )
+        else:
+            return params["threshold_prob"]
+
+    # Si l'attribut self._params_fit_list n'est pas défini dans la classe fille, cela provoquera une erreur.
+    # Erreur difficile à retrouver ? A voir avec le temps. Pour l'instant on choisit de ne pas le mettre dans check_attributes
+    def get_params_fit(self, all_params, convert_none=True):
+        params = {k: v for k, v in all_params.items() if k in self._params_fit_list}
+        if convert_none:
+            for param_name in params.keys():
+                if params[param_name] == "none":
+                    params[param_name] = None
+        return params
+
+    def get_params_balance(self, all_params):
+        return {k: v for k, v in all_params.items() if k in self._params_balance_list}
+
+    # Attention certains params peuvent/doivent être None, d'autres doivent être "none" selon la librairie
+    # Dans optuna : optuna accepte les deux propositions 'none' ou None pour du suggest_categorical()
+    # Dans cuml de RAPIDS : penalty=None n'est pas encore supporté, il faut penalty="none",
+    # tandis que class-weight=None  est ok.. (mais class_weight="none" fonctionne aussi).
+    def get_params_of_model(self, all_params, convert_none=[]):
+        params = {k: v for k, v in all_params.items() if k in self._params_model_list}
+        if convert_none:
+            for param_name in params.keys():
+                if params[param_name] == "none":
+                    params[param_name] = None
+        return params
 
     def print_all_params(self):
         params = self.get_all_params()
-        print("Tous les paraamètres :")
+        print("Tous les paramètres :")
         for k in params.keys():
             print(f"\t{k} : {params[k]}")
 
@@ -1328,6 +1460,398 @@ class ExpSearch(ExpMlFlow):
 """
 
 
+"""
+Causes possibles Warning ConvergenceWarning: lbfgs failed to converge (status=1)
+Échelle des données : 
+Si les données ne sont pas bien standardisées (c'est-à-dire que les caractéristiques ont des échelles très différentes), 
+cela peut rendre l'optimisation plus difficile. L'algorithme pourrait avoir du mal à trouver un minimum global.
+
+Multicolinéarité : 
+Si certaines des variables sont très corrélées, cela peut poser des problèmes de convergence pour l'algorithme d'optimisation.
+
+Taille du dataset : 
+Si le dataset est très grand , cela peut aussi rendre l'optimisation plus difficile, 
+surtout avec des solvers qui sont sensibles à la taille des données.
+
+Régularisation trop forte ou trop faible : 
+Un mauvais réglage du paramètre de régularisation (C pour la régression logistique) peut également empêcher la convergence.
+"""
+
+
+class RfecvLogReg(ExpMlFlow):
+    """
+    Modèle de régression logistique avec sélection récursive de features (RFECV) et suivi via MLflow.
+
+    Ce modèle applique un pipeline de prétraitement aux données, effectue une sélection de variables
+    avec RFECV et trace les performances moyennes en cross-validation via courbe ROC.
+
+    Args:
+        model_name (str, optional): Nom du modèle (utilisé pour MLflow et les logs). Par défaut "logreg".
+        debug (bool, optional): Active le mode debug (verbose, logs supplémentaires). Par défaut False.
+
+    Attributes:
+        params_model (dict): Dictionnaire des hyperparamètres du modèle.
+        max_iter (int): Nombre maximal d'itérations pour la convergence du modèle.
+        solver (str): Algorithme de résolution utilisé par la régression logistique.
+        model (sklearn.base.BaseEstimator or None): L'instance du modèle sklearn.
+        binary_preprocess (sklearn.pipeline.Pipeline): Pipeline pour les colonnes binaires.
+        num_preprocess (sklearn.pipeline.Pipeline): Pipeline pour les colonnes numériques continues.
+        X (pandas.DataFrame): Données d'entrée (features).
+        y (pandas.Series): Variable cible.
+        n_folds (int): Nombre de folds pour la validation croisée.
+        n_jobs (int): Nombre de threads à utiliser pour le calcul parallèle.
+        meta.balance (str): Méthode de rééquilibrage des classes (ex: "none").
+        score_before (float): Score AUC obtenu avant la sélection de variables.
+        _dropped_features_preprocess (list): Features supprimées pendant le prétraitement.
+        _new_scores (list): Historique des nouveaux scores obtenus.
+        metric (str): Métrique utilisée pour la sélection (ex: "auc").
+        _useless_features (list): Features considérées comme non pertinentes.
+        _usefull_features (list): Features considérées comme pertinentes.
+        _features_to_drop (list): Liste des features à supprimer par fold.
+        _run_id (str): ID du run MLflow courant.
+        device (str): Appareil utilisé pour le calcul ("cpu", "gpu").
+        _rfecv (sklearn.feature_selection.RFECV): L'objet RFECV après ajustement.
+    """
+
+    def __init__(
+        self,
+        model_name="logreg",
+        # threshold_prob=0.5,
+        debug=False,
+    ):
+        super().__init__(task="rfecv", model_name=model_name, debug=debug)
+
+        self.params_model = {"C": 0.0001, "penalty": "l2"}
+        self.max_iter = 400
+        self.solver = "sag"
+        self.model = None
+        # Pipeline pour les colonnes binaires
+        self.binary_preprocess = skPipeline(
+            steps=[
+                ("imputer", skSimpleImputer(strategy="most_frequent")),
+            ]
+        ).set_output(transform="pandas")
+        # Pipeline pour les colonnes non binaires
+        self.num_preprocess = skPipeline(
+            steps=[
+                (
+                    "imputer",
+                    skSimpleImputer(strategy="median"),
+                ),
+                ("variance_threshold", skVarianceThreshold(threshold=0.0)),
+                ("robust_scaler", skRobustScaler(quantile_range=(10.0, 90.0))),
+                # ("robust_scaler", skStandardScaler()),
+                ("minmax_scaler", skMinMaxScaler()),
+            ]
+        ).set_output(transform="pandas")
+        self.X = None
+        self.y = None
+        self.n_folds = 4
+        self.n_jobs = -1
+        self.meta.balance = "none"
+        self.score_before = 0
+        self._dropped_features_preprocess = []
+        self._new_scores = []
+
+        # Paramètres pour la permutation
+        self.metric = "auc"
+        self._useless_features = []
+        self._usefull_features = []
+
+        # liste de n_folds listes de features à supprimer
+        self._features_to_drop = []
+        self._run_id = None
+        self.device = "cpu"
+        self._rfecv = None
+
+    def evaluate(self):
+        """
+        Évalue les performances du modèle en utilisant une validation croisée.
+
+        Cette méthode applique la validation croisée avec le modèle actuel, calculant la courbe ROC et
+        le score AUC moyen, puis trace la courbe ROC moyenne avec l'intervalle de confiance. Elle
+        enregistre également les résultats et met à jour les listes des performances des folds.
+
+        Args:
+            None
+
+        Returns:
+            None
+        """
+        predictors = [f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]]
+        binary_predictors = get_binary_features(self.X[predictors])
+        num_predictors = [f for f in predictors if f not in binary_predictors]
+        preprocessor = skColumnTransformer(
+            transformers=[
+                ("num", self.num_preprocess, binary_predictors),
+                ("bin", self.binary_preprocess, num_predictors),
+            ]
+        ).set_output(transform="pandas")
+        # Initialisation des variables
+        self.model = skLogisticRegression(
+            max_iter=self.max_iter,
+            n_jobs=-1,
+            tol=0.001,
+            solver=self.solver,
+            random_state=self.random_state,
+            **self.params_model,
+        )
+
+        full_pipeline = skPipeline(
+            steps=[
+                ("preprocessor", preprocessor),
+                ("estimator", self.model),
+            ]
+        ).set_output(transform="pandas")
+
+        cv = StratifiedKFold(n_splits=self.n_folds)
+        tprs = []
+        aucs = []
+        mean_fpr = np.linspace(0, 1, 100)
+
+        folds_list = pd_build_folds_list(
+            n_folds=self.n_folds,
+            X=self.X[predictors],
+            y=self.y,
+            random_state=self.random_state,
+        )
+
+        for i_fold, (train_idx, valid_idx) in enumerate(folds_list):
+            X_train = self.X[predictors].iloc[train_idx]
+            X_val = self.X[predictors].iloc[valid_idx]
+            y_train = self.y.iloc[train_idx]
+            y_val = self.y.iloc[valid_idx]
+
+            full_pipeline.fit(X_train, y_train)
+            y_prob = full_pipeline.predict_proba(X_val)[:, 1]
+
+            # Calcul de la courbe ROC
+            fpr, tpr, _ = sk_roc_curve(y_val, y_prob)
+            roc_auc = sk_auc(fpr, tpr)
+            aucs.append(roc_auc)
+
+            # Interpolation des True Positive Rates (TPR)
+            tprs.append(np.interp(mean_fpr, fpr, tpr))
+            tprs[-1][0] = 0.0
+
+        # Calcul de la moyenne et des intervalles de confiance
+        mean_tpr = np.mean(tprs, axis=0)
+        mean_tpr[-1] = 1.0
+        mean_auc = sk_auc(mean_fpr, mean_tpr)
+        std_auc = np.std(aucs)
+
+        # Calcul des intervalles de confiance (± 1 écart type)
+        tprs_upper = np.minimum(mean_tpr + np.std(tprs, axis=0), 1)
+        tprs_lower = np.maximum(mean_tpr - np.std(tprs, axis=0), 0)
+
+        # Tracé de la courbe ROC moyenne
+        plt.figure()
+        plt.plot(
+            mean_fpr,
+            mean_tpr,
+            color="b",
+            label=r"Mean ROC (AUC = %0.2f $\pm$ %0.2f)" % (mean_auc, std_auc),
+            lw=2,
+            alpha=0.8,
+        )
+
+        # Remplissage de l'intervalle de confiance autour de la courbe ROC moyenne
+        plt.fill_between(
+            mean_fpr,
+            tprs_lower,
+            tprs_upper,
+            color="grey",
+            alpha=0.2,
+            label=r"$\pm$ 1 std. dev.",
+        )
+
+        # Diagonale de référence
+        plt.plot([0, 1], [0, 1], linestyle="--", lw=2, color="r", alpha=0.8)
+
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title("Receiver Operating Characteristic")
+        plt.legend(loc="lower right")
+        plt.show()
+
+    def run(self, random_state=VAL_SEED, verbose=True):
+        """
+        Exécute le modèle avec sélection de features RFECV et suivi via MLflow.
+
+        Cette méthode effectue une exécution complète du pipeline de sélection de features avec RFECV,
+        enregistre le run dans MLflow et trace les résultats. Elle permet également de contrôler la
+        répartition des features sélectionnées et d'obtenir les résultats de la permutation.
+
+        Args:
+            random_state (int, optional): La valeur de la graine pour la reproductibilité. Par défaut VAL_SEED.
+            verbose (bool, optional): Si True, affiche des informations détaillées pendant l'exécution. Par défaut True.
+
+        Returns:
+            None
+        """
+        self.model = skLogisticRegression(
+            max_iter=self.max_iter,
+            n_jobs=-1,
+            tol=0.001,
+            solver=self.solver,
+            random_state=self.random_state,
+            **self.params_model,
+        )
+        print(f"Sélection de features RFECV sur {self.device.upper()}\n")
+
+        with mlflow.start_run(
+            experiment_id=self._mlflow_id,
+            run_name=f"Permutation",
+        ) as run:
+            self._run_id = run.info.run_id
+            """all_params = {**self.params_model, **self.params_other}
+            mlflow.log_params(all_params)"""
+
+            self._useless_features = []
+            self._features_to_drop = []
+
+            """# Pour loguer le dataset
+            self.create_mlflow_dataset()
+            self.track_dataset()"""
+
+            predictors = [
+                f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]
+            ]
+            binary_predictors = get_binary_features(self.X[predictors])
+            num_predictors = [f for f in predictors if f not in binary_predictors]
+            preprocessor = skColumnTransformer(
+                transformers=[
+                    ("num", self.num_preprocess, binary_predictors),
+                    ("bin", self.binary_preprocess, num_predictors),
+                ]
+            ).set_output(transform="pandas")
+            full_pipeline = skPipeline(
+                steps=[
+                    ("preprocessor", preprocessor),
+                    (
+                        "feature_selection",
+                        RFECV(
+                            estimator=self.model,
+                            cv=self.n_folds,
+                            scoring="roc_auc",
+                            n_jobs=self.n_jobs,
+                        ),
+                    ),
+                ]
+            ).set_output(transform="pandas")
+
+            full_pipeline.fit(self.X[predictors], self.y)
+            rfecv = full_pipeline.named_steps["feature_selection"]
+            self._rfecv = rfecv
+            print("Nombre optimal de features : %d" % rfecv.n_features_)
+            support_df = pd.Series(rfecv.support_, index=predictors)
+            self._useless_features = support_df[support_df == False].index.to_list()
+            print(f"{len(self._useless_features)} features sont inutiles :")
+            print(self._useless_features)
+            """print("Support des features : ", rfecv.support_)
+            print(support_df)
+            print("Ranking des features : ", rfecv.ranking_)"""
+        return  # useless_features
+
+    def get_dropped_in_n_folds(self, n_folds=None, verbose=True):
+        if not n_folds:
+            n_folds = self.n_folds
+            str_n_folds = f"les {n_folds} folds :"
+        elif n_folds > self.n_folds:
+            print(f"Le nombre de folds indiqué ({n_folds}) doit être <= {self.n_folds}")
+            return
+        else:
+            str_n_folds = f"au moins {n_folds} folds :"
+
+        ################# Preprocessing
+        feature_counter_preprocess = Counter(
+            f for fold in self._dropped_features_preprocess for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les variances nulles
+        dict_dropped_preprocessed = defaultdict(list)
+        for feature, count in feature_counter_preprocess.items():
+            dict_dropped_preprocessed[count].append(feature)
+        dict_dropped_preprocessed = dict(dict_dropped_preprocessed)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_preprocessed.items() if k >= n_folds]
+        list_to_drop_preprocess = []
+        for fold in list_n_folds:
+            list_to_drop_preprocess += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_preprocess)} features Supprimées lors du préprocessing sur {str_n_folds}"
+            )
+            print(list_to_drop_preprocess)
+
+        ############### Corrélations
+        feature_counter_corr = Counter(
+            f for fold in self._too_correlated_features for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les corrélations
+        dict_dropped_corr = defaultdict(list)
+        for feature, count in feature_counter_corr.items():
+            dict_dropped_corr[count].append(feature)
+        dict_dropped_corr = dict(dict_dropped_corr)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_corr.items() if k >= n_folds]
+        list_to_drop_corr = []
+        for fold in list_n_folds:
+            list_to_drop_corr += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_corr)} features Supprimées lors des corrélations sur {str_n_folds}"
+            )
+            print(list_to_drop_corr)
+
+        ############### Permutations
+        feature_counter_permut = Counter(
+            f for fold in self._useless_features for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les corrélations
+        dict_dropped_permut = defaultdict(list)
+        for feature, count in feature_counter_permut.items():
+            dict_dropped_permut[count].append(feature)
+        dict_dropped_permut = dict(dict_dropped_permut)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_permut.items() if k >= n_folds]
+        list_to_drop_permut = []
+        for fold in list_n_folds:
+            list_to_drop_permut += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_permut)} features Supprimées lors de la permutation sur {str_n_folds}"
+            )
+            print(list_to_drop_permut)
+
+        # Les features à supprimer globalement sont celles qui ont été supprimées dans tous les folds pour tous les steps
+        list_to_drop = list_to_drop_preprocess + list_to_drop_corr + list_to_drop_permut
+        if verbose:
+            print(f"Globalement, nous pouvons supprimer {len(list_to_drop)} features :")
+            print(list_to_drop)
+        return list_to_drop
+
+    def drop_useless_features(self, verbose=True):
+        if self._useless_features:
+            to_drop = [
+                f for f in self._useless_features if f in self.X.columns.tolist()
+            ]
+            self.X = self.X.drop(to_drop, axis=1)
+            if verbose:
+                print(f"{len(to_drop)} features supprimées")
+                memory_consumed_mb = get_memory_consumed(self.X, verbose=False)
+                print(
+                    f"Forme de X : {self.X.shape}, type : {type(self.X)}, conso mémoire : {memory_consumed_mb:.0f} Mo"
+                )
+
+
 class ExpPermutation(ExpMlFlow):
     def __init__(
         self,
@@ -1367,7 +1891,13 @@ class ExpPermutation(ExpMlFlow):
                 f for f in self.X.columns if f not in ["TARGET", "SK_ID_CURR"]
             ]
 
-            X_tmp = self.X[predictors[:2]].to_numpy()
+            predictors_without_nan = [
+                f for f in predictors if self.X[f].isna().sum() == 0
+            ]
+
+            X_tmp = self.X[["SK_ID_CURR", predictors_without_nan[0]]].to_numpy(
+                copy=True
+            )
             y_tmp = self.y.to_pandas()
 
             folds = StratifiedKFold(
@@ -1492,6 +2022,1329 @@ class ExpPermutation(ExpMlFlow):
                 print(
                     f"Forme de X : {self.X.shape}, type : {type(self.X)}, conso mémoire : {memory_consumed_mb:.0f} Mo"
                 )
+
+
+class ExpPermutImportance_old(ExpMlFlow):
+    def __init__(
+        self,
+        score_before,
+        model_name="logreg",
+        # threshold_prob=0.5,
+        debug=False,
+    ):
+        super().__init__(task="permut", model_name=model_name, debug=debug)
+        self.params_model = LogisticRegression().get_params()
+        self.params_other = {
+            "threshold_prob": 0.5,
+            "balance": "none",
+            "sampling_strategy": 0,
+            "k_neighbors": 0,
+        }
+        # Paramètres généraux
+        self.pipe_preprocess = None
+        self.X = None
+        self.y = None
+        self.n_folds = 4
+        self.meta.balance = self.params_other["balance"]
+        self.score_before = score_before
+        self._dropped_features_preprocess = []
+        self._new_scores = []
+        # Paramètres pour la suppression des features trop corrélées
+        self.drop_correlated_features = True
+        self.rcaf = True
+        self.exclude_from_corr = []
+        self.corr_method = "pearson"
+        self.threshold_corr = 0.9
+        self.threshold_dist = 0.1
+        self._too_correlated_features = []
+        # Paramètres pour la permutation
+        self.metric = "auc"
+        self.n_repeat = 5
+        self.threshold_importance = 0
+        self.exclude_from_permut = []
+        self._useless_features = []
+        self._usefull_features = []
+
+        # liste de n_folds listes de features à supprimer
+        self._features_to_drop = []
+        self._run_id = None
+        # self.threshold_prob = threshold_prob
+
+    def run(self, random_state=VAL_SEED, verbose=True):
+        print(
+            f"Sélection de features par permutation importance sur {self.device.upper()}\n"
+        )
+
+        with mlflow.start_run(
+            experiment_id=self._mlflow_id,
+            run_name=f"Permutation",
+        ) as run:
+            self._run_id = run.info.run_id
+            all_params = {**self.params_model, **self.params_other}
+            mlflow.log_params(all_params)
+
+            self._useless_features = []
+            self._features_to_drop = []
+
+            """# Pour loguer le dataset
+            self.create_mlflow_dataset()
+            self.track_dataset()"""
+
+            predictors = [
+                f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]
+            ]
+
+            # On construit la liste des folds avec des index en position relative
+            folds_list = cu_build_folds_list(
+                n_folds=self.n_folds,
+                X=self.X[predictors],
+                y=self.y,
+                random_state=VAL_SEED,
+            )
+
+            # Le dictionnaire contenant les résultats contient une clef pour chaque feature.
+            # Les valeurs sont les listes des importances (une importance par fold)
+            """dic_importances = {col: [] for col in predictors}
+            baseline_scores = []"""
+
+            for i_fold, (train_idx, valid_idx) in enumerate(folds_list):
+                print(f"Fold {i_fold}...")
+                X_train = self.X[predictors].iloc[train_idx]
+                X_val = self.X[predictors].iloc[valid_idx]
+                y_train = self.y.iloc[train_idx]
+                y_val = self.y.iloc[valid_idx]
+
+                X_train_balanced, y_train_balanced, X_val_processed = (
+                    pre_process_1_fold(
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_val=X_val,
+                        pipe_preprocess=self.pipe_preprocess,
+                        balance=self.params_other["balance"],
+                        k_neighbors=self.params_other["k_neighbors"],
+                        sampling_strategy=self.params_other["sampling_strategy"],
+                    )
+                )
+                # Lors du pipe de preprocess, des colonnes ont pu être supprimées à cause d'une variance nulle, on les retient
+                self._dropped_features_preprocess.append(
+                    [
+                        f
+                        for f in X_train_balanced.columns.to_list()
+                        if f not in predictors
+                    ]
+                )
+
+                # Suppression des variables trop corrélées entre elles
+                if self.drop_correlated_features:
+                    # print("Suppression des features redondantes...")
+                    corr_selector = CuCorrSelector(
+                        exclude=self.exclude_from_corr,
+                        method=self.corr_method,
+                        rcaf=self.rcaf,
+                        threshold_corr=self.threshold_corr,
+                        threshold_dist=self.threshold_dist,
+                    )
+                    X_train_balanced = corr_selector.fit_transform(
+                        X_train_balanced, y_train
+                    )
+                    X_val_processed = corr_selector.transform(X_val_processed)
+
+                # On retient les features droppées à cause d'une trop grande corrélation
+                self._too_correlated_features.append(corr_selector._features_to_drop)
+
+                if self.meta.model_name == "logreg":
+                    clf = LogisticRegression(**self.params_model)
+                    clf.fit(X_train_balanced, y_train_balanced)
+                    permut_device = "cuda"
+                else:
+                    X_train_balanced = X_train_balanced.to_pandas()
+                    y_train_balanced = y_train_balanced.to_pandas()
+                    X_val_processed = X_val_processed.to_pandas()
+                    y_val = y_val.to_pandas()
+                    permut_device = "cpu"
+                    # clf = LGBMClassifier(**{**self.params_model, **hyperparams})
+                    clf = LGBMClassifier(**self.params_model)
+                    metrics = {}
+                    callbacks = [
+                        lgb.early_stopping(stopping_rounds=20),
+                        lgb.log_evaluation(period=50),
+                        lgb.record_evaluation(metrics),
+                    ]
+                    # print("Fit")
+                    clf.fit(
+                        X_train_balanced,
+                        y_train_balanced,
+                        eval_set=[
+                            (X_train_balanced, y_train_balanced),
+                            (X_val_processed, y_val),
+                        ],
+                        eval_metric={"auc"},
+                        # verbose=200,
+                        callbacks=callbacks,
+                    )
+
+                ################
+                permutation_selector = PermutSelector(
+                    fitted_model=clf,
+                    metric=self.metric,
+                    device=permut_device,
+                    threshold_prob=self.params_other["threshold_prob"],
+                    threshold_importance=self.threshold_importance,
+                    n_repeat=self.n_repeat,
+                    exclude=self.exclude_from_permut,
+                    random_state=self.random_state,
+                )
+
+                permutation_selector.fit(
+                    X=X_train_balanced, X_val=X_val_processed, y_val=y_val
+                )
+
+                # On retient les features à dropper par permutation importance
+                self._useless_features.append(permutation_selector.useless_features_)
+                self._usefull_features.append(
+                    permutation_selector.get_feature_names_out()
+                )
+
+                # On score sur le dataset obtenu
+                # On supprime réellement les features et on fitte sur le nouveau jeu
+                X_train_balanced = permutation_selector.transform(
+                    X=X_train_balanced, X_val=X_val_processed
+                )
+                # X_val_processed = X_val_processed.loc[:, X_train_balanced.columns].copy()
+                X_val_processed = X_val_processed.drop(
+                    permutation_selector.useless_features_, axis=1
+                )
+                if self.meta.model_name == "logreg":
+                    clf.fit(X_train_balanced, y_train_balanced)
+                    y_score_val = clf.predict_proba(X_val_processed)[1]
+                    # Mesure sur le jeu de validation avec les colonnes supprimées
+                    new_auc_score = cu_roc_auc_score(y_val, y_score_val)
+                else:
+                    clf.fit(
+                        X_train_balanced,
+                        y_train_balanced,
+                        eval_set=[
+                            (X_train_balanced, y_train_balanced),
+                            (X_val_processed, y_val),
+                        ],
+                        eval_metric={"auc"},
+                        # verbose=200,
+                        callbacks=callbacks,
+                    )
+                    y_score_val = clf.predict_proba(
+                        X_val_processed, num_iteration=clf.best_iteration_
+                    )[:, 1]
+                    # Mesure sur le jeu de validation avec les colonnes supprimées
+                    new_auc_score = sk_roc_auc_score(y_val, y_score_val)
+
+                self._new_scores.append(new_auc_score)
+
+                self._features_to_drop.append(
+                    permutation_selector.useless_features_
+                    + corr_selector._features_to_drop
+                )
+
+                del X_train
+                del X_train_balanced
+                del y_train
+                del y_train_balanced
+                del X_val
+                del X_val_processed
+                del y_val
+                gc.collect()
+
+                print()
+                #######################
+
+            print("\nTous les folds...")
+            to_drop_in_all_folds = self.get_dropped_in_n_folds()
+            mean_new_scores = np.mean(self._new_scores)
+            print()
+            print(f"Score {self.metric} avant Permutation : {self.score_before}")
+            print(
+                f"Score {self.metric} moyen sur {self.n_folds} folds après permutation pour chaque fold : {mean_new_scores}"
+            )
+            if mean_new_scores >= self.score_before:
+                print(f"La permutation est profitable")
+            else:
+                print("La permutation n'est pas profitable")
+
+            print()
+            i_fold = 0
+            """while i_fold < self.n_folds:
+                i_fold += 1
+                print(f"En enlevant seulement les inutiles sur {i_fold} folds :")
+                X_train = self.X[
+                    ["SK_ID_CURR"] + self.get_dropped_in_n_folds(i_fold)
+                ].copy()
+                scores = cuml_cross_evaluate(
+                    X_train,
+                    self.pipe_preprocess,
+                    clf,
+                    self.meta.balance,
+                    k_neighbors=self.params_other["k_neighbors"],
+                    y_train_and_val=self.y,
+                    train_scores=False,
+                    threshold_prob=self.params_other["threshold_prob"],
+                    n_folds=self.n_folds,
+                    random_state=self.random_state,
+                )
+                mean_scores = {k: np.mean(v) for (k, v) in scores.items()}
+                print("auc :", mean_scores[self.metric])"""
+
+            del clf
+            gc.collect()
+            # print(f"{len(useless_features)} features sont inutiles :")
+            # print(useless_features)
+        return  # useless_features
+
+    def get_dropped_in_n_folds(self, n_folds=None, verbose=True):
+        if not n_folds:
+            n_folds = self.n_folds
+            str_n_folds = f"les {n_folds} folds :"
+        elif n_folds > self.n_folds:
+            print(f"Le nombre de folds indiqué ({n_folds}) doit être <= {self.n_folds}")
+            return
+        else:
+            str_n_folds = f"au moins {n_folds} folds :"
+
+        ################# Preprocessing
+        feature_counter_preprocess = Counter(
+            f for fold in self._dropped_features_preprocess for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les variances nulles
+        dict_dropped_preprocessed = defaultdict(list)
+        for feature, count in feature_counter_preprocess.items():
+            dict_dropped_preprocessed[count].append(feature)
+        dict_dropped_preprocessed = dict(dict_dropped_preprocessed)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_preprocessed.items() if k >= n_folds]
+        list_to_drop_preprocess = []
+        for fold in list_n_folds:
+            list_to_drop_preprocess += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_preprocess)} features Supprimées lors du préprocessing sur {str_n_folds}"
+            )
+            print(list_to_drop_preprocess)
+
+        ############### Corrélations
+        feature_counter_corr = Counter(
+            f for fold in self._too_correlated_features for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les corrélations
+        dict_dropped_corr = defaultdict(list)
+        for feature, count in feature_counter_corr.items():
+            dict_dropped_corr[count].append(feature)
+        dict_dropped_corr = dict(dict_dropped_corr)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_corr.items() if k >= n_folds]
+        list_to_drop_corr = []
+        for fold in list_n_folds:
+            list_to_drop_corr += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_corr)} features Supprimées lors des corrélations sur {str_n_folds}"
+            )
+            print(list_to_drop_corr)
+
+        ############### Permutations
+        feature_counter_permut = Counter(
+            f for fold in self._useless_features for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les corrélations
+        dict_dropped_permut = defaultdict(list)
+        for feature, count in feature_counter_permut.items():
+            dict_dropped_permut[count].append(feature)
+        dict_dropped_permut = dict(dict_dropped_permut)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_permut.items() if k >= n_folds]
+        list_to_drop_permut = []
+        for fold in list_n_folds:
+            list_to_drop_permut += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_permut)} features Supprimées lors de la permutation sur {str_n_folds}"
+            )
+            print(list_to_drop_permut)
+
+        # Les features à supprimer globalement sont celles qui ont été supprimées dans tous les folds pour tous les steps
+        list_to_drop = list_to_drop_preprocess + list_to_drop_corr + list_to_drop_permut
+        if verbose:
+            print(f"Globalement, nous pouvons supprimer {len(list_to_drop)} features :")
+            print(list_to_drop)
+        return list_to_drop
+
+    def drop_useless_features(self, verbose=True):
+        if self._useless_features:
+            to_drop = [
+                f for f in self._useless_features if f in self.X.columns.tolist()
+            ]
+            self.X = self.X.drop(to_drop, axis=1)
+            if verbose:
+                print(f"{len(to_drop)} features supprimées")
+                memory_consumed_mb = get_memory_consumed(self.X, verbose=False)
+                print(
+                    f"Forme de X : {self.X.shape}, type : {type(self.X)}, conso mémoire : {memory_consumed_mb:.0f} Mo"
+                )
+
+
+class ExpPermutImportance(ExpMlFlow):
+    def __init__(
+        self,
+        score_before,
+        model_name="logreg",
+        # threshold_prob=0.5,
+        debug=False,
+    ):
+        super().__init__(task="permut", model_name=model_name, debug=debug)
+        self.params_model = LogisticRegression().get_params()
+        self.params_other = {
+            "threshold_prob": 0.5,
+            "balance": "none",
+            "sampling_strategy": 0,
+            "k_neighbors": 0,
+        }
+        # Paramètres généraux
+        self.pipe_preprocess = None
+        self.X = None
+        self.y = None
+        self.n_folds = 4
+        self.meta.balance = self.params_other["balance"]
+        self.score_before = score_before
+        self._dropped_features_preprocess = []
+        self._new_scores = []
+        # Paramètres pour la suppression des features trop corrélées
+        self.drop_correlated_features = True
+        self.rcaf = True
+        self.exclude_from_corr = []
+        self.corr_method = "pearson"
+        self.threshold_corr = 0.9
+        self.threshold_dist = 0.1
+        self._too_correlated_features = []
+        # Paramètres pour la permutation
+        self.metric = "auc"
+        self.n_repeat = 5
+        self.threshold_importance = 0
+        self.exclude_from_permut = []
+        self._useless_features = []
+        self._usefull_features = []
+
+        # liste de n_folds listes de features à supprimer
+        self._features_to_drop = []
+        self._run_id = None
+        # self.threshold_prob = threshold_prob
+
+    def run(self, random_state=VAL_SEED, verbose=True):
+        print(
+            f"Sélection de features par permutation importance sur {self.device.upper()}\n"
+        )
+
+        with mlflow.start_run(
+            experiment_id=self._mlflow_id,
+            run_name=f"Permutation",
+        ) as run:
+            self._run_id = run.info.run_id
+            all_params = {**self.params_model, **self.params_other}
+            mlflow.log_params(all_params)
+
+            self._useless_features = []
+            self._features_to_drop = []
+
+            """# Pour loguer le dataset
+            self.create_mlflow_dataset()
+            self.track_dataset()"""
+
+            predictors = [
+                f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]
+            ]
+
+            # On construit la liste des folds avec des index en position relative
+            folds_list = cu_build_folds_list(
+                n_folds=self.n_folds,
+                X=self.X[predictors],
+                y=self.y,
+                random_state=VAL_SEED,
+            )
+
+            # Le dictionnaire contenant les résultats contient une clef pour chaque feature.
+            # Les valeurs sont les listes des importances (une importance par fold)
+            """dic_importances = {col: [] for col in predictors}
+            baseline_scores = []"""
+
+            for i_fold, (train_idx, valid_idx) in enumerate(folds_list):
+                print(f"Fold {i_fold}...")
+                X_train = self.X[predictors].iloc[train_idx]
+                X_val = self.X[predictors].iloc[valid_idx]
+                y_train = self.y.iloc[train_idx]
+                y_val = self.y.iloc[valid_idx]
+
+                X_train_balanced, y_train_balanced, X_val_processed = (
+                    pre_process_1_fold(
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_val=X_val,
+                        pipe_preprocess=self.pipe_preprocess,
+                        balance=self.params_other["balance"],
+                        k_neighbors=self.params_other["k_neighbors"],
+                        sampling_strategy=self.params_other["sampling_strategy"],
+                    )
+                )
+                # Lors du pipe de preprocess, des colonnes ont pu être supprimées à cause d'une variance nulle, on les retient
+                self._dropped_features_preprocess.append(
+                    [
+                        f
+                        for f in X_train_balanced.columns.to_list()
+                        if f not in predictors
+                    ]
+                )
+
+                # Suppression des variables trop corrélées entre elles
+                if self.drop_correlated_features:
+                    # print("Suppression des features redondantes...")
+                    corr_selector = CuCorrSelector(
+                        exclude=self.exclude_from_corr,
+                        method=self.corr_method,
+                        rcaf=self.rcaf,
+                        threshold_corr=self.threshold_corr,
+                        threshold_dist=self.threshold_dist,
+                    )
+                    X_train_balanced = corr_selector.fit_transform(
+                        X_train_balanced, y_train
+                    )
+                    X_val_processed = corr_selector.transform(X_val_processed)
+
+                # On retient les features droppées à cause d'une trop grande corrélation
+                self._too_correlated_features.append(corr_selector._features_to_drop)
+
+                if self.meta.model_name == "logreg":
+                    clf = LogisticRegression(**self.params_model)
+                else:
+
+                    clf = WrapperLgbForCuda(
+                        X_val=X_val_processed,
+                        y_val=y_val,
+                        params_model=self.params_model,
+                    )
+                clf.fit(X_train_balanced, y_train_balanced)
+
+                ################
+                permutation_selector = CuPermutSelector(
+                    fitted_model=clf,
+                    metric=self.metric,
+                    threshold_prob=self.params_other["threshold_prob"],
+                    threshold_importance=self.threshold_importance,
+                    n_repeat=self.n_repeat,
+                    exclude=self.exclude_from_permut,
+                    random_state=self.random_state,
+                )
+
+                permutation_selector.fit(
+                    X=X_train_balanced, X_val=X_val_processed, y_val=y_val
+                )
+
+                # On retient les features à dropper par permutation importance
+                self._useless_features.append(permutation_selector.useless_features_)
+                self._usefull_features.append(
+                    permutation_selector.get_feature_names_out()
+                )
+
+                # On score sur le dataset obtenu
+                # On supprime réellement les features et on fitte sur le nouveau jeu
+                X_train_balanced = permutation_selector.transform(
+                    X=X_train_balanced, X_val=X_val_processed
+                )
+                # X_val_processed = X_val_processed.loc[:, X_train_balanced.columns].copy()
+                X_val_processed = X_val_processed.drop(
+                    permutation_selector.useless_features_, axis=1
+                )
+                if self.meta.model_name == "logreg":
+                    clf = LogisticRegression(**self.params_model)
+                else:
+                    clf = WrapperLgbForCuda(
+                        X_val=X_val_processed,
+                        y_val=y_val,
+                        params_model=self.params_model,
+                    )
+                clf.fit(X_train_balanced, y_train_balanced)
+                y_score_val = clf.predict_proba(X_val_processed)[1]
+                # Mesure sur le jeu de validation avec les colonnes supprimées
+                new_auc_score = cu_roc_auc_score(y_val, y_score_val)
+
+                self._new_scores.append(new_auc_score)
+
+                self._features_to_drop.append(
+                    permutation_selector.useless_features_
+                    + corr_selector._features_to_drop
+                )
+
+                del X_train
+                del X_train_balanced
+                del y_train
+                del y_train_balanced
+                del X_val
+                del X_val_processed
+                del y_val
+                gc.collect()
+
+                print()
+                #######################
+
+            print("\nTous les folds...")
+            to_drop_in_all_folds = self.get_dropped_in_n_folds()
+            mean_new_scores = np.mean(self._new_scores)
+            print()
+            print(f"Score {self.metric} avant Permutation : {self.score_before}")
+            print(
+                f"Score {self.metric} moyen sur {self.n_folds} folds après permutation pour chaque fold : {mean_new_scores}"
+            )
+            if mean_new_scores >= self.score_before:
+                print(f"La permutation est profitable")
+            else:
+                print("La permutation n'est pas profitable")
+
+            print()
+            i_fold = 0
+            while i_fold < self.n_folds:
+                i_fold += 1
+                """print(f"En enlevant seulement les inutiles sur {i_fold} folds :")
+                X_train = self.X[
+                    ["SK_ID_CURR"] + self.get_dropped_in_n_folds(i_fold)
+                ].copy()
+                scores = cuml_cross_evaluate(
+                    X_train,
+                    self.pipe_preprocess,
+                    clf,
+                    self.meta.balance,
+                    k_neighbors=self.params_other["k_neighbors"],
+                    y_train_and_val=self.y,
+                    train_scores=False,
+                    threshold_prob=self.params_other["threshold_prob"],
+                    n_folds=self.n_folds,
+                    random_state=self.random_state,
+                )
+                mean_scores = {k: np.mean(v) for (k, v) in scores.items()}
+                print("auc :", mean_scores[self.metric])"""
+                to_drop = self.get_dropped_in_n_folds(i_fold, verbose=False)
+                print(f"{len(to_drop)} features inutiles sur au moins {i_fold} folds :")
+                print(to_drop)
+
+            del clf
+            gc.collect()
+            # print(f"{len(useless_features)} features sont inutiles :")
+            # print(useless_features)
+        return  # useless_features
+
+    def get_dropped_in_n_folds(self, n_folds=None, verbose=True):
+        if not n_folds:
+            n_folds = self.n_folds
+            str_n_folds = f"les {n_folds} folds :"
+        elif n_folds > self.n_folds:
+            print(f"Le nombre de folds indiqué ({n_folds}) doit être <= {self.n_folds}")
+            return
+        else:
+            str_n_folds = f"au moins {n_folds} folds :"
+
+        ################# Preprocessing
+        feature_counter_preprocess = Counter(
+            f for fold in self._dropped_features_preprocess for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les variances nulles
+        dict_dropped_preprocessed = defaultdict(list)
+        for feature, count in feature_counter_preprocess.items():
+            dict_dropped_preprocessed[count].append(feature)
+        dict_dropped_preprocessed = dict(dict_dropped_preprocessed)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_preprocessed.items() if k >= n_folds]
+        list_to_drop_preprocess = []
+        for fold in list_n_folds:
+            list_to_drop_preprocess += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_preprocess)} features Supprimées lors du préprocessing sur {str_n_folds}"
+            )
+            print(list_to_drop_preprocess)
+
+        ############### Corrélations
+        feature_counter_corr = Counter(
+            f for fold in self._too_correlated_features for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les corrélations
+        dict_dropped_corr = defaultdict(list)
+        for feature, count in feature_counter_corr.items():
+            dict_dropped_corr[count].append(feature)
+        dict_dropped_corr = dict(dict_dropped_corr)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_corr.items() if k >= n_folds]
+        list_to_drop_corr = []
+        for fold in list_n_folds:
+            list_to_drop_corr += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_corr)} features Supprimées lors des corrélations sur {str_n_folds}"
+            )
+            print(list_to_drop_corr)
+
+        ############### Permutations
+        feature_counter_permut = Counter(
+            f for fold in self._useless_features for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les corrélations
+        dict_dropped_permut = defaultdict(list)
+        for feature, count in feature_counter_permut.items():
+            dict_dropped_permut[count].append(feature)
+        dict_dropped_permut = dict(dict_dropped_permut)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_permut.items() if k >= n_folds]
+        list_to_drop_permut = []
+        for fold in list_n_folds:
+            list_to_drop_permut += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_permut)} features Supprimées lors de la permutation sur {str_n_folds}"
+            )
+            print(list_to_drop_permut)
+
+        # Les features à supprimer globalement sont celles qui ont été supprimées dans tous les folds pour tous les steps
+        list_to_drop = list_to_drop_preprocess + list_to_drop_corr + list_to_drop_permut
+        if verbose:
+            print(f"Globalement, nous pouvons supprimer {len(list_to_drop)} features :")
+            print(list_to_drop)
+        return list_to_drop
+
+    def drop_useless_features(self, verbose=True):
+        if self._useless_features:
+            to_drop = [
+                f for f in self._useless_features if f in self.X.columns.tolist()
+            ]
+            self.X = self.X.drop(to_drop, axis=1)
+            if verbose:
+                print(f"{len(to_drop)} features supprimées")
+                memory_consumed_mb = get_memory_consumed(self.X, verbose=False)
+                print(
+                    f"Forme de X : {self.X.shape}, type : {type(self.X)}, conso mémoire : {memory_consumed_mb:.0f} Mo"
+                )
+
+
+class PermutLogReg(ExpMlFlow):
+    def __init__(
+        self,
+        score_before,
+        model_name="logreg",
+        # threshold_prob=0.5,
+        debug=False,
+    ):
+        super().__init__(task="permut", model_name=model_name, debug=debug)
+        self.params_model = LogisticRegression().get_params()
+        self.params_other = {
+            "threshold_prob": 0.5,
+            "balance": "none",
+            "sampling_strategy": 0,
+            "k_neighbors": 0,
+        }
+        # Paramètres généraux
+        self.pipe_preprocess = None
+        self.X = None
+        self.y = None
+        self.n_folds = 4
+        self.meta.balance = self.params_other["balance"]
+        self.score_before = score_before
+        self._dropped_features_preprocess = []
+        self._new_scores = []
+        # Paramètres pour la suppression des features trop corrélées
+        self.drop_correlated_features = True
+        self.rcaf = True
+        self.exclude_from_corr = []
+        self.corr_method = "pearson"
+        self.threshold_corr = 0.9
+        self.threshold_dist = 0.1
+        self._too_correlated_features = []
+        # Paramètres pour la permutation
+        self.metric = "auc"
+        self.n_repeat = 5
+        self.threshold_importance = 0
+        self.exclude_from_permut = []
+        self._useless_features = []
+        self._usefull_features = []
+
+        # liste de n_folds listes de features à supprimer
+        self._features_to_drop = []
+        self._run_id = None
+        # self.threshold_prob = threshold_prob
+
+    def run(self, random_state=VAL_SEED, verbose=True):
+        print(
+            f"Sélection de features par permutation importance sur {self.device.upper()}\n"
+        )
+
+        with mlflow.start_run(
+            experiment_id=self._mlflow_id,
+            run_name=f"Permutation",
+        ) as run:
+            self._run_id = run.info.run_id
+            all_params = {**self.params_model, **self.params_other}
+            mlflow.log_params(all_params)
+
+            self._useless_features = []
+            self._features_to_drop = []
+
+            """# Pour loguer le dataset
+            self.create_mlflow_dataset()
+            self.track_dataset()"""
+
+            predictors = [
+                f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]
+            ]
+
+            # On construit la liste des folds avec des index en position relative
+            folds_list = cu_build_folds_list(
+                n_folds=self.n_folds,
+                X=self.X[predictors],
+                y=self.y,
+                random_state=VAL_SEED,
+            )
+
+            # Le dictionnaire contenant les résultats contient une clef pour chaque feature.
+            # Les valeurs sont les listes des importances (une importance par fold)
+            """dic_importances = {col: [] for col in predictors}
+            baseline_scores = []"""
+
+            for i_fold, (train_idx, valid_idx) in enumerate(folds_list):
+                print(f"Fold {i_fold}...")
+                X_train = self.X[predictors].iloc[train_idx]
+                X_val = self.X[predictors].iloc[valid_idx]
+                y_train = self.y.iloc[train_idx]
+                y_val = self.y.iloc[valid_idx]
+
+                X_train_balanced, y_train_balanced, X_val_processed = (
+                    pre_process_1_fold(
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_val=X_val,
+                        pipe_preprocess=self.pipe_preprocess,
+                        balance=self.params_other["balance"],
+                        k_neighbors=self.params_other["k_neighbors"],
+                        sampling_strategy=self.params_other["sampling_strategy"],
+                    )
+                )
+                # Lors du pipe de preprocess, des colonnes ont pu être supprimées à cause d'une variance nulle, on les retient
+                self._dropped_features_preprocess.append(
+                    [
+                        f
+                        for f in X_train_balanced.columns.to_list()
+                        if f not in predictors
+                    ]
+                )
+
+                # Suppression des variables trop corrélées entre elles
+                if self.drop_correlated_features:
+                    # print("Suppression des features redondantes...")
+                    corr_selector = CuCorrSelector(
+                        exclude=self.exclude_from_corr,
+                        method=self.corr_method,
+                        rcaf=self.rcaf,
+                        threshold_corr=self.threshold_corr,
+                        threshold_dist=self.threshold_dist,
+                    )
+                    X_train_balanced = corr_selector.fit_transform(
+                        X_train_balanced, y_train
+                    )
+                    X_val_processed = corr_selector.transform(X_val_processed)
+
+                # On retient les features droppées à cause d'une trop grande corrélation
+                self._too_correlated_features.append(corr_selector._features_to_drop)
+
+                clf = LogisticRegression(**self.params_model)
+                clf.fit(X_train_balanced, y_train_balanced)
+
+                ################
+                permutation_selector = CuPermutSelector(
+                    fitted_model=clf,
+                    metric=self.metric,
+                    threshold_prob=self.params_other["threshold_prob"],
+                    threshold_importance=self.threshold_importance,
+                    n_repeat=self.n_repeat,
+                    exclude=self.exclude_from_permut,
+                    random_state=self.random_state,
+                )
+
+                permutation_selector.fit(
+                    X=X_train_balanced, X_val=X_val_processed, y_val=y_val
+                )
+
+                # On retient les features à dropper par permutation importance
+                self._useless_features.append(permutation_selector.useless_features_)
+                self._usefull_features.append(
+                    permutation_selector.get_feature_names_out()
+                )
+
+                # On score sur le dataset obtenu
+                # On supprime réellement les features et on fitte sur le nouveau jeu
+                X_train_balanced = permutation_selector.transform(
+                    X=X_train_balanced, X_val=X_val_processed
+                )
+                # X_val_processed = X_val_processed.loc[:, X_train_balanced.columns].copy()
+                X_val_processed = X_val_processed.drop(
+                    permutation_selector.useless_features_, axis=1
+                )
+                clf.fit(X_train_balanced, y_train_balanced)
+                y_score_val = clf.predict_proba(X_val_processed)[1]
+                # Mesure sur le jeu de validation avec les colonnes supprimées
+                new_auc_score = cuml.metrics.roc_auc_score(y_val, y_score_val)
+                self._new_scores.append(new_auc_score)
+
+                self._features_to_drop.append(
+                    permutation_selector.useless_features_
+                    + corr_selector._features_to_drop
+                )
+
+                del X_train
+                del X_train_balanced
+                del y_train
+                del y_train_balanced
+                del X_val
+                del X_val_processed
+                del y_val
+                gc.collect()
+
+                print()
+                #######################
+
+            print("\nTous les folds...")
+            to_drop_in_all_folds = self.get_dropped_in_n_folds()
+            mean_new_scores = np.mean(self._new_scores)
+            print()
+            print(f"Score {self.metric} avant Permutation : {self.score_before}")
+            print(
+                f"Score {self.metric} moyen sur {self.n_folds} folds après permutation pour chaque fold : {mean_new_scores}"
+            )
+            if mean_new_scores >= self.score_before:
+                print(f"La permutation est profitable")
+            else:
+                print("La permutation n'est pas profitable")
+
+            print()
+            i_fold = 0
+            while i_fold < self.n_folds:
+                i_fold += 1
+                print(f"En enlevant seulement les inutiles sur {i_fold} folds :")
+                X_train = self.X[
+                    ["SK_ID_CURR"] + self.get_dropped_in_n_folds(i_fold)
+                ].copy()
+                scores = cuml_cross_evaluate(
+                    X_train,
+                    self.pipe_preprocess,
+                    clf,
+                    self.meta.balance,
+                    k_neighbors=self.params_other["k_neighbors"],
+                    y_train_and_val=self.y,
+                    train_scores=False,
+                    threshold_prob=self.params_other["threshold_prob"],
+                    n_folds=self.n_folds,
+                    random_state=self.random_state,
+                )
+                mean_scores = {k: np.mean(v) for (k, v) in scores.items()}
+                print("auc :", mean_scores[self.metric])
+
+            # on transforme en df, les features sont en colonnes et les folds en lignes
+            # importances = pd.DataFrame(dic_importances)
+
+            """# On loggue la liste des features de moindre importance, c'est à dire celles qui ont en moyenne un score inférieur ou égal à zéro
+            importances_mean = importances.mean()
+            useless_features = importances_mean[importances_mean <= 0].index.tolist()
+            self._useless_features = useless_features
+            dic_useless_features = {"useless_features": useless_features}
+            mlflow.log_dict(dic_useless_features, "useless_features.json")
+            # On logue les features utiles
+            usefull_features = importances_mean[importances_mean > 0].index.tolist()
+            self._usefull_features = usefull_features
+            dic_usefull_features = {"dic_usefull_features": usefull_features}
+            mlflow.log_dict(dic_usefull_features, "usefull_features.json")
+
+            # On logue la moyenne des AUC scores avant permutation
+            baseline_scores_mean = np.mean(baseline_scores)
+            mlflow.log_metric("baseline AUC mean", baseline_scores_mean)
+
+            # On logue le plot
+            fig = plot_permutation_importance(
+                importances,
+                f"Permutation importance sur {n_folds} folds\n{self.meta._name}\n",
+            )
+            if fig:
+                # On sauvegarde la figure (la précédente sera écrasée, c'est volontarire)
+                filepath = os.path.join(self.output_dir, "permutation.png")
+                fig.savefig(filepath)
+                # On loggue dans mlflow
+                mlflow.log_artifact(filepath)"""
+
+            del clf
+            gc.collect()
+            # print(f"{len(useless_features)} features sont inutiles :")
+            # print(useless_features)
+        return  # useless_features
+
+    def get_dropped_in_n_folds(self, n_folds=None, verbose=True):
+        if not n_folds:
+            n_folds = self.n_folds
+            str_n_folds = f"les {n_folds} folds :"
+        elif n_folds > self.n_folds:
+            print(f"Le nombre de folds indiqué ({n_folds}) doit être <= {self.n_folds}")
+            return
+        else:
+            str_n_folds = f"au moins {n_folds} folds :"
+
+        ################# Preprocessing
+        feature_counter_preprocess = Counter(
+            f for fold in self._dropped_features_preprocess for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les variances nulles
+        dict_dropped_preprocessed = defaultdict(list)
+        for feature, count in feature_counter_preprocess.items():
+            dict_dropped_preprocessed[count].append(feature)
+        dict_dropped_preprocessed = dict(dict_dropped_preprocessed)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_preprocessed.items() if k >= n_folds]
+        list_to_drop_preprocess = []
+        for fold in list_n_folds:
+            list_to_drop_preprocess += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_preprocess)} features Supprimées lors du préprocessing sur {str_n_folds}"
+            )
+            print(list_to_drop_preprocess)
+
+        ############### Corrélations
+        feature_counter_corr = Counter(
+            f for fold in self._too_correlated_features for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les corrélations
+        dict_dropped_corr = defaultdict(list)
+        for feature, count in feature_counter_corr.items():
+            dict_dropped_corr[count].append(feature)
+        dict_dropped_corr = dict(dict_dropped_corr)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_corr.items() if k >= n_folds]
+        list_to_drop_corr = []
+        for fold in list_n_folds:
+            list_to_drop_corr += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_corr)} features Supprimées lors des corrélations sur {str_n_folds}"
+            )
+            print(list_to_drop_corr)
+
+        ############### Permutations
+        feature_counter_permut = Counter(
+            f for fold in self._useless_features for f in fold
+        )
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds pour les corrélations
+        dict_dropped_permut = defaultdict(list)
+        for feature, count in feature_counter_permut.items():
+            dict_dropped_permut[count].append(feature)
+        dict_dropped_permut = dict(dict_dropped_permut)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_dropped_permut.items() if k >= n_folds]
+        list_to_drop_permut = []
+        for fold in list_n_folds:
+            list_to_drop_permut += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop_permut)} features Supprimées lors de la permutation sur {str_n_folds}"
+            )
+            print(list_to_drop_permut)
+
+        # Les features à supprimer globalement sont celles qui ont été supprimées dans tous les folds pour tous les steps
+        list_to_drop = list_to_drop_preprocess + list_to_drop_corr + list_to_drop_permut
+        if verbose:
+            print(f"Globalement, nous pouvons supprimer {len(list_to_drop)} features :")
+            print(list_to_drop)
+        return list_to_drop
+
+    def drop_useless_features(self, verbose=True):
+        if self._useless_features:
+            to_drop = [
+                f for f in self._useless_features if f in self.X.columns.tolist()
+            ]
+            self.X = self.X.drop(to_drop, axis=1)
+            if verbose:
+                print(f"{len(to_drop)} features supprimées")
+                memory_consumed_mb = get_memory_consumed(self.X, verbose=False)
+                print(
+                    f"Forme de X : {self.X.shape}, type : {type(self.X)}, conso mémoire : {memory_consumed_mb:.0f} Mo"
+                )
+
+
+class ExpCorrCv(ExpMlFlow):
+    def __init__(
+        self,
+        # cluster_corr pour similarité correlation, cluster_agglo pour agglomerative clustering direct
+        # model_name="cluster_corr",
+        debug=False,
+    ):
+        super().__init__(task="corrcv", model_name="all", debug=debug)
+        self.train_filename = "01_v1_train.csv"
+        self.pipe_preprocess = None
+        self.meta.balance = "none"
+        self.corr_coef = "spearman"
+        self.threshold_corr = 0.9
+        self.threshold_dist = 0.1
+        self.agglo_method = "complete"
+        self.X = None
+        self.y = None
+        # self.model_name = "corr"
+        # On regroupe sur une métrique basée sur la corrélation
+        self.metric = "1-|corr|"
+        self.meta.suffix1 = self.corr_coef
+        self.meta.suffix2 = self.metric
+        self.n_folds = 4
+        # self.meta.main_description = "Suppression des features trop corrélées 2 à 2"
+        self.meta.description2 = f"Méthode clustering : {self.agglo_method} - métrique : {self.metric} {self.corr_coef.upper()}"
+        self._features_correlated_above_threshold = None
+        self._features_to_drop = []
+        self._run_id = []
+
+    def run(self, verbose=True):
+        self._run_id = []
+        self._features_correlated_above_threshold = None
+        self._features_to_drop = []
+
+        predictors = [f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]]
+        predictors_without_nan = [f for f in predictors if self.X[f].isna().sum() == 0]
+
+        X_tmp = self.X[["SK_ID_CURR", predictors_without_nan[0]]].to_numpy(copy=True)
+        y_tmp = self.y.to_pandas()
+
+        folds = StratifiedKFold(
+            n_splits=self.n_folds,
+            shuffle=True,
+            random_state=self.random_state,
+        )
+
+        for i_fold, (train_idx_array, valid_idx_array) in enumerate(
+            folds.split(X_tmp, y_tmp), start=1
+        ):
+            with mlflow.start_run(
+                experiment_id=self._mlflow_id,
+                run_name=f"fold_{i_fold}",
+            ) as run:
+                self._run_id.append(run.info.run_id)
+                mlflow.log_params(
+                    {
+                        "corr_coef": self.corr_coef,
+                        "threshold_corr": self.threshold_corr,
+                        "threshold_dist": self.threshold_dist,
+                    }
+                )
+                if verbose:
+                    print(f"Fold {i_fold}/{self.n_folds}...")
+                train_idx = train_idx_array
+                valid_idx = valid_idx_array
+                t0_fit_time = time.time()
+                X_train = self.X[predictors].iloc[train_idx]
+                X_val = self.X[predictors].iloc[valid_idx]
+
+                y_train = self.y.iloc[train_idx]
+                y_val = self.y.iloc[valid_idx]
+
+                # print(f"\tPrétraitement")
+                pipe = deepcopy(self.pipe_preprocess)
+                X_train_processed = pipe.fit_transform(X_train)
+                X_val_processed = pipe.transform(X_val)
+
+                corr_matrix = build_rcaf_matrix(
+                    X_train_processed,
+                    y=y_train,
+                    method=self.corr_coef,
+                )
+                self.run_top_10_correlations(
+                    X_train_processed, corr_matrix, verbose=verbose
+                )
+                self.run_features_corr_above(
+                    X_train_processed, corr_matrix, verbose=verbose
+                )
+                self.run_redondant_features(X_train_processed, verbose=verbose)
+        # On crée un run pour tous les folds qui va compter le nombres de folds par features à supprimer
+        with mlflow.start_run(
+            experiment_id=self._mlflow_id,
+            run_name=f"all_folds",
+        ) as run:
+            self._run_id.append(run.info.run_id)
+            mlflow.log_params(
+                {
+                    "corr_coef": self.corr_coef,
+                    "threshold_corr": self.threshold_corr,
+                    "threshold_dist": self.threshold_dist,
+                    "n_folds": self.n_folds,
+                }
+            )
+            if verbose:
+                print("Tous les folds...")
+            features_to_drop_n_folds = self.get_to_drop_in_n_folds(verbose=verbose)
+
+            # On loggue la liste des features redondantes dans mlflow
+            dic_features_to_drop_n_folds = {
+                "features_to_drop_n_folds": features_to_drop_n_folds
+            }
+            mlflow.log_dict(
+                dic_features_to_drop_n_folds,
+                "features_to_drop_n_folds.json",
+            )
+            self.drop_features(features=features_to_drop_n_folds, verbose=verbose)
+
+    def run_top_10_correlations(self, X, corr_matrix, verbose=True):
+
+        # On loggue le dataset
+        # self.create_mlflow_dataset()
+        # self.track_dataset()
+
+        # On plotte les features les plus corrélées entre elles
+        max_features = 10
+        title = f"Top {max_features} des plus hautes corrélations {self.corr_coef.upper()} en valeur absolue"
+        subtitle = f"pipe : {self.get_pipe_str()}\nRéquilibrage : Robust Correlation Analysis Framework\nExp : {self.meta._name}"
+        top_corr = plot_top_correlations(
+            corr_matrix,
+            max_n_features=max_features,
+            title=title,
+            subtitle=subtitle,
+            verbose=verbose,
+        )
+        # On sauvegarde la figure (la précédente sera écrasée, c'est volontarire)
+        filepath = os.path.join(self.output_dir, "top_correlations.png")
+        top_corr.savefig(filepath, bbox_inches="tight")
+        # On loggue dans mlflow
+        mlflow.log_artifact(filepath)
+
+    def run_features_corr_above(self, X, corr_matrix, verbose=True):
+
+        # On loggue le dataset
+        """self.create_mlflow_dataset()
+        self.track_dataset()"""
+        # On récupère la liste des features qui ont une corrélation supérieure au seuil (en valeur absolue)
+        features_correlated_above_threshold = get_features_correlated_above(
+            corr_matrix, self.threshold_corr, verbose=False
+        )
+        self._features_correlated_above_threshold = features_correlated_above_threshold
+
+        # On loggue la liste des features préselectionnées comme hautement corrélées 2 à 2 dans mlflow
+        dic_features_correlated_above_threshold = {
+            "features_correlated_above_threshold": self._features_correlated_above_threshold
+        }
+        mlflow.log_dict(
+            dic_features_correlated_above_threshold,
+            "features_correlated_above_threshold.json",
+        )
+        return features_correlated_above_threshold
+
+    def run_redondant_features(self, X, verbose=True):
+        # On loggue le dataset et les paramètres
+        """self.create_mlflow_dataset()
+        self.track_dataset()"""
+
+        linkage_matrix = build_linkage_matrix(
+            X,
+            self._features_correlated_above_threshold,
+            corr_coef=self.corr_coef,
+            method=self.agglo_method,
+        )
+        all_clusters_col, features_to_drop = cluster_features_from_linkage_matrix(
+            X,
+            linkage_matrix,
+            features=self._features_correlated_above_threshold,
+            threshold_pct=self.threshold_dist,
+            verbose=verbose,
+        )
+        self._features_to_drop.append(features_to_drop)
+
+        # On logue les features à supprimer
+        dic_features_to_drop = {"features_to_drop": features_to_drop}
+        mlflow.log_dict(dic_features_to_drop, "features_to_drop.json")
+
+        # On plotte le dendrogramme
+        subtitle = f"Métrique={self.metric}, seuil distance : {self.threshold_dist:.0%}"
+        balance_str = f" - {self.meta.balance.upper()}"
+        if self.meta.balance == "none":
+            balance_str = ""
+        subtitle = (
+            subtitle
+            + f"\nPipe : {self.get_pipe_str()}{balance_str}\nExp : {self.meta._name}"
+        )
+        dendro = plot_dendro(
+            linkage_matrix,
+            features=self._features_correlated_above_threshold,
+            corr_coef=self.corr_coef,
+            threshold_dist=self.threshold_dist,
+            dropped_features=features_to_drop,
+            subtitle=subtitle,
+            verbose=verbose,
+        )
+        # On sauvegarde la figure et on la loggue dans mlflow
+        filepath = os.path.join(self.output_dir, "features_clustering.png")
+        dendro.savefig(filepath, bbox_inches="tight")
+        mlflow.log_artifact(filepath)
+
+    """def drop_redondant_features(self):
+        self.X = self.X.drop(self._features_to_drop[-1], axis=1)
+        print(f"{len(self._features_to_drop[-1])} features supprimées")
+        memory_consumed_mb = get_memory_consumed(self.X, verbose=False)
+        print(
+            f"Nouvelle forme de X : {self.X.shape}, conso mémoire : {memory_consumed_mb:.0f} Mo"
+        )"""
+
+    def drop_features(self, features, verbose=True):
+        self.X = self.X.drop(features, axis=1)
+        if verbose:
+            print(f"{len(features)} features supprimées")
+            memory_consumed_mb = get_memory_consumed(self.X, verbose=False)
+            print(
+                f"Nouvelle forme de X : {self.X.shape}, conso mémoire : {memory_consumed_mb:.0f} Mo"
+            )
+
+    def get_to_drop_in_n_folds(self, n_folds=None, verbose=True):
+        if not n_folds:
+            n_folds = self.n_folds
+            str_n_folds = f"les {n_folds} folds :"
+        elif n_folds > self.n_folds:
+            print(f"Le nombre de folds indiqué ({n_folds}) doit être <= {self.n_folds}")
+            return
+        else:
+            str_n_folds = "au moins {n_folds} folds :"
+        feature_counter = Counter(f for fold in self._features_to_drop for f in fold)
+        # On crée un dictionnaire où les clefs sont les nombres de folds et
+        # les valeurs sont les listes de features à supprimer dans ce nombre de folds
+        dict_to_drop = defaultdict(list)
+        for feature, count in feature_counter.items():
+            dict_to_drop[count].append(feature)
+        dict_to_drop = dict(dict_to_drop)
+
+        # On sélectionne les features qui sont à supprimer dans au moins n_folds
+        list_n_folds = [v for k, v in dict_to_drop.items() if k >= n_folds]
+        list_to_drop = []
+        for fold in list_n_folds:
+            list_to_drop += fold
+        if verbose:
+            print(
+                f"{len(list_to_drop)} features à supprimer. Identifiées redondantes dans {str_n_folds}"
+            )
+            print(list_to_drop)
+        return list_to_drop
 
 
 class ExpCorr(ExpMlFlow):
@@ -1698,7 +3551,8 @@ class ExpEvalLogreg(ExpMlFlow):
         self._param_names_of_model = LogisticRegression().get_param_names()
         self.device = "cuda"
         self.pipe_preprocess = None
-
+        self.pipe_postprocess = None
+        self.n_folds = 4
         self.meta.balance = "none"
         self.metric = "auc"
         self.max_iter = 1_000
@@ -1719,7 +3573,7 @@ class ExpEvalLogreg(ExpMlFlow):
             dic_params["threshold_prob"] = 0.5
         if not "penalty" in params.keys():
             dic_params["penalty"] = "l2"
-        # Nos paramètre sont issus de recheche Optuna.
+        # Nos paramètres sont issus de recherche Optuna.
         # dans optuna il faut "none" as string (pas None) et dans le fonctionnement normal il faut None (ou param absent)
         if "class_weight" in params.keys() and params["class_weight"] == "none":
             dic_params["class_weight"] = None
@@ -1756,7 +3610,7 @@ class ExpEvalLogreg(ExpMlFlow):
         super().read_data(verbose)
         self.create_mlflow_dataset()
 
-    def run(self, params, n_folds=5, verbose=True):
+    def run(self, params, verbose=True):
         if not self._mlflow_id:
             print("Créez l'expérience mlflow avant de lancer un run")
             return
@@ -1807,7 +3661,7 @@ class ExpEvalLogreg(ExpMlFlow):
                 cuml_model=model,
                 balance=all_params["balance"],
                 k_neighbors=all_params["k_neighbors"],
-                n_folds=n_folds,
+                n_folds=self.n_folds,
                 threshold_prob=all_params["threshold_prob"],
                 train_scores=True,
             )
@@ -1829,9 +3683,7 @@ class ExpEvalLogreg(ExpMlFlow):
             mlflow.log_metrics(mean_train_scores)
             mlflow.log_metrics(mean_val_scores)
 
-            title = (
-                f"Scores moyens moyen sur {n_folds} folds - {model.__class__.__name__}"
-            )
+            title = f"Scores moyens moyen sur {self.n_folds} folds - {model.__class__.__name__}"
             subtitle = f"Mlflow : {self.meta._name}, {run_name}"
             if (
                 "search_experiment" in all_params.keys()
@@ -1856,7 +3708,9 @@ class ExpEvalLogreg(ExpMlFlow):
             mlflow.log_artifact(filepath)
 
             # On plotte la matrice de confusion moyenne (recall) sur le jeu de valdation
-            title = f"Recall moyen sur {n_folds} folds - {model.__class__.__name__}"
+            title = (
+                f"Recall moyen sur {self.n_folds} folds - {model.__class__.__name__}"
+            )
             fig = plot_recall_mean(
                 tn=mean_val_scores["val.tn"],
                 fp=mean_val_scores["val.fp"],
@@ -1872,6 +3726,221 @@ class ExpEvalLogreg(ExpMlFlow):
             # On loggue dans mlflow
             mlflow.log_artifact(filepath)
             print("Durée totale :", format_time(time.time() - t0_score))
+        return
+
+    def get_params_of_model(self, all_params):
+        return {k: v for k, v in all_params.items() if k in self._param_names_of_model}
+
+    def print_params(self, all_params):
+        params_model = self.get_params_of_model(all_params)
+        params_other = {
+            k: v for k, v in all_params.items() if k not in params_model.keys()
+        }
+        print(f"Paramètres du modèle :")
+        for k, v in params_model.items():
+            print(f"\t{k} : {v}")
+        print("Autres paramètres :")
+        for k, v in params_other.items():
+            print(f"\t{k} : {v}")
+
+
+class ExpEvalLgb(ExpMlFlow):
+    def __init__(
+        self,
+        debug=False,
+    ):
+        super().__init__(task="eval", model_name="lgb", debug=debug)
+        self.params_model = None
+        self.params_other = None
+        self.model = None
+        # self._default_model = LogisticRegression()
+        self._param_names_of_model = None
+        self.device = "cpu"
+        self.pipe_preprocess = None
+        self.pipe_postprocess = None
+        self.n_folds = 4
+        self.meta.balance = "none"
+        self.metric = "auc"
+        self.stopping_round = 20
+        self.min_delta = 0.000_1
+        self.X = None
+        self.y = None
+        self._run_id = None
+        # self.threshold_prob = threshold_prob
+
+    """def init_all_params(self, params):
+        dic_params = deepcopy(params)
+        # [TODO ? ] plutôt éliminer des params ceux dont les valeurs sont à 'none' ou à None dans le dico final ?
+        if not "k_neighbors" in params.keys():
+            dic_params["k_neighbors"] = 0
+        if not "balance" in params.keys():
+            dic_params["balance"] = "none"
+        if not "threshold_prob" in params.keys():
+            dic_params["threshold_prob"] = 0.5
+
+        if not "verbose" in params.keys():
+            dic_params["verbose"] = cuml.common.logger.level_error
+        return dic_params"""
+
+    def init_run_name(self, params_other):
+        run_name = f"{self.get_run_count() + 1:03}"
+        if params_other["balance"] == "none":
+            run_name = run_name + f"_unbalanced"
+        else:
+            run_name = run_name + f"_{params_other['balance']}"
+        return run_name
+
+    def init_run_tags(self, all_params, verbose=False):
+        params_to_tag = [
+            "balance",
+            "k_neighbors",
+            "search_experiment",
+        ]
+        tags = {k: v for k, v in all_params.items() if k in params_to_tag}
+        tags["task"] = self.meta.task
+        if verbose:
+            print("Tags du run :")
+            print(tags)
+        return tags
+
+    """def read_data(self, verbose=True):
+        super().read_data(verbose)
+        self.create_mlflow_dataset()"""
+
+    def run(self, params_model=None, params_other=None, verbose=True):
+        if params_model:
+            self.params_model = params_model
+        if params_other:
+            self.params_other = params_other
+        if not self._mlflow_id:
+            print("Créez l'expérience mlflow avant de lancer un run")
+            return
+
+        run_name = self.init_run_name(self.params_other)
+        run_tags = self.init_run_tags(self.params_other)
+        all_params = {**self.params_model, **self.params_other}
+        print("all_params")
+        print(all_params)
+        """if verbose:
+            self.print_params(all_params)
+            print("run_name :", run_name)"""
+        print(f"Evaluation sur {self.device}...")
+        t0_score = time.time()
+        with mlflow.start_run(
+            experiment_id=self._mlflow_id,
+            run_name=run_name,
+        ) as run:
+            self._run_id = run.info.run_id
+
+            # On ajoute des tags au run pour pouvoir les sélectionner grâce à eux :
+            mlflow.set_tags(run_tags)
+
+            # On loggue les paramètres dans mlflow
+            mlflow.log_params(all_params)
+            model = LGBMClassifier(**self.params_model)
+
+            # Pour loguer le dataset
+            self.create_mlflow_dataset()
+            self.track_dataset()
+
+            # On logue les paramètres du modèle sous forme de json
+            dic_params_model = {"dic_params_model": self.params_model}
+            mlflow.log_dict(dic_params_model, "dic_params_model.json")
+            # On logue tous les paramètres sous forme de json
+            dic_all_params = {"dic_all_params": all_params}
+            mlflow.log_dict(dic_all_params, "dic_all_params.json")
+
+            mlflow.log_params(all_params)
+
+            kwargs = {
+                "params_model": self.params_model,
+                "params_other": self.params_other,
+                "balance": self.meta.balance,
+                "k_neighbors": self.params_other["k_neighbors"],
+                "sampling_strategy": self.params_other["sampling_strategy"],
+                # "trial": trial,
+            }
+
+            # On calcule les scores sur les jeux de validation en validation croisée
+            self.process_n_folds(**kwargs)
+
+            mean_val_scores = {k: np.mean(v) for (k, v) in self._all_val_scores.items()}
+
+            print(
+                "Durée du scoring en cross évaluation :",
+                format_time(time.time() - t0_score),
+            )
+
+            # On logue les scores moyens
+            mlflow.log_metrics(mean_val_scores)
+
+            title = f"Scores moyens moyen sur {self.n_folds} folds - {model.__class__.__name__}"
+            subtitle = f"Mlflow : {self.meta._name}, {run_name}"
+            if (
+                "search_experiment" in all_params.keys()
+                and all_params["search_experiment"]
+            ):
+                subtitle = (
+                    subtitle + f"\nSrc params : {all_params['search_experiment']}"
+                )
+
+            # On plotte les scores d'évaluation
+            """fig = plot_evaluation_scores(
+                train_scores=train_scores,
+                val_scores=val_scores,
+                title=title,
+                subtitle=subtitle,
+                verbose=verbose,
+            )
+            # On logue le plot dans mlflow :
+            filepath = os.path.join(self.output_dir, "eval_scores.png")
+            fig.savefig(filepath)
+            # On loggue dans mlflow
+            mlflow.log_artifact(filepath)"""
+
+            # On plotte la matrice de confusion moyenne (recall) sur le jeu de valdation
+            title = (
+                f"Recall moyen sur {self.n_folds} folds - {model.__class__.__name__}"
+            )
+            fig = plot_recall_mean(
+                tn=mean_val_scores["val.tn"],
+                fp=mean_val_scores["val.fp"],
+                fn=mean_val_scores["val.fn"],
+                tp=mean_val_scores["val.tp"],
+                title=title,
+                subtitle=subtitle,
+                verbose=verbose,
+            )
+            # On sauvegarde la figure et on la logue dans mlflow
+            filepath = os.path.join(self.output_dir, "recall_mean_plot.png")
+            fig.savefig(filepath, bbox_inches="tight")
+            # On loggue dans mlflow
+            mlflow.log_artifact(filepath)
+            print("Durée totale :", format_time(time.time() - t0_score))
+        return
+
+    def process_1_fold(self, X_train, X_val, y_train, y_val, i_fold, *args, **kwargs):
+        X_train_balanced, y_train_balanced, X_val_processed = pre_process_1_fold(
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            pipe_preprocess=self.pipe_preprocess,
+            balance=self.meta.balance,
+            k_neighbors=kwargs["k_neighbors"],
+            sampling_strategy=kwargs["sampling_strategy"],
+        )
+
+        fold_scores = lgb_validate_1_fold(
+            X_train=X_train_balanced,
+            y_train=y_train_balanced,
+            X_test=X_val_processed,
+            y_test=y_val,
+            model_params=kwargs["params_model"],
+            other_params=kwargs["params_other"],
+        )
+
+        for k in self._all_val_scores.keys():
+            self._all_val_scores[k].append(fold_scores[k])
         return
 
     def get_params_of_model(self, all_params):

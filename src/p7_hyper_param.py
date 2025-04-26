@@ -2,34 +2,38 @@ import numpy as np
 import random
 import logging
 import io
-import re
-import requests
-import os
+
+# import re
+# import requests
+# import os
 import gc
 import time
 import joblib
 from joblib import Parallel, delayed
 from copy import deepcopy
-import multiprocessing
-import subprocess
-import psycopg2
-from psycopg2 import OperationalError
+
+# import multiprocessing
+# import subprocess
+# import psycopg2
+# from psycopg2 import OperationalError
 
 import inspect
 import lightgbm as lgb
 import optuna
-from optuna.storages import JournalStorage, JournalFileStorage, RDBStorage
-from scipy.stats import beta
-import plotly
-import kaleido
+
+# import plotly
+# import kaleido
 import mlflow
 import mlflow.pyfunc
 from mlflow.tracking import MlflowClient
 
 import pandas as pd
-from sklearn.model_selection import cross_val_score, cross_validate, train_test_split
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import (
+
+# from sklearn.model_selection import cross_val_score, cross_validate, train_test_split
+# from sklearn.model_selection import StratifiedKFold
+from sklearn.dummy import DummyClassifier
+
+"""from sklearn.metrics import (
     roc_auc_score,
     confusion_matrix,
     roc_curve,
@@ -42,20 +46,24 @@ from sklearn.metrics import (
     precision_score,
 )
 from scipy import special
-import cudf
+import cudf"""
 import cuml
 from cuml.linear_model import LogisticRegression
-from bokbokbok.loss_functions.classification import WeightedCrossEntropyLoss
-from bokbokbok.eval_metrics.classification import WeightedCrossEntropyMetric
-from bokbokbok.utils import clip_sigmoid
 
-from src.p7_constantes import NUM_THREADS
-from src.p7_util import timer, clean_ram, format_time
-from src.p7_file import make_dir
-from src.p7_regex import sel_var
-from src.p7_constantes import MODEL_DIR, DATA_INTERIM, MAX_SIZE_PARA, VAL_SEED
+# from bokbokbok.loss_functions.classification import WeightedCrossEntropyLoss
+# from bokbokbok.eval_metrics.classification import WeightedCrossEntropyMetric
+# from bokbokbok.utils import clip_sigmoid
 
-from src.p7_secret import (
+import warnings
+
+# from src.p7_constantes import NUM_THREADS
+from src.p7_util import format_time
+
+# from src.p7_file import make_dir
+# from src.p7_regex import sel_var
+from src.p7_constantes import VAL_SEED
+
+"""from src.p7_secret import (
     PORT_MLFLOW,
     HOST_MLFLOW,
     PORT_PG,
@@ -68,30 +76,33 @@ from src.p7_simple_kernel import (
     # get_batch_size,
     get_memory_consumed,
     get_available_memory,
-)
+)"""
 from src.p7_metric import (
-    cu_pred_prob_to_binary,
-    pd_pred_prob_to_binary,
-    penalize_f1,
-    penalize_business_gain,
+    # cu_pred_prob_to_binary,
+    # pd_pred_prob_to_binary,
+    # penalize_f1,
+    # penalize_business_gain,
     make_objective_weighted_logloss,
 )
 from src.p7_evaluate import (
     cuml_cross_validate,
     cuml_cross_evaluate,
-    balance_smote,
-    balance_nearmiss,
+    # balance_smote,
+    # balance_nearmiss,
     lgb_validate_1_fold,
+    cuml_validate_1_fold,
     pre_process_1_fold,
     pd_build_folds_list,
+    sk_validate_1_fold,
 )
-from src.p7_evaluate import CuDummyClassifier
-from src.p7_preprocess import train_test_split_nan
-from src.p7_tracking import ExpMetaData, ExpMlFlow, ExpSearch
+from src.p7_evaluate import CuDummyClassifier, WrapperLogReg
+from src.p7_preprocess import cu_build_folds_list
+from src.p7_tracking import ExpSearch
 from src.p7_metric import (
-    logloss_objective,
-    logloss_metric,
-    feval_auc,
+    # logloss_objective,
+    # logloss_metric,
+    feval_auc_logits,
+    feval_auc_probs,
     make_feval_business_gain,
 )
 
@@ -171,21 +182,154 @@ class SearchCuDummy(ExpSearch):
         if verbose:
             print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
 
-    # La parallélisation ne fonctionne pas si CUDA car pas assez de mémoire
+
+class SearchDummy(ExpSearch):
+    def __init__(self, metric="auc", direction="maximize", debug=False):
+        super().__init__(
+            model_name="dummy", metric=metric, direction=direction, debug=debug
+        )
+        self.device = "cpu"
+        self.n_folds = 4
+        # self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
+        # Liste des paramètres qu'on veut voir affichés dans le parrallel plot fait par optuna
+        self._params_to_plot_in_parallel = []
+        self._plot_importance_params = False
+        self.sampler = optuna.samplers.RandomSampler(VAL_SEED)
+        self.pruner = None
+
+    def objective(self, trial):
+        with mlflow.start_run(
+            experiment_id=self._mlflow_id, run_name=f"{trial.number}", nested=True
+        ):
+
+            threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
+            constant = trial.suggest_categorical("constant", [0, 1])
+
+            # Si on a de l'oversampling ou de l'undersampling, on recherche le nombre de voisins,
+            # ainsi que le ratio classe minoritaire / classe majoritaire
+            if self.meta.balance == "none":
+                k_neighbors = 0
+                sampling_strategy = 0
+            else:
+                k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
+                sampling_strategy = trial.suggest_float("sampling_strategy", 0.2, 1.0)
+
+            # Paramètres utilisés dans le train et dans le scoring
+            model_params = {
+                "constant": constant,
+                # "threshold_prob": threshold_prob,
+            }
+            all_params = {k: v for k, v in model_params.items()}
+            all_params["balance"] = self.meta.balance
+            all_params["k_neigbors"] = k_neighbors
+            all_params["sampling_strategy"] = sampling_strategy
+            all_params["threshold_prob"] = threshold_prob
+            mlflow.log_params(all_params)
+
+            predictors = [
+                f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]
+            ]
+
+            clf = DummyClassifier(strategy="constant", constant=constant)
+            # clf = DummyClassifier(strategy="uniform")
+            # all_params = {"threshold_prob": threshold_prob}
+
+            # On construit la liste des folds avec des index en position relative
+            folds_list = pd_build_folds_list(
+                n_folds=self.n_folds,
+                X=self.X[predictors],
+                y=self.y,
+                random_state=VAL_SEED,
+            )
+
+            all_scores = {
+                "auc": [],
+                "accuracy": [],
+                "recall": [],
+                "penalized_f1": [],
+                "business_gain": [],
+                "fit_time": [],
+                "tn": [],
+                "tp": [],
+                "fn": [],
+                "fp": [],
+            }
+
+            for i_fold, (train_idx, valid_idx) in enumerate(folds_list):
+                X_train = self.X[predictors].iloc[train_idx]
+                X_val = self.X[predictors].iloc[valid_idx]
+                y_train = self.y.iloc[train_idx]
+                y_val = self.y.iloc[valid_idx]
+
+                X_train_balanced, y_train_balanced, X_val_processed = (
+                    pre_process_1_fold(
+                        X_train=X_train,
+                        y_train=y_train,
+                        X_val=X_val,
+                        pipe_preprocess=self.pipe_preprocess,
+                        balance=self.meta.balance,
+                        k_neighbors=k_neighbors,
+                        sampling_strategy=sampling_strategy,
+                    )
+                )
+
+                fold_scores = sk_validate_1_fold(
+                    X_train=X_train_balanced,
+                    y_train=y_train_balanced,
+                    X_test=X_val_processed,
+                    y_test=y_val,
+                    sk_model=clf,
+                    threshold_prob=threshold_prob,
+                )
+                for k in all_scores.keys():
+                    all_scores[k].append(fold_scores[k])
+
+                del X_train
+                del X_train_balanced
+                del y_train
+                del y_train_balanced
+                del X_val
+                del X_val_processed
+                del y_val
+                del fold_scores
+
+                gc.collect()
+
+            # Dans optuna, il ne sera loggé par défaut que la métrique à optimiser, pour loguer toutes les métriques,
+            # On utilise set_user_attr qui permet de personnaliser ce qu'on veut logguer dans Optuna
+            mean_scores = {k: np.mean(v) for (k, v) in all_scores.items()}
+
+            trial.set_user_attr("mean_scores", mean_scores)
+
+            # On loggue les scores moyens dans mlflow
+            mlflow.log_metrics(mean_scores)
+
+        return mean_scores[self.metric]
+
+    def run_logreg_trials(self, n_trials=20, verbose=True):
+        t0 = time.time()
+        if verbose:
+            print(f"Optimisation {n_trials} trials...")
+
+        self._study.optimize(self.objective, n_trials=n_trials, gc_after_trial=True)
+        if verbose:
+            print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+
+    # La parallélisation ne fonctionne pas si CUDA
     # ou tout simplement allocation sur CUDA en parallel ne fonctionne pas bien (alloue plus que nécessaire).
     # On peut surveiller en temps réel la consommation de VRAM avec nvidia-smi -l 1 (crée une loop pour rafraichir toutes les 1 secondes)
     # Le multithreads réglerait peut-être le problème de l'allocation VRAM mais MLFlow n'est pas thread-safe.
     def optimize(self, n_trials=10, verbose=True):
-        # Si le nombre de trials est grand, on ne les loggue pas à l'écran, à la place on affiche uniquement les warnings
+        # Si le nombre de trials est grand, on ne les loggue pas à l'écran, à la place on affiche uniquement les erreurs
         if n_trials > 20:
-            self.optuna_verbosity = optuna.logging.WARNING
+            self.optuna_verbosity = optuna.logging.ERROR
         else:
             self.optuna_verbosity = optuna.logging.INFO
         optuna.logging.set_verbosity(self.optuna_verbosity)
 
         t0 = time.time()
         if verbose:
-            print(f"Optimisation {n_trials} trials sur CUDA...")
+            print(f"Optimisation {n_trials} trials sur {self.device}...")
 
         # self.run_logreg_trials(n_trials=n_trials, n_jobs=1, verbose=False)
         self._study.optimize(
@@ -215,110 +359,158 @@ class SearchLogReg(ExpSearch):
             f"Optimisation de {metric}, Fonction de perte : 'binary'"
         )
         self.device = "cuda"
-        # Comme CUDA est utilisé, on ne parallélise pas, on peut donc fiwxer la graine du sampler
-        self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
-        # Liste des paramètres qu'on veut voir affichés dans le parrallel plot fait par optuna
-        self._params_to_plot_in_parallel = [
+
+        # Doc optuna : TPESampler n'est intéressant que pour un nombre de trials > 100
+        # Comme CUDA est utilisé, on ne parallélise pas, on peut donc fiwxer la graine du sampler sans reseed
+        # self.sampler = optuna.samplers.TPESampler(seed=VAL_SEED)
+
+        # Liste par défaut des paramètres à rechercher
+        self.params_to_optimize = [
             "C",
             "penalty",
             "class_weight",
-            "threshold_prob",
             "fit_intercept",
+            "threshold_prob",
+        ]
+        self.n_folds = 4
+        # Inspecter la signature au lieu d'indiquer une liste fixe nous permettra peut-être
+        # moins de maintenace à l'avenir sur une librairie en très forte évolution (cuml)
+        # Bien entendu les facilités sklearn 'built_in' pour récupérer les paramètres par défaut ou leur nom ne sont pas encore supportées
+        self._params_model_list = inspect.signature(
+            LogisticRegression.__init__
+        ).parameters.keys()
+        self._params_fit_list = [
+            p
+            for p in inspect.signature(LogisticRegression.fit).parameters.keys()
+            if p not in ["self", "X", "x", "y"]
         ]
 
-    def objective(self, trial):
-
-        with mlflow.start_run(
-            experiment_id=self._mlflow_id, run_name=f"{trial.number}", nested=True
-        ):
-            # doc cuml : https://docs.rapids.ai/api/cuml/nightly/api/#regression-and-classification
+    def suggest_all_params(self, trial):
+        all_params = {}
+        # doc cuml : https://docs.rapids.ai/api/cuml/nightly/api/#regression-and-classification
+        if "C" in self.params_to_optimize or "c" in self.params_to_optimize:
             c = trial.suggest_float("C", 1e-7, 100.0, log=True)
-
-            # En cuml, pas le choix du solver mais
-            # si penalty=None ou l2 solver=L-BFGS,
-            # si penalty=l1 ou elasticnet avec un ratio_l1 > 0 alors solver=OWL-QN
-
+        else:
+            c = 1.0
+        all_params["c"] = c
+        # En cuml, pas le choix du solver mais
+        # si penalty"none ou l2 solver=L-BFGS,
+        # si penalty=l1 ou elasticnet avec un ratio_l1 > 0 alors solver=OWL-QN
+        # Ne pas suggérer None à la place de "none"
+        if "penalty" in self.params_to_optimize:
             penalty = trial.suggest_categorical(
                 "penalty", ["none", "l2", "l1", "elasticnet"]
             )
-            # penalty = trial.suggest_categorical("penalty", ["l1", "elasticnet"])
-            if penalty == "elasticnet":
-                l1_ratio = trial.suggest_float("l1_ratio", 0.2, 0.8, log=False)
-            else:
-                l1_ratio = None
+        else:
+            penalty = "l2"
+        # penalty = trial.suggest_categorical("penalty", ["l1", "elasticnet"])
+        if penalty == "elasticnet":
+            l1_ratio = trial.suggest_float("l1_ratio", 0.2, 0.8, log=False)
+        else:
+            l1_ratio = None
+        # None ou "none" sont supportés par Optuna,
+        # mais dans cuml, "none" n'est pas supporté pour certains arguments ex : penalty dans une logreg
+        # A contrario dans cuml,"none" et None sont supprotés pour "class_weight" dans la logreg
+        # Donc Par souci d'homogénéité, on suggère tout à "none" plutôt que None
+        # class_weight = trial.suggest_categorical("class_weight", [None, "balanced"])
+        if "class_weight" in self.params_to_optimize:
+            class_weight = trial.suggest_categorical("class_weight", [None, "balanced"])
+        else:
+            class_weight = None
 
-            class_weight = trial.suggest_categorical(
-                "class_weight", ["none", "balanced"]
-            )
-            # class_weight = "balanced"
-            # Pour avoir l'équivallent d'un tol sklearn en cuml, il faut diviser le tol sklearn par sample_size
-            # tol = trial.suggest_float("tol", 1e-6, 1e-3)
+        # Pour avoir l'équivallent d'un tol sklearn en cuml, il faut diviser le tol sklearn par sample_size
+        # tol = trial.suggest_float("tol", 1e-6, 1e-3)
+        if "fit_intercept" in self.params_to_optimize:
             fit_intercept = trial.suggest_categorical("fit_intercept", [True, False])
-            # fit_intercept = False
-            clf_params = {
-                "C": c,
-                "penalty": penalty,
-                "l1_ratio": l1_ratio,
-                "tol": 1e-4,
-                "fit_intercept": fit_intercept,
-            }
-            # Petit bug pour le cuml LogisticRegression, on ne peut pas directement assigner class_weight
-            if class_weight == "balanced":
-                clf_params["class_weight"] = "balanced"
+        else:
+            fit_intercept = False
+        clf_params = {
+            "C": c,
+            "penalty": penalty,
+            "l1_ratio": l1_ratio,
+            "tol": 1e-4,
+            "fit_intercept": fit_intercept,
+        }
+        # Petit bug pour le cuml LogisticRegression, on ne peut pas directement assigner class_weight
+        if class_weight == "balanced":
+            clf_params["class_weight"] = "balanced"
 
-            # Max_iter par défaut est 1_000. Si une régularisation l1 est appliquée, dans ces conditions,
-            # L'algorithme ne pourra pas converger. Soit on augmente max_iter, (voire la tol) soit on scale les features binaires dans le pipe.
-            if penalty == "l1" or penalty == "elasticnet":
-                clf_params["max_iter"] = 10_000
-                clf_params["tol"] = 1e-3
-                if penalty == "elasticnet":
-                    clf_params["l1_ratio"] = l1_ratio
+        # Max_iter par défaut est 1_000 en cuml. Si une régularisation l1 est appliquée,
+        # L'algorithme ne pourra pas converger complètement avec les valeurs par défaut.
+        # Soit on augmente max_iter, (ou/et on modifie la tol) soit on tente de scaler différemment les features binaires dans le pipe.
+        # max_iter=4_000 n'est pas tout le temps suffisant dans notre cas (le warning à ce sujet peut se déclencher pour certaines valeurs de C),
+        # mais c'est un compromis de temps de calcul, dans une recherche d'hyper-paramètres, sans énormes ressources.
+        if penalty == "l1" or penalty == "elasticnet":
+            clf_params["max_iter"] = 4_000
+            clf_params["tol"] = 1e-3
+            if penalty == "elasticnet":
+                clf_params["l1_ratio"] = l1_ratio
 
-            # On concentre la recherche du seuil autour de 0.5 avec la distribution Beta
-            # threshold_prob = self.suggest_beta("threshold_prob", low=0.05, high=0.95)
+        if "threshold_prob" in self.params_to_optimize:
             threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
+        else:
+            threshold_prob = 0.5
+
+        # Si on a de l'oversampling ou de l'undersampling, on recherche le nombre de voisins,
+        # ainsi que le ratio classe minoritaire / classe majoritaire
+        if self.meta.balance == "none":
+            k_neighbors = 0
+            sampling_strategy = 0
+        else:
+            k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
+            if self.meta.balance == "smote":
+                # Si smote on ne rééquilibre jamais complètement (sampling_strategy=1.0) car on n'a pas assez de VRAM sur le GPU
+                # Cela n'est pas très grave, il n'y a pas besoin de ré-équilibrer à 50-50 pour avoir des scores corrects
+                sampling_strategy = trial.suggest_float("sampling_strategy", 0.2, 0.6)
+            else:
+                sampling_strategy = trial.suggest_float("sampling_strategy", 0.2, 1.0)
+        all_params = {k: v for (k, v) in clf_params.items()}
+
+        all_params["threshold_prob"] = threshold_prob
+        all_params["balance"] = self.meta.balance
+        all_params["sampling_strategy"] = sampling_strategy
+        all_params["k_neighbors"] = k_neighbors
+
+        return all_params
+
+    def objective(self, trial):
+        with mlflow.start_run(
+            experiment_id=self._mlflow_id, run_name=f"{trial.number}", nested=True
+        ):
+            all_params = self.suggest_all_params(trial=trial)
+            mlflow.log_params(all_params)
+
+            params_model = self.get_params_of_model(all_params)
+            threshold_prob = self.get_threshold_prob(all_params)
+            # params_fit = self.get_params_fit(all_params)
+            params_balance = self.get_params_balance(all_params)
 
             # La verbosité permet de désactiver le warning : QWL-QN stopped, because the line search failed to advance (step delta = 0.000000)
             clf = LogisticRegression(
-                **clf_params, verbose=cuml.common.logger.level_error
+                **params_model, verbose=cuml.common.logger.level_error
             )
-            """scores = cuml_cross_validate(
-                self.X,
-                self.y,
-                self.pipe_preprocess,
-                clf,
-                threshold_prob=threshold_prob,
-            )"""
+            model = WrapperLogReg(clf, threshold=threshold_prob)
+            kwargs = {
+                "model": model,
+                "balance": self.meta.balance,
+                "k_neighbors": params_balance["k_neighbors"],
+                "sampling_strategy": params_balance["sampling_strategy"],
+                "trial": trial,
+            }
+            """kwargs = {
+                "clf": clf,
+                "threshold_prob": threshold_prob,
+                "balance": self.meta.balance,
+                "k_neighbors": params_balance["k_neighbors"],
+                "sampling_strategy": params_balance["sampling_strategy"],
+                "trial": trial,
+            }"""
 
-            all_params = {k: v for (k, v) in clf_params.items()}
-            all_params["threshold_prob"] = threshold_prob
-
-            # Si on n'a pas d'oversampling ni d'undersampling, on fait une cross validation avec 5 folds,
-            # Si on a de l'oversampling ou de l'undersampling on ne fait que 2 folds pour diminuer les temps de calcul
-            if self.meta.balance == "none":
-                n_folds = 5
-                k_neighbors = 0
-            else:
-                n_folds = 2
-                k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
-                all_params["k_neighbors"] = k_neighbors
-
-            scores = cuml_cross_evaluate(
-                X_train_and_val=self.X,
-                y_train_and_val=self.y,
-                pipe_preprocess=self.pipe_preprocess,
-                cuml_model=clf,
-                balance=self.meta.balance,
-                k_neighbors=k_neighbors,
-                n_folds=n_folds,
-                threshold_prob=threshold_prob,
-                train_scores=False,
-            )
+            # On calcule les scores sur les jeux de validation en validation croisée
+            self.process_n_folds(**kwargs)
 
             # mean_scores = scores.mean(axis=0)
-            mean_scores = {k: np.mean(v) for (k, v) in scores.items()}
-
-            # Minimise la log loss : ll = log_loss(test_y , y_predlr)
+            mean_scores = {k: np.mean(v) for (k, v) in self._all_val_scores.items()}
 
             # Dans optuna, il ne sera loggé par défaut que la métrique à optimiser, pour loguer toutes les métriques,
             # on personnalise pour enregistrer toutes les métriques
@@ -326,14 +518,68 @@ class SearchLogReg(ExpSearch):
 
             # Fin d'un trial, on loggue dans mlflow
             mlflow.log_metrics(mean_scores)
-            """all_params = {k: v for (k, v) in clf_params.items()}
-            all_params["threshold_prob"] = threshold_prob"""
-
-            mlflow.log_params(all_params)
-            # On ne logue le dataset que dans le best_run
-            # self.track_dataset()
 
         return mean_scores[self.metric]
+
+    def process_1_fold(self, X_train, X_val, y_train, y_val, i_fold, *args, **kwargs):
+        X_train_balanced, y_train_balanced, X_val_processed = pre_process_1_fold(
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            pipe_preprocess=self.pipe_preprocess,
+            balance=self.meta.balance,
+            k_neighbors=kwargs["k_neighbors"],
+            sampling_strategy=kwargs["sampling_strategy"],
+        )
+
+        kwargs["model"].fit(X_train_balanced, y_train_balanced)
+        fold_scores = kwargs["model"].evaluate(X_val_processed, y_val)
+
+        for k in self._all_val_scores.keys():
+            self._all_val_scores[k].append(fold_scores[k])
+
+        # Le prunage est impératif dans le p7. Sinon temps de calculs vraiment trop longs.
+        # pour la logreg (pas comme lgbm ou réseaux de neurones), on est obligé de lever le prunage manuellement.
+        # On lève le prunage à chaque fold, les médianes concernent chaque fold séparément donc
+        # si sur le 1er fold c'est pas ok (ou le 2ème etc.), le trial sera pruné sans attendre la médiane des autres folds
+        kwargs["trial"].report(fold_scores[self.metric], i_fold)
+        if kwargs["trial"].should_prune():
+            raise optuna.TrialPruned()
+        return
+
+    def process_1_fold_old(
+        self, X_train, X_val, y_train, y_val, i_fold, *args, **kwargs
+    ):
+        X_train_balanced, y_train_balanced, X_val_processed = pre_process_1_fold(
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            pipe_preprocess=self.pipe_preprocess,
+            balance=self.meta.balance,
+            k_neighbors=kwargs["k_neighbors"],
+            sampling_strategy=kwargs["sampling_strategy"],
+        )
+
+        fold_scores = cuml_validate_1_fold(
+            X_train=X_train_balanced,
+            y_train=y_train_balanced,
+            X_val=X_val_processed,
+            y_val=y_val,
+            cuml_model=kwargs["clf"],
+            threshold_prob=kwargs["threshold_prob"],
+        )
+
+        for k in self._all_val_scores.keys():
+            self._all_val_scores[k].append(fold_scores[k])
+
+        # Le prunage est impératif dans le p7. Sinon temps de calculs vraiment trop longs.
+        # pour la logreg (pas comme lgbm ou réseaux de neurones), on est obligé de lever le prunage manuellement.
+        # On lève le prunage à chaque fold, les médianes concernent chaque fold séparément donc
+        # si sur le 1er fold c'est pas ok (ou le 2ème etc.), le trial sera pruné sans attendre la médiane des autres folds
+        kwargs["trial"].report(fold_scores[self.metric], i_fold)
+        if kwargs["trial"].should_prune():
+            raise optuna.TrialPruned()
+        return
 
     def run_logreg_trials(self, n_trials=20, n_jobs=1, verbose=True):
         t0 = time.time()
@@ -346,11 +592,18 @@ class SearchLogReg(ExpSearch):
         if verbose:
             print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
 
-    # La parallélisation ne fonctionne pas si CUDA car pas assez de mémoire
-    # ou tout simplement allocation sur CUDA en parallel ne fonctionne pas bien (alloue plus que nécessaire).
+    # La parallélisation ne fonctionne pas si CUDA
     # On peut surveiller en temps réel la consommation de VRAM avec nvidia-smi -l 1 (crée une loop pour rafraichir toutes les 1 secondes)
     # Le multithreads réglerait peut-être le problème de l'allocation VRAM mais MLFlow n'est pas thread-safe.
-    def run(self, n_trials=10, verbose=True):
+    def run(
+        self,
+        n_trials=10,
+        verbose=True,
+        show_parallel=True,
+        show_importance=True,
+        show_history=True,
+        show_recall=True,
+    ):
         # Si le nombre de trials est grand, on ne les loggue pas à l'écran, à la place on affiche uniquement les warnings
         if n_trials > 20:
             self.optuna_verbosity = optuna.logging.WARNING
@@ -360,7 +613,9 @@ class SearchLogReg(ExpSearch):
 
         t0 = time.time()
         if verbose:
-            print(f"Optimisation {n_trials} trials sur CUDA...")
+            print(
+                f"Optimisation {n_trials} trials sur CUDA (n_folds={self.n_folds})..."
+            )
 
         # self.run_logreg_trials(n_trials=n_trials, n_jobs=1, verbose=False)
         self._study.optimize(
@@ -368,20 +623,27 @@ class SearchLogReg(ExpSearch):
         )
 
         if verbose:
-            """print(
-                f"Meilleure combinaison : trial {self._study.best_trial.number}, {self.metric} : {self._study.best_trial.value}"
-            )
-            print(f"Paramètres : {self._study.best_trial.params}")"""
-
             print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
-        self.create_best_run(verbose=verbose)
+            print()
+            self.print_best_trial()
+            print(
+                "Nombre total de trials élagués (=pruned) :",
+                self.counts_pruned_trials(),
+            )
+            print()
+        self.create_best_run(
+            verbose=verbose,
+            show_parallel=show_parallel,
+            show_history=show_history,
+            show_importance=show_importance,
+            show_recall=show_recall,
+        )
 
     def get_model(self):
         params_of_model = self.get_params_of_model()
         return LogisticRegression(**params_of_model)
 
 
-# [TODO] refacto car hérite de ExpSearch au lieu de ExperimentSearch
 class SearchLgb(ExpSearch):
     def __init__(self, metric="auc", direction="maximize", loss="binary", debug=False):
         super().__init__(
@@ -394,246 +656,270 @@ class SearchLgb(ExpSearch):
         self.meta.balance = "none"
         self.meta.description2 = f"Optimisation de {metric}, Fonction de perte : {loss}"
         self.device = "cpu"
-        # Finalement il n'est pas intéressant de paralléliser, on fixe donc la graine du sampler
-        self.sampler = optuna.samplers.TPESampler(VAL_SEED)
+        # Finalement il n'est pas intéressant de paralléliser, on fixe donc la graine du sampler sabs resees
+        # self.sampler = optuna.samplers.TPESampler(VAL_SEED)
         # Grand maximum en séquentiel
         self.lgb_n_threads = 12
         # Turn off optuna log notes.
         # optuna.logging.set_verbosity(optuna.logging.WARN)
-        # Liste des paramètres qu'on veut voir affichés dans le parrallel plot fait par optuna
-        self._params_to_plot_in_parallel = [
-            "n_estimators",
+        # Liste des paramètres qu'on veut optimiser
+        self.params_to_optimize = [
             "learning_rate",
+            "max_bin",
+            "n_estimators",
+            "num_leaves",
+            "min_child_samples",
+            "scale_pos_weight",
+            "lambda_l1",
+            "lambda_l2",
+            "feature_fraction",
+            "bagging_fraction",
+            "bagging_freq",
+            "threshold_prob",
+        ]
+        # Paramètres possibles (tolérés ici) dans la définition du modèle, il y a d'autres alias selon les api
+        self._params_model_list = [
+            "force_col_wise",
+            "boosting_type",
+            "boost_from_average",
+            "deterministic",
+            "objective",
+            "metrics",
+            "scale_pos_weight",
             "lambda_l1",
             "lambda_l2",
             "num_leaves",
             "feature_fraction",
-            # "is_unbalance",
-            "scale_pos_weight",
-            "threshold_prob",
+            "bagging_fraction",
+            "bagging_freq",
+            "min_child_samples",
+            "learning_rate",
+            "max_bin",
+            "num_threads",
+            "verbosity",
+            "verbose_eval",
+            # alias 'num_boost-round' du train dans l'api lgb.train mais pour l'api sklearn dans les params_model
+            "n_estimators",
+        ]
+        # Paramètres possibles dans le fit ou le train
+        self._params_fit_list = [
+            "train_set",
+            "valid_sets",
+            # 'num_boost_round' avec lgb_api dans les params de train équivaut à
+            # 'n_estimators' avec sklearn_api mais dans les params du modèle,
+            # en utilisant lgb avec n_estimator dans les params_model on a juste un warning
+            "num_boost_round",
+            "feval",
+            "callbacks",
         ]
         self.min_delta = 0.001
-        # self.sampler = optuna.samplers.TPESampler(VAL_SEED)
         self.n_folds = 4
 
-        # Assure la reproductibilité de l'entraînement lgbm si plusieurs thrreads (ralentit)
+        # Assure la reproductibilité de l'entraînement lgbm si plusieurs threads (ralentit)
         self.deterministic = False
 
-    # On ne teste pas boosting_type dart car pas de early_stopping et c'est trop long
-    # Pas de validation croisée car c'est trop long
+    def suggest_all_params(self, trial):
+        # On fixe les valeurs par défaut au cas où on n'optimise pas tous les paramètres
+        learning_rate = 0.1
+        n_estimators = 100
+        num_leaves = 31
+        min_child_samples = 20
+        lambda_l1 = 0.0
+        lambda_l2 = 0.0
+        threshold_prob = 0.5
+
+        if "learning_rate" in self.params_to_optimize:
+            learning_rate = trial.suggest_float("learning_rate", 0.0001, 0.5, log=True)
+        if "n_estimators" in self.params_to_optimize:
+            n_estimators = trial.suggest_int("n_estimators", 40, 400, step=20)
+        if "num_leaves" in self.params_to_optimize:
+            num_leaves = trial.suggest_int("num_leaves", 8, 256)
+        if "min_child_samples" in self.params_to_optimize:
+            min_child_samples = trial.suggest_int("min_child_samples", 50, 100)
+        if "lambda_l1" in self.params_to_optimize:
+            lambda_l1 = trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True)
+        if "lambda_l2" in self.params_to_optimize:
+            lambda_l2 = trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True)
+        if "threshold_prob" in self.params_to_optimize:
+            threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
+        all_params = {}
+        all_params["learning_rate"] = learning_rate
+        all_params["n_estimators"] = n_estimators
+        all_params["num_leaves"] = num_leaves
+        all_params["min_child_samples"] = min_child_samples
+        all_params["lambda_l1"] = lambda_l1
+        all_params["lambda_l2"] = lambda_l2
+        all_params["threshold_prob"] = threshold_prob
+
+        if "max_bin" in self.params_to_optimize:
+            all_params["max_bin"] = trial.suggest_int("max_bin", 128, 512, step=32)
+        if "scale_pos_weight" in self.params_to_optimize:
+            all_params["scale_pos_weight"] = trial.suggest_float(
+                "scale_pos_weight", 1.0, 10.0
+            )
+        # Permet d'utiliser un sous-ensemble des features sélectionnées aléatoirement
+        # et ainsi de varier les arbres. Aide contre surfit et diminue temps de fit
+        if "feature_fraction" in self.params_to_optimize:
+            all_params["feature_fraction"] = trial.suggest_float(
+                "feature_fraction", 0.4, 1.0, step=0.1
+            )
+        # Idem feature_fraction mais pour les lignes
+        if "bagging_fraction" in self.params_to_optimize:
+            all_params["bagging_fraction"] = trial.suggest_float(
+                "bagging_fraction", 0.4, 1.0, step=0.1
+            )
+        if "bagging_freq" in self.params_to_optimize:
+            all_params["bagging_freq"] = trial.suggest_int("bagging_freq", 1, 7)
+
+        # Si on demande un rééquilibrage par smote ou nearmiss, on recherche le nombre de voisins et la sampling_strategy
+        if self.meta.balance == "none":
+            k_neighbors = 0
+            sampling_strategy = 0
+        else:
+            k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
+            sampling_strategy = trial.suggest_float("sampling_strategy", 0.2, 1.0)
+        all_params["k_neighbors"] = k_neighbors
+        all_params["sampling_strategy"] = sampling_strategy
+
+        # [TODO si le temps] voir une meilleure manière (que la copie et d'avoir les 2) de gérer n_estimators de sklearn et num_boost_round de lgb
+        all_params["num_boost_round"] = all_params["n_estimators"]
+        # boost_from_average permet d'initialiser le score au départ et est censé améliorer la convergence (puisque le départ serait meilleur)
+        # Cependant si nous voulons pouvoir comparer les différenters API (sklearn/lgb), on ne peut pas l'utiliser.
+        all_params["boost_from_average"] = False
+
+        # Si on utilise la fonction de perte binary_logloss standard, le modèle poroduit des probas
+        if self.loss == "binary":
+            lgb_objective = "binary"
+            alpha = 1.0
+            if self.metric == "auc":
+                feval = [feval_auc_probs]
+            else:
+                # La fonction de perte étant "buit-in", le modèle renvoie des probas et non des logits
+                feval_business = make_feval_business_gain(
+                    all_params["threshold_prob"], preds_are_logits=False
+                )
+                feval = [feval_business]
+
+        # Si on utilise une fonction de perte personnalisée qui pondère la binary_cross_entropy
+        elif self.loss == "weighted_logloss":
+            # alpha < 1.0 réduit le nombre de faux négatifs, 1 équivaut à loss="binary" (à condition de boost_from_average=False)
+            # et alpha > 1 réduirait le nombre de faux positifs
+            alpha = trial.suggest_float("alpha", 1.0, 20.0)
+            lgb_objective = make_objective_weighted_logloss(alpha)
+            if self.metric == "auc":
+                feval = [feval_auc_logits]
+            else:
+                # La fonction de perte étant personnalisée, le modèle renvoie des logits et non des probas
+                feval_business = make_feval_business_gain(
+                    threshold_prob, preds_are_logits=True
+                )
+                feval = [feval_business]
+
+        # Focntion de perte et métrique
+        all_params["objective"] = lgb_objective
+        all_params["alpha"] = alpha
+        all_params["feval"] = feval
+        all_params["loss"] = self.loss
+        all_params["metrics"] = [self.metric]
+        # Eventuel rééquilibrage avec smote ou nearmiss
+        all_params["balance"] = self.meta.balance
+        all_params["k_neigbors"] = k_neighbors
+        all_params["sampling_strategy"] = sampling_strategy
+        # paramètres fixés.
+        all_params["force_col_wise"] = True
+        # boost_from_average est cencé améliorer la convergence en intialisant mais on ne peut plus comparer les api skleearn et lgb
+        all_params["boost_from_average"] = False
+        all_params["num_threads"] = self.lgb_n_threads
+
+        # On définit le callback de pruning pour interrompre l'essai optuna s'il n'est pas prometteur.
+        # Le pruning s'effectue sur la métrique mesurée dans l'ensemble de validation
+        # Le callback de early_stopping interrompt l'entraînement si la métrique d'évaluation n'évolue plus dans le jdd de validation
+        pruning_callback = optuna.integration.LightGBMPruningCallback(
+            trial, f"{self.metric}"
+        )
+        eval_results = {}
+        callbacks = [
+            lgb.early_stopping(
+                stopping_rounds=10, min_delta=self.min_delta, verbose=True
+            ),
+            pruning_callback,
+            lgb.record_evaluation(eval_results),
+        ]
+        all_params["callbacks"] = callbacks
+        return all_params
+
+    # Finalement On ne teste pas boosting_type dart car trop long et n'apporte pas grand chose
     def objective(self, trial):
         with mlflow.start_run(
             experiment_id=self._mlflow_id, run_name=f"{trial.number}", nested=True
         ):
-            threshold_prob = trial.suggest_float("threshold_prob", 0.0, 1.0, log=False)
-            learning_rate = trial.suggest_float("learning_rate", 0.0001, 0.5, log=True)
-            max_bin = trial.suggest_int("max_bin", 128, 512, step=32)
-            n_estimators = trial.suggest_int("n_estimators", 40, 400, step=20)
-            num_leaves = trial.suggest_int("num_leaves", 8, 256)
-            min_child_samples = trial.suggest_int("min_child_samples", 5, 100)
-            # k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
-            scale_pos_weight = trial.suggest_float("scale_pos_weight", 1.0, 10.0)
-            lambda_l1 = trial.suggest_float("lambda_l1", 1e-8, 10.0, log=True)
-            lambda_l2 = trial.suggest_float("lambda_l2", 1e-8, 10.0, log=True)
-            # Permet d'utiliser un sous-ensemble des features sélectionnées aléatoirement
-            # et ainsi de varier les arbres. Aide contre surfit et diminue temps de fit
-            feature_fraction = trial.suggest_float(
-                "feature_fraction", 0.4, 1.0, step=0.1
-            )
-            # Idem feature_fraction mais pour les lignes
-            bagging_fraction = trial.suggest_float(
-                "bagging_fraction", 0.4, 1.0, step=0.1
-            )
-            bagging_freq = trial.suggest_int("bagging_freq", 1, 7)
-            alpha = trial.suggest_float("alpha", 1.0, 20.0)
 
             # On définit la métrique sur laquelle va s'exercer le early_stopping et le pruning
-            if self.metric in ["auc", "business_gain"]:
-                metrics = [self.metric]
-            else:
+            if self.metric not in ["auc", "business_gain"]:
                 raise ValueError(
                     f"La métrique '{self.metric}' n'est pas autorisée. Métriques possibles à optimiser : ['auc', 'business_gain']"
                 )
 
-            # On définit le callback de pruning pour interrompre l'essai optuna s'il n'est pas prometteur
-            # et le callback de early_stopping pour interrompre l'entraînement si la métrique d'évaluation n'évolue plus
-            pruning_callback = optuna.integration.LightGBMPruningCallback(
-                trial, self.metric
-            )
-            eval_results = {}
-            callbacks = [
-                lgb.early_stopping(
-                    stopping_rounds=10, min_delta=self.min_delta, verbose=True
-                ),
-                pruning_callback,
-                # lgb.log_evaluation(period=5),
-                lgb.record_evaluation(eval_results),
-            ]
-
-            # Si on utilise la fonction de perte binary_logloss
-            if self.loss == "binary":
-                lgb_objective = "binary"
-                if self.metric == "auc":
-                    feval = None
-                else:
-                    # La fonction de perte étant "buit-in", le modèle renvoie des probas et non des logits
-                    feval_business = make_feval_business_gain(
-                        threshold_prob, preds_are_logits=False
-                    )
-                    feval = [feval_business]
-
-                alpha = 1.0
-
-            # Si on utilise une fonction de perte personnalisée qui pondère la binary_cross_entropy
-            elif self.loss == "weighted_logloss":
-                # alpha < 1.0 réduit le nombre de faux négatifs, 1 équivaut à loss="binary" (à condition de boost_from_average=False)
-                # et alpha > 1 réduirait le nombre de faux positifs
-                # alpha = trial.suggest_float("alpha", 1.0, 20.0)
-                lgb_objective = make_objective_weighted_logloss(alpha)
-                if self.metric == "auc":
-                    feval = [feval_auc]
-                else:
-                    # La fonction de perte étant personnalisée, le modèle renvoie des logits et non des probas
-                    feval_business = make_feval_business_gain(
-                        threshold_prob, preds_are_logits=True
-                    )
-                    feval = [feval_business]
-
-            # Si on a de l'oversampling ou de l'undersampling, on recherche le nombre de voisins,
-            # ainsi que le ratio classe minoritaire / classe majoritaire
-            if self.meta.balance == "none":
-                k_neighbors = 0
-                sampling_strategy = 0
-            else:
-                k_neighbors = trial.suggest_int("k_neighbors", 3, 6)
-                sampling_strategy = trial.suggest_float("sampling_strategy", 0.1, 1.0)
-
-            lgb_params = {
-                "force_col_wise": True,
-                "boosting_type": "gbdt",
-                # "boost_from_average": False,
-                "deterministic": self.deterministic,
-                "objective": lgb_objective,
-                "metrics": metrics,
-                "scale_pos_weight": scale_pos_weight,
-                "lambda_l1": lambda_l1,
-                "lambda_l2": lambda_l2,
-                "num_leaves": num_leaves,
-                "feature_fraction": feature_fraction,
-                "bagging_fraction": bagging_fraction,
-                "bagging_freq": bagging_freq,
-                "min_child_samples": min_child_samples,
-                "learning_rate": learning_rate,
-                "max_bin": max_bin,
-                "num_threads": self.lgb_n_threads,
-                "verbosity": -1,
-                "verbose_eval": False,
-            }
-
-            # Paramètres utilisés dans le train et dans le scoring
-            other_params = {
-                "n_estimators": n_estimators,
-                "feval": feval,
-                "callbacks": callbacks,
-                "loss": self.loss,
-                "threshold_prob": threshold_prob,
-            }
-            all_params = {
-                k: v
-                for k, v in lgb_params.items()
-                if k
-                not in [
-                    "random_seed",
-                    "verbosity",
-                    "verbose",
-                    "verbose_eval",
-                    "objective",
-                    "metrics",
-                    "num_threads",
-                ]
-            }
-            all_params["n_estimators"] = n_estimators
-            all_params["loss"] = self.loss
-            all_params["alpha"] = alpha
-            all_params["balance"] = self.meta.balance
-            all_params["k_neigbors"] = k_neighbors
-            all_params["sampling_strategy"] = sampling_strategy
+            # On suggère tous les paramètres possibles
+            all_params = self.suggest_all_params(trial=trial)
             mlflow.log_params(all_params)
 
-            predictors = [
-                f for f in self.X.columns if f not in ["SK_ID_CURR", "TARGET"]
-            ]
+            params_model = self.get_params_of_model(all_params)
+            # threshold_prob = self.get_threshold_prob(all_params)
+            # params_fit = self.get_params_fit(all_params)
+            params_balance = self.get_params_balance(all_params)
 
-            # On construit la liste des folds avec des index en position relative
-            folds_list = pd_build_folds_list(
-                n_folds=self.n_folds,
-                X=self.X[predictors],
-                y=self.y,
-                random_state=VAL_SEED,
-            )
+            other_params = self.get_params_fit(all_params)
+            other_params["threshold_prob"] = self.get_threshold_prob(all_params)
 
-            all_scores = {
-                "auc": [],
-                "accuracy": [],
-                "recall": [],
-                "penalized_f1": [],
-                "business_gain": [],
-                "fit_time": [],
-                "tn": [],
-                "tp": [],
-                "fn": [],
-                "fp": [],
+            mlflow.log_params(all_params)
+
+            kwargs = {
+                "clf": params_model,
+                "other_params": other_params,
+                "balance": self.meta.balance,
+                "k_neighbors": params_balance["k_neighbors"],
+                "sampling_strategy": params_balance["sampling_strategy"],
+                # "trial": trial,
             }
 
-            for train_idx, valid_idx in folds_list:
-                X_train = self.X[predictors].iloc[train_idx]
-                X_val = self.X[predictors].iloc[valid_idx]
-                y_train = self.y.iloc[train_idx]
-                y_val = self.y.iloc[valid_idx]
-
-                X_train_balanced, y_train_balanced, X_val_processed = (
-                    pre_process_1_fold(
-                        X_train=X_train,
-                        y_train=y_train,
-                        X_val=X_val,
-                        pipe_preprocess=self.pipe_preprocess,
-                        balance=self.meta.balance,
-                        k_neighbors=k_neighbors,
-                        sampling_strategy=sampling_strategy,
-                    )
-                )
-
-                fold_scores = lgb_validate_1_fold(
-                    X_train=X_train_balanced,
-                    y_train=y_train_balanced,
-                    X_test=X_val_processed,
-                    y_test=y_val,
-                    model_params=lgb_params,
-                    other_params=other_params,
-                )
-                for k in all_scores.keys():
-                    all_scores[k].append(fold_scores[k])
-
-                del X_train
-                del X_train_balanced
-                del y_train
-                del y_train_balanced
-                del X_val
-                del X_val_processed
-                del y_val
-                del fold_scores
-
-                gc.collect()
+            # On calcule les scores sur les jeux de validation en validation croisée
+            self.process_n_folds(**kwargs)
 
             # Dans optuna, il ne sera loggé par défaut que la métrique à optimiser, pour loguer toutes les métriques,
             # On utilise set_user_attr qui permet de personnaliser ce qu'on veut logguer dans Optuna
-            mean_scores = {k: np.mean(v) for (k, v) in all_scores.items()}
+            mean_scores = {k: np.mean(v) for (k, v) in self._all_val_scores.items()}
+
             trial.set_user_attr("mean_scores", mean_scores)
 
             # On loggue les scores moyens dans mlflow
             mlflow.log_metrics(mean_scores)
 
         return mean_scores[self.metric]
+
+    def process_1_fold(self, X_train, X_val, y_train, y_val, i_fold, *args, **kwargs):
+        X_train_balanced, y_train_balanced, X_val_processed = pre_process_1_fold(
+            X_train=X_train,
+            y_train=y_train,
+            X_val=X_val,
+            pipe_preprocess=self.pipe_preprocess,
+            balance=self.meta.balance,
+            k_neighbors=kwargs["k_neighbors"],
+            sampling_strategy=kwargs["sampling_strategy"],
+        )
+
+        fold_scores = lgb_validate_1_fold(
+            X_train=X_train_balanced,
+            y_train=y_train_balanced,
+            X_test=X_val_processed,
+            y_test=y_val,
+            model_params=kwargs["clf"],
+            other_params=kwargs["other_params"],
+        )
+
+        for k in self._all_val_scores.keys():
+            self._all_val_scores[k].append(fold_scores[k])
+        return
 
     def hide_lgb_log(self):
         log_stream = io.StringIO()
@@ -661,10 +947,13 @@ class SearchLgb(ExpSearch):
             n_trials=n_trials,
             n_jobs=1,
             gc_after_trial=True,
-            # call_backs=pruning_callback,
         )
 
     def run(self, n_trials=10, verbose=False, lgb_n_threads=None):
+        warnings.filterwarnings(
+            "ignore",
+            category=UserWarning,
+        )
         if lgb_n_threads:
             self.lgb_n_threads = lgb_n_threads
 
@@ -680,6 +969,7 @@ class SearchLgb(ExpSearch):
 
         self.run_lgb_trials(n_trials=n_trials, verbose=verbose)
         print("Durée de l'optimisation (hh:mm:ss) :", format_time(time.time() - t0))
+        print()
         self.print_best_trial()
         print("Nombre total de trials élagués (=pruned) :", self.counts_pruned_trials())
         print()
@@ -692,7 +982,7 @@ class SearchLgb(ExpSearch):
             if k not in ["threshold_prob", "k_neighbors"] and not pd.isna(v)
         }"""
 
-    def get_params_of_model(self):
+    """def get_params_of_model(self):
         suggested_params = self.get_suggested_params()
         params_of_model = {
             k: v
@@ -703,7 +993,7 @@ class SearchLgb(ExpSearch):
         params_of_model["force_col_wise"] = True
         params_of_model["boosting_type"] = "gbdt"
         params_of_model["loss"] = self.loss
-        return params_of_model
+        return params_of_model"""
 
 
 """

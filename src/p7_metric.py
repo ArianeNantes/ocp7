@@ -6,7 +6,7 @@ from sklearn.metrics import (
 )
 from scipy import special
 
-EPSILON = 1e-15
+from src.p7_constantes import EPSILON
 
 
 def clip_sigmoid(logits, epsilon=EPSILON):
@@ -18,6 +18,7 @@ def clip_sigmoid(logits, epsilon=EPSILON):
     return prob
 
 
+# Imite la fonction de perte binary logloss. Permet de tester les fonctions personnalisées
 def logloss_objective(pred_raw_scores, train_data):
     y_true = train_data.get_label()
 
@@ -41,10 +42,53 @@ def logloss_metric(pred_raw_scores, train_data):
     return "logloss", -ll.mean(), is_higher_better
 
 
+# Pour diminuer les Faux négatifs, choisir alpha > 1 (pour diminuer les Faux positifs, alpha < 1)
+# Plus alpha est grand, plus on augmente le recall et on diminue la précision
+# Plus alpha est petit, plus on augmente la précision et on diminue le recall
+def weighted_logloss_from_preds(logits, train_data, alpha=1.0):
+    y_true = train_data.get_label()
+    prob = clip_sigmoid(logits)
+
+    grad = (y_true * prob * (alpha - 1)) + prob - (alpha * y_true)
+    hess = (y_true * (alpha - 1) + 1) * prob * (1 - prob)
+
+    return grad, hess
+
+
+def make_objective_weighted_logloss(alpha=1.0):
+    def objective_weighted_logloss_wrapper(logits, train_data):
+        return weighted_logloss_from_preds(
+            logits=logits,
+            train_data=train_data,
+            alpha=alpha,
+        )
+
+    return objective_weighted_logloss_wrapper
+
+
+# Non utilisée car on mesure l'auc ou le business gain pour les callbacks.
+# Si on voulait l'utiliser dans feval, il faudrait faire un wrapper pour respecter
+# la signature imposer (sans alpha). Voir exemple business_gain
+"""def weighted_logloss_metric(logits, dtrain, alpha=1.0):
+
+    y = dtrain.get_label()
+    probs = clip_sigmoid(logits)
+    elements = -alpha * y * np.log(probs) - (1 - y) * np.log(1 - probs)
+    is_higher_better = False
+    return f"WCE_alpha{alpha}", (np.sum(elements) / len(y)), is_higher_better"""
+
+
 # Permet d'intégrer l'auc score dans feval pour lgbm afin de pruner sur l'auc avec optuna
+# Nécessaire si la loss est une fonction personnalisée car le modèle produit alors des logits au lieu des probas
 # La signature est imposée
-def feval_auc(pred_logits, lgbDataset):
+def feval_auc_logits(pred_logits, lgbDataset):
     pred_probs = special.expit(pred_logits)
+    y_true = lgbDataset.get_label()
+    is_higher_better = True
+    return "auc", roc_auc_score(y_true, pred_probs), is_higher_better
+
+
+def feval_auc_probs(pred_probs, lgbDataset):
     y_true = lgbDataset.get_label()
     is_higher_better = True
     return "auc", roc_auc_score(y_true, pred_probs), is_higher_better
@@ -123,9 +167,8 @@ def penalize_f1_old(y_true, y_pred, weight_fn=10, weight_fp=1):
     return weighted_f1
 
 
-def penalize_business_gain(
-    tn, fp, fn, tp, gain_tp=5, gain_tn=55, loss_fp=50, loss_fn=500
-):
+# [TODO] Remplacer partout l'appel de cette fonc par business_gain_score puis supprimer la fonction
+def penalize_business_gain(tn, fp, fn, tp, gain_tp=1, gain_tn=1, loss_fp=1, loss_fn=10):
     gain = gain_tp * tp + gain_tn * tn - loss_fp * fp - loss_fn * fn
 
     n_default = tp + fn
@@ -134,6 +177,24 @@ def penalize_business_gain(
     min_gain = -loss_fp * n_default - loss_fn * n_ok
     normalized_gain = (gain - min_gain) / (max_gain - min_gain)
 
+    return normalized_gain
+
+
+# Calcule le score métier. Le score maximum est 1
+def business_gain_score(tn, fp, fn, tp, gain_tp=5, gain_tn=1, loss_fp=1, loss_fn=10):
+    gain = gain_tp * tp + gain_tn * tn - loss_fp * fp - loss_fn * fn
+
+    # Nombre de défauts réels
+    n_default = tp + fn
+    # Nombre de remboursements OK réels
+    n_ok = tn + fp
+
+    # Maximum de gain métier en valeur, si on a tout prédit correctement
+    max_gain = gain_tp * n_default + gain_tn * n_ok
+    # Minimum de gain métier en valeur, si toutes les prédictions sont fausses
+    min_gain = -loss_fp * n_default - loss_fn * n_ok
+    # On ramène en pourcentage
+    normalized_gain = (gain - min_gain) / (max_gain - min_gain)
     return normalized_gain
 
 

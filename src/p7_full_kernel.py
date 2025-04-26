@@ -438,7 +438,7 @@ class DataFull:
             df["AMT_INCOME_TOTAL"] < 20000000
         ]  # Max income in test is 4M; train has a 117M value
         # Contraitrement à Pandas, l'introduction de cudf.NA dans une colonne ne modifie pas le type de la colonne en object
-        # De même, l'introduire np.nan ne modifie pas le type de la colonne en float64, il faut donc caste ravant
+        # De même, l'introduire np.nan ne modifie pas le type de la colonne en float64, il faut donc caster avant
         """df[["DAYS_EMPLOYED", "DAYS_LAST_PHONE_CHANGE"]] = df[
             ["DAYS_EMPLOYED", "DAYS_LAST_PHONE_CHANGE"]
         ].astype("float64")"""

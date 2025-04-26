@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+import cudf
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.gridspec as gridspec
@@ -51,7 +52,7 @@ RUBRIQUE BALANCE
 
 
 def plot_default_ratio(series):
-    labels = ["Ok", "Défaut"]
+    labels = ["Remb. Ok", "Défaut"]
     # Plot en camembert
     fig, ax = plt.subplots(figsize=(7, 5))
     fig.suptitle(
@@ -69,8 +70,7 @@ def plot_default_ratio(series):
 
     fig.legend(loc="lower right")
     fig.tight_layout()
-    plt.show()
-    return
+    return fig
 
 
 """***********************************************************************************************************************

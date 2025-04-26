@@ -8,6 +8,7 @@ import pandas as pd
 import lightgbm as lgb
 import re
 import gc
+import cupy as cp
 import os
 import time
 from contextlib import contextmanager
@@ -17,6 +18,9 @@ import cuml
 from cuml.pipeline import Pipeline
 from cuml.linear_model import LogisticRegression
 from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.utils.validation import check_X_y as sk_valid_check_X_y
+from sklearn.utils.validation import check_array as sk_valid_check_array
 from sklearn.metrics import (
     roc_auc_score,
     confusion_matrix,
@@ -29,6 +33,7 @@ from sklearn.metrics import (
     recall_score,
     precision_score,
 )
+from sklearn.model_selection import train_test_split as sk_train_test_split
 from scipy import special
 from IPython.display import display
 import warnings
@@ -62,6 +67,184 @@ from src.p7_constantes import (
 )
 from src.p7_simple_kernel import CONFIG_SIMPLE
 from src.p7_util import timer
+
+
+# wrapper pour pouvoir utiliser des fonctionnalités avancées de sklearn avec un modèle de type cuml
+class CumlWrapper:
+    def __init__(self, cuml_model):
+        self.cuml_model = cuml_model
+
+    def fit(self, X, y):
+        X, y = sk_valid_check_X_y(X, y)
+        self.cuml_model.fit(X, y)
+        return self
+
+    def predict(self, X):
+        X = sk_valid_check_array(X)
+        return self.cuml_model.predict(
+            X
+        ).get()  # `.get()` pour récupérer un numpy array
+
+    def predict_proba(self, X):
+        X = sk_valid_check_array(X)
+        return self.cuml_model.predict_proba(X).get()
+
+    def score(self, X, y):
+        X, y = sk_valid_check_X_y(X, y)
+        return self.cuml_model.score(X, y).get()
+
+
+# wrapper pour pouvoir utiliser un LightGbm dans un pipe cuda (permutation)
+class WrapperLgbForCuda(BaseEstimator, ClassifierMixin):
+    def __init__(self, X_val, y_val, params_model={}, threshold_prob=0.5):
+        self.eval_set = [(X_val.to_pandas(), y_val.to_pandas())]
+        self.params_model = params_model
+        self.threshold_prob = 0.5
+        self.model = LGBMClassifier(**self.params_model)
+        self._fit_time = 0
+
+    def fit(self, X_train, y_train):
+        t0 = time.time()
+
+        metrics = {}
+        callbacks = [
+            lgb.early_stopping(stopping_rounds=20),
+            lgb.log_evaluation(period=50),
+            lgb.record_evaluation(metrics),
+        ]
+
+        # print("Fit")
+        self.model.fit(
+            X_train.to_pandas(),
+            y_train.to_pandas(),
+            eval_set=self.eval_set,
+            eval_metric={"auc"},
+            callbacks=callbacks,
+        )
+        self._fit_time = time.time() - t0
+
+        return self
+
+    def predict_proba(self, X_val):
+        cudf_pred_prob = cudf.DataFrame(
+            self.model.predict_proba(
+                X_val.to_pandas(), num_iteration=self.model.best_iteration_
+            ),  # columns=[0, 1]
+        )
+        return cudf_pred_prob
+
+    def predict(self, X_val):
+        # Prend les probabilités d'appartenir à la classe défaut
+        y_prob = self.predict_proba(X_val)[1]
+        return cu_pred_prob_to_binary(y_prob, threshold=self.threshold)
+
+    def set_params(self, **params):
+        self.threshold = params.get("threshold", self.threshold)
+        self.model.set_params(**params)
+        return self
+
+    def get_params(self, deep=True):
+        return {"threshold": self.threshold, **self.model.get_params(deep)}
+
+    def score(self, X_val, y_val):
+        # Par défaut sklearn renvoie l'accuracy, mais nous voulons renvoyer l'auc
+        # return self.model.score(X, y)
+        proba = self.predict_proba(X_val)[1]
+        return cuml.metrics.roc_auc_score(y_val, proba)
+
+    def evaluate(self, X_val, y_val):
+        y_prob = self.predict_proba(X_val)[1]
+        y_pred = self.predict(X_val)
+
+        # Mesures sur le jeu de validation
+        # Order C applatit la matrice en ligne comme ravel() de numpy, mais
+        # Attention, ne renvoie pas des scalaires mais des cupy ndarrays
+        mat = cuml.metrics.confusion_matrix(y_val, y_pred)
+        tn_array, fp_array, fn_array, tp_array = mat.ravel(order="C")
+        # On extrait les scalaires des cupy ndarrays()
+        tn = tn_array.item()
+        fp = fp_array.item()
+        fn = fn_array.item()
+        tp = tp_array.item()
+
+        # On enregistre les scores dans le dictionnaire
+        scores = {}
+        scores["tn"] = tn
+        scores["fn"] = fn
+        scores["tp"] = tp
+        scores["fp"] = fp
+        scores["auc"] = cuml.metrics.roc_auc_score(y_val, y_prob)
+        scores["accuracy"] = cuml.metrics.accuracy_score(y_val, y_pred)
+        scores["recall"] = cupd_recall_score(tp=tp, fn=fn)
+        scores["penalized_f1"] = penalize_f1(tp=tp, fp=fp, fn=fn)
+        scores["business_gain"] = penalize_business_gain(tp=tp, fn=fn, tn=tn, fp=fp)
+        scores["fit_time"] = self._fit_time
+        return scores
+
+
+# wrapper pour pouvoir logguer un modèle de régression logistique cuml dans mlflow
+class WrapperLogReg(BaseEstimator, ClassifierMixin):
+    def __init__(self, model=LogisticRegression(), threshold=0.5):
+        self.model = model
+        self.threshold = threshold
+        self._fit_time = 0
+
+    def fit(self, X, y):
+        t0 = time.time()
+        self.model.fit(X, y)
+        self._fit_time = time.time() - t0
+        return self
+
+    def predict_proba(self, X):
+        return self.model.predict_proba(X)
+
+    def predict(self, X):
+        # Prend les probabilités d'appartenir à la classe défaut
+        y_prob = self.predict_proba(X)[1]
+        return cu_pred_prob_to_binary(y_prob, threshold=self.threshold)
+
+    def set_params(self, **params):
+        self.threshold = params.get("threshold", self.threshold)
+        self.model.set_params(**params)
+        return self
+
+    def get_params(self, deep=True):
+        return {"threshold": self.threshold, **self.model.get_params(deep)}
+
+    def score(self, X, y):
+        # Par défaut sklearn renvoie l'accuracy, mais nous voulons renvoyer l'auc
+        # return self.model.score(X, y)
+        proba = self.predict_proba(X)[:, 1]
+        return cuml.metrics.roc_auc_score(y, proba)
+
+    def evaluate(self, X, y):
+        y_prob = self.predict_proba(X)[1]
+        y_pred = self.predict(X)
+
+        # Mesures sur le jeu de validation
+        # Order C applatit la matrice en ligne comme ravel() de numpy, mais
+        # Attention, ne renvoie pas des scalaires mais des cupy ndarrays
+        mat = cuml.metrics.confusion_matrix(y, y_pred)
+        tn_array, fp_array, fn_array, tp_array = mat.ravel(order="C")
+        # On extrait les scalaires des cupy ndarrays()
+        tn = tn_array.item()
+        fp = fp_array.item()
+        fn = fn_array.item()
+        tp = tp_array.item()
+
+        # On enregistre les scores dans le dictionnaire
+        scores = {}
+        scores["tn"] = tn
+        scores["fn"] = fn
+        scores["tp"] = tp
+        scores["fp"] = fp
+        scores["auc"] = cuml.metrics.roc_auc_score(y, y_prob)
+        scores["accuracy"] = cuml.metrics.accuracy_score(y, y_pred)
+        scores["recall"] = cupd_recall_score(tp=tp, fn=fn)
+        scores["penalized_f1"] = penalize_f1(tp=tp, fp=fp, fn=fn)
+        scores["business_gain"] = penalize_business_gain(tp=tp, fn=fn, tn=tn, fp=fp)
+        scores["fit_time"] = self._fit_time
+        return scores
 
 
 # see : https://github.com/jrzaurin/LightGBM-with-Focal-Loss/blob/d510432cdccd680c7fd3f3cbe780db69ccc297a4/utils/metrics.py
@@ -203,6 +386,35 @@ def lgb_cross_evaluate(
     return cv_results
 
 
+# Pour dataframe pandas (pas cudf)
+# Construit des folds même si n_folds = 1. Les index sont relatifs et non positionnels tels que dans X.index.
+def pd_build_folds_list(n_folds, X, y, random_state=VAL_SEED, frac_test=0.25):
+    # Si on utilise pas la validation croisée (temps de calculs trop longs)
+    if n_folds == 1:
+        X_train, X_val, y_train, y_val = sk_train_test_split(
+            X,
+            y,
+            stratify=y,
+            test_size=frac_test,
+            random_state=random_state,
+        )
+        # Conversion des indices en indices positionnels relatifs à X
+        train_idx = X.index.get_indexer(X_train.index)
+        valid_idx = X.index.get_indexer(X_val.index)
+        folds_list = [(train_idx, valid_idx)]
+
+    # Si on utilise la validation croisée:
+    else:
+        folds = StratifiedKFold(
+            n_splits=n_folds,
+            shuffle=True,
+            random_state=VAL_SEED,
+        )
+        folds_list = [fold for fold in folds.split(X, y)]
+
+    return folds_list
+
+
 def pre_process_1_fold(
     X_train,
     y_train,
@@ -220,6 +432,10 @@ def pre_process_1_fold(
     else:
         X_train_processed = X_train
         X_val_processed = X_val
+
+    del X_train
+    del X_val
+    gc.collect()
 
     # Eventuel rééquilibrage avec SMOTE ou NearMiss
     if balance == "none":
@@ -246,7 +462,39 @@ def pre_process_1_fold(
         print(
             f"{balance} est une valeur incorrecte pour balance. Les valeurs possibles sont 'none', 'smote' ou 'nearmiss'"
         )
+
     return X_train_balanced, y_train_balanced, X_val_processed
+
+
+# X_train etc. sont déjà pre-processes et resampled. Les features ne sont que des prédicteurs (pas de SK_ID_CURR)
+def sk_validate_1_fold(X_train, y_train, X_test, y_test, sk_model, threshold_prob):
+    t0_fit_time = time.time()
+    model = deepcopy(sk_model)
+    model.fit(X_train, y_train)
+    fit_time = time.time() - t0_fit_time
+
+    y_score_val = model.predict_proba(X_test)[:, 1]
+    y_pred_val = pd_pred_prob_to_binary(y_score_val, threshold_prob)
+
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred_val).ravel()
+
+    # Mesures sur le jeu de validation
+    dic_val_scores = {}
+    dic_val_scores["auc"] = roc_auc_score(y_test, y_score_val)
+    dic_val_scores["accuracy"] = accuracy_score(y_test, y_pred_val)
+    dic_val_scores["recall"] = recall_score(y_test, y_pred_val)
+    dic_val_scores["penalized_f1"] = penalize_f1(fp=fp, fn=fn, tp=tp)
+    dic_val_scores["business_gain"] = penalize_business_gain(tn=tn, fp=fp, fn=fn, tp=tp)
+
+    dic_val_scores["fit_time"] = fit_time
+    dic_val_scores["tn"] = tn
+    dic_val_scores["fn"] = fn
+    dic_val_scores["tp"] = tp
+    dic_val_scores["fp"] = fp
+
+    del model
+    gc.collect()
+    return dic_val_scores
 
 
 # X_train etc. sont déjà pre-processes et resampled. Les features ne sont que des prédicteurs (pas de SK_ID_CURR)
@@ -256,21 +504,26 @@ def lgb_validate_1_fold(X_train, y_train, X_test, y_test, model_params, other_pa
         X_train,
         y_train,
         params={"verbosity": -1},
-        free_raw_data=False,
+        free_raw_data=True,
     )
     lgb_val = lgb.Dataset(
         X_test,
         y_test,
         reference=lgb_train,
         params={"verbosity": -1},
-        free_raw_data=False,
+        # [data leakage] ne change absolument rien au problème si True ou false (normal puisqu'on copie et détruit à chaque fois...)
+        free_raw_data=True,
     )
     t0_fit_time = time.time()
+    if "n_estimators" in model_params.keys():
+        num_boost_round = model_params["n_estimators"]
+    """else:
+        num_boost_round = other_params["num_boost_round"]"""
     model = lgb.train(
         params=model_params,
         train_set=lgb_train,
         valid_sets=[lgb_val],
-        num_boost_round=other_params["n_estimators"],
+        num_boost_round=num_boost_round,
         feval=other_params["feval"],
         callbacks=other_params["callbacks"],
     )
@@ -278,7 +531,7 @@ def lgb_validate_1_fold(X_train, y_train, X_test, y_test, model_params, other_pa
 
     # Si on utilise une fonc built-il pour la perte, le modèle renvoie déjà des probas,
     # Si on utilise les fonc perso, on a des logits et on doit appliquer sigmoid pour obtenir les probas,
-    if other_params["loss"] == "binary":
+    if model_params["objective"] == "binary":
         y_score_val = model.predict(X_test)
     else:
         y_score_val = special.expit(model.predict(X_test))
@@ -303,6 +556,55 @@ def lgb_validate_1_fold(X_train, y_train, X_test, y_test, model_params, other_pa
     dic_val_scores["fn"] = fn
     dic_val_scores["tp"] = tp
     dic_val_scores["fp"] = fp
+
+    del model
+    del lgb_train
+    del lgb_val
+    gc.collect()
+    return dic_val_scores
+
+
+# X_train etc. sont déjà pre-processes et resampled. Les features ne sont que des prédicteurs (pas de SK_ID_CURR)
+def cuml_validate_1_fold(
+    X_train, y_train, X_val, y_val, cuml_model, threshold_prob=0.5
+):
+    # Afin de repartir d'un modèle non fitté on copie le modèle initial
+    clf = deepcopy(cuml_model)
+    t0_fit_time = time.time()
+    clf.fit(X_train, y_train)
+    fit_time = time.time() - t0_fit_time
+
+    # Probabilité d'appartenir à la classe default pour le jeu de validation
+    y_score_val = clf.predict_proba(X_val)[1]
+    # Prédiction de la classe en fonction du seuil de probabilité
+    y_pred_val = cu_pred_prob_to_binary(y_score_val, threshold=threshold_prob)
+
+    # Mesures sur le jeu de validation
+    dic_val_scores = {}
+    # Order C applatit la matrice en ligne comme ravel() de numpy, mais
+    # Attention, ne renvoie pas des scalaires mais des cupy ndarrays
+    mat = cuml.metrics.confusion_matrix(y_val, y_pred_val)
+    tn_array, fp_array, fn_array, tp_array = mat.ravel(order="C")
+    # On extrait les scalaires des cupy ndarrays()
+    tn = tn_array.item()
+    fp = fp_array.item()
+    fn = fn_array.item()
+    tp = tp_array.item()
+    # On enregistre les scores dans le dictionnaire
+    dic_val_scores["tn"] = tn
+    dic_val_scores["fn"] = fn
+    dic_val_scores["tp"] = tp
+    dic_val_scores["fp"] = fp
+    dic_val_scores["auc"] = cuml.metrics.roc_auc_score(y_val, y_score_val)
+    dic_val_scores["accuracy"] = cuml.metrics.accuracy_score(y_val, y_pred_val)
+    dic_val_scores["recall"] = cupd_recall_score(tp=tp, fn=fn)
+    dic_val_scores["penalized_f1"] = penalize_f1(tp=tp, fp=fp, fn=fn)
+    dic_val_scores["business_gain"] = penalize_business_gain(tp=tp, fn=fn, tn=tn, fp=fp)
+    dic_val_scores["fit_time"] = fit_time
+
+    del clf
+    gc.collect()
+    cp._default_memory_pool.free_all_blocks()
     return dic_val_scores
 
 
@@ -857,16 +1159,18 @@ def cuml_cross_validate(
     return dic_val_scores
 
 
+# [TODO] intégrer un pipe avec corrélation et permutation ?
 def cuml_cross_evaluate(
     X_train_and_val,
     pipe_preprocess,
     cuml_model,
+    pipe_postprocess=None,
     balance="none",
     k_neighbors=5,
     y_train_and_val=None,
     train_scores=False,
     threshold_prob=0.5,
-    n_folds=5,
+    n_folds=4,
     random_state=42,
     verbose=False,
 ):
@@ -879,7 +1183,13 @@ def cuml_cross_evaluate(
     # A faire avant le pipe
     # binary_features = get_binary_features(train_and_val)
 
-    X_tmp = X_train_and_val[["SK_ID_CURR", predictors[0]]].to_numpy()
+    predictors_without_nan = [
+        f for f in predictors if X_train_and_val[f].isna().sum() == 0
+    ]
+
+    X_tmp = X_train_and_val[["SK_ID_CURR", predictors_without_nan[0]]].to_numpy(
+        copy=True
+    )
     if y_train_and_val is not None:
         y_tmp = y_train_and_val.to_pandas()
     else:
@@ -908,8 +1218,10 @@ def cuml_cross_evaluate(
         dic_train_scores = deepcopy(dic_val_scores)
 
     for train_idx_array, valid_idx_array in folds.split(X_tmp, y_tmp):
-        train_idx = train_idx_array.tolist()
-        valid_idx = valid_idx_array.tolist()
+        """train_idx = train_idx_array.tolist()
+        valid_idx = valid_idx_array.tolist()"""
+        train_idx = train_idx_array
+        valid_idx = valid_idx_array
         t0_fit_time = time.time()
         X_train = X_train_and_val[predictors].iloc[train_idx]
         X_val = X_train_and_val[predictors].iloc[valid_idx]
@@ -928,8 +1240,8 @@ def cuml_cross_evaluate(
 
         # Eventuel rééquilibrage avec SMOTE ou NearMiss
         if balance == "none":
-            X_train_balanced = X_train_processed
-            y_train_balanced = y_train
+            X_train_balanced = X_train_processed.copy()
+            y_train_balanced = y_train.copy()
         elif balance == "smote":
             X_train_balanced, y_train_balanced = balance_smote(
                 X_train_processed,
@@ -1036,18 +1348,38 @@ def cuml_cross_evaluate(
         return dic_val_scores
 
 
-def plot_roc_curve(y_true, y_score):
+def plot_roc_curve(
+    y_true,
+    y_score,
+    title="Receiver Operating Characteristic (ROC) Curve",
+    subtitle="",
+    figsize=(5, 5),
+):
     # Taux de faux positifs et taux de faux négatifs
     fpr, tpr, _ = roc_curve(y_true, y_score)
-    plt.figure()
+
+    fig, ax = plt.subplots(figsize=figsize)
+    fig.suptitle(title)
+
+    if subtitle:
+        # title = title + "\n" + subtitle
+        ax.set_title(
+            subtitle,
+            ha="left",
+            x=0,
+            # Les 3 solutions suivantes pour la fontsize sont équivallentes si on n'a pas modifé le comportement par défaut
+            # fontsize=plt.rcParams["font.size"],
+            # fontsize="medium",
+            fontsize=ax.xaxis.label.get_fontsize(),
+        )
     plt.plot(fpr, tpr, label="ROC Curve (sklearn)")
     plt.plot([0, 1], [0, 1], linestyle="--", color="grey")
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
-    plt.title("Receiver Operating Characteristic (ROC) Curve")
     plt.legend()
     plt.grid(True)
-    return
+    plt.tight_layout()
+    return fig
 
 
 def plot_precision_recall_curve(y_true, y_score):
@@ -1123,7 +1455,7 @@ def plot_recall_mean(
     fp,
     fn,
     tp,
-    title="Recall moyen (% par ligne)",
+    title="Matrice de confusion (% par ligne)",
     subtitle="",
     figsize=(5, 5),
     n_samples=True,
