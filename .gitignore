@@ -571,6 +571,9 @@ mlartifacts/
 artifacts/
 mlruns/
 p7env/
+cuenv/
+apienv/
+unused/
 .vscode/
 .wp7/
 *.csv
