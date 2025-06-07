@@ -26,12 +26,7 @@ import warnings
 from copy import deepcopy
 
 from src.modeling.p7_util import format_time
-from src.modeling.p7_metric import (
-    cu_pred_prob_to_binary,
-    cu_f1_score,
-    business_gain_score,
-    cupd_recall_score,
-)
+from src.modeling.p7_metric import business_gain_score
 
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -128,11 +123,12 @@ class EvaluatorCV:
         cv=5,
         score_train_set=True,
         param_bg={
-            "loss_fn": -50_000,
-            "loss_fp": -5_000,
-            "gain_tp": 5_000,
-            "gain_tn": 0,
+            "loss_fn": -10,
+            "loss_fp": -1,
+            "gain_tp": 1,
+            "gain_tn": 1,
         },
+        threshold_prob=0.5,
         device="GPU",
         random_state=42,
         verbose=True,
@@ -141,6 +137,7 @@ class EvaluatorCV:
         self.cv = cv
         self.score_train_set = score_train_set
         self.param_bg = param_bg
+        self.threshold_prob = threshold_prob
         self.random_state = random_state
         self.device = device
         self.verbose = verbose
@@ -162,7 +159,6 @@ class EvaluatorCV:
             self.model = self.pipe
         self.n_rows = None
         self.n_features = None
-        self.threshold_prob = 0.5
         # Balancing
         self.balance_str = "Unbalanced"
         model_params = self.model.get_params()
@@ -560,17 +556,19 @@ class Evaluator:
         self,
         pipe,
         score_train_set=True,
+        threshold_prob=0.5,
         param_bg={
-            "loss_fn": -50_000,
-            "loss_fp": -5_000,
-            "gain_tp": 5_000,
-            "gain_tn": 0,
+            "loss_fn": -10,
+            "loss_fp": -1,
+            "gain_tp": 1,
+            "gain_tn": 1,
         },
         random_state=VAL_SEED,
         verbose=True,
     ):
         self.pipe = deepcopy(pipe)
         self.score_train_set = score_train_set
+        self.threshold_prob = threshold_prob
         self.param_bg = param_bg
         self.random_state = random_state
         self.verbose = verbose
@@ -586,6 +584,9 @@ class Evaluator:
             self.model = self.pipe.steps[-1][1]
         else:
             self.model = self.pipe
+        self.n_rows = None
+        self.n_features = None
+        # Balancing
         self.balance_str = "Unbalanced"
         model_params = self.model.get_params()
         if "class_weight" in model_params.keys():
@@ -607,10 +608,8 @@ class Evaluator:
         y_train,
         X_test,
         y_test,
-        threshold_prob=0.5,
     ):
         self.start_time_ = time.time()
-        self.threshold_prob = threshold_prob
         self.val_scores = self._init_scores()
         self.fit_time = 0
         # Utilisés pour les tableaux récapitulatifs et sous-titres
@@ -966,71 +965,6 @@ class CumlWrapper:
     def score(self, X, y):
         X, y = sk_valid_check_X_y(X, y)
         return self.cuml_model.score(X, y).get()
-
-
-# wrapper pour pouvoir logguer un modèle de régression logistique cuml dans mlflow
-class WrapperLogReg(BaseEstimator, ClassifierMixin):
-    def __init__(self, model=LogisticRegression(), threshold=0.5):
-        self.model = model
-        self.threshold = threshold
-        self._fit_time = 0
-
-    def fit(self, X, y):
-        t0 = time.time()
-        self.model.fit(X, y)
-        self._fit_time = time.time() - t0
-        return self
-
-    def predict_proba(self, X):
-        return self.model.predict_proba(X)
-
-    def predict(self, X):
-        # Prend les probabilités d'appartenir à la classe défaut
-        y_prob = self.predict_proba(X)[1]
-        return cu_pred_prob_to_binary(y_prob, threshold=self.threshold)
-
-    def set_params(self, **params):
-        self.threshold = params.get("threshold", self.threshold)
-        self.model.set_params(**params)
-        return self
-
-    def get_params(self, deep=True):
-        return {"threshold": self.threshold, **self.model.get_params(deep)}
-
-    def score(self, X, y):
-        # Par défaut sklearn renvoie l'accuracy, mais nous voulons renvoyer l'auc
-        # return self.model.score(X, y)
-        proba = self.predict_proba(X)[:, 1]
-        return cuml.metrics.roc_auc_score(y, proba)
-
-    def evaluate(self, X, y):
-        y_prob = self.predict_proba(X)[1]
-        y_pred = self.predict(X)
-
-        # Mesures sur le jeu de validation
-        # Order C applatit la matrice en ligne comme ravel() de numpy, mais
-        # Attention, ne renvoie pas des scalaires mais des cupy ndarrays
-        mat = cuml.metrics.confusion_matrix(y, y_pred)
-        tn_array, fp_array, fn_array, tp_array = mat.ravel(order="C")
-        # On extrait les scalaires des cupy ndarrays()
-        tn = tn_array.item()
-        fp = fp_array.item()
-        fn = fn_array.item()
-        tp = tp_array.item()
-
-        # On enregistre les scores dans le dictionnaire
-        scores = {}
-        scores["tn"] = tn
-        scores["fn"] = fn
-        scores["tp"] = tp
-        scores["fp"] = fp
-        scores["auc"] = cuml.metrics.roc_auc_score(y, y_prob)
-        scores["accuracy"] = cuml.metrics.accuracy_score(y, y_pred)
-        scores["recall"] = cupd_recall_score(tp=tp, fn=fn)
-        scores["f1_score"] = cu_f1_score(tp=tp, fp=fp, fn=fn)
-        scores["business_gain"] = business_gain_score(tp=tp, fn=fn, tn=tn, fp=fp)
-        scores["fit_time"] = self._fit_time
-        return scores
 
 
 def plot_evaluation_scores(

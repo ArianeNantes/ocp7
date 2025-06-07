@@ -16,7 +16,9 @@ import re
 import cupy as cp
 from shapely import length
 
-from src.modeling.p7_constantes import MODEL_DIR
+import cudf
+
+from src.modeling.p7_constantes import MODEL_DIR, DATA_CLEAN_DIR
 
 
 @contextmanager
@@ -246,3 +248,39 @@ def search_item_regex(regex, search_in, case_sensitive=False, verbose=True):
         print(items_matched)
 
     return items_matched
+
+
+def read_train(
+    directory=DATA_CLEAN_DIR,
+    train_name="01_v2_vif_train.csv",
+    features=[],
+    optim=True,
+    clean_dtype=False,
+):
+    if features:
+        train = cudf.read_csv(os.path.join(directory, train_name))[
+            features + ["SK_ID_CURR", "TARGET"]
+        ].set_index("SK_ID_CURR")
+    else:
+        train = cudf.read_csv(os.path.join(directory, train_name)).set_index(
+            "SK_ID_CURR"
+        )
+    if optim:
+        train = reduce_memory_cudf(train)
+    predictors = [f for f in train.columns if f not in ["SK_ID_CURR", "TARGET"]]
+    X = train[predictors].to_pandas()
+    # Un modèle enregistré dans le registre mlflow, ne doit pas être entraîné sur des données de type intqui comportent des NaN.
+    # Par ailleurs, pour une analyse SHAP, les booléens peuvent nous poser des difficultés.
+    # Le plus simple est de transformer les int en float, puis de transformer les booéens en int.
+    if clean_dtype:
+        print("Cast des features")
+        int_features = X.select_dtypes(include="int").columns.to_list()
+        if int_features:
+            X[int_features] = X[int_features].astype("float")
+        bool_features = X.select_dtypes(include="bool").columns.to_list()
+        if bool_features:
+            X[bool_features] = X[bool_features].astype("int")
+    y = train["TARGET"].to_pandas()
+    print("\nInfo X_train")
+    X.info()
+    return X, y

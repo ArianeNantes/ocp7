@@ -27,7 +27,7 @@ class RfecvSelector(BaseEstimator, TransformerMixin):
         cv=4,
         min_features=100,
         step=1,
-        param_bg=None,
+        # param_bg=None,
         random_state=VAL_SEED,
         verbose=True,
     ):
@@ -41,7 +41,7 @@ class RfecvSelector(BaseEstimator, TransformerMixin):
             )
 
             self.min_features = self.min_features + self.step
-        self.param_bg = param_bg
+        # self.param_bg = param_bg
         self.random_state = random_state
         self.verbose = verbose
         # Si l'argument pipe est de type pipeline, on récupère le modèle dans le dernier step,

@@ -7,21 +7,6 @@ import gc
 import cupy as cp
 import time
 
-
-"""
-# Pour l'install de nearmiss
-# pip install -U imbalanced-learn
-# Dépendances critiques : numpy >= 1.19.5, scipy >= 1.6.0 
-https://imbalanced-learn.org/stable/install.html
--------
-Python (>= 3.8)
-NumPy (>= 1.17.3)
-SciPy (>= 1.5.0)
-Scikit-learn (>= 1.0.2)
-https://pypi.org/project/imbalanced-learn/
-"""
-
-# from src.modeling.p7_metric import business_gain_score
 from src.modeling.p7_util import format_time
 
 

@@ -1,19 +1,5 @@
-import matplotlib.pyplot as plt
-
-from matplotlib.cbook import CallbackRegistry
-import numpy as np
 import pandas as pd
-import lightgbm as lgb
-import re
-import gc
-import os
-import time
-from contextlib import contextmanager
-from lightgbm import LGBMClassifier, record_evaluation
-import cudf
-import cuml
-from cuml.pipeline import Pipeline
-from cuml.linear_model import LogisticRegression
+import matplotlib.pyplot as plt
 from sklearn.model_selection import StratifiedKFold as SkStratifiedKFold
 
 from src.modeling.p7_constantes import VAL_SEED
@@ -21,14 +7,6 @@ from src.modeling.p7_constantes import VAL_SEED
 
 # Calcule les importances de features (nombre de splits) grâce à un model comme un classifier LightGBM en validation croisée
 def importance_from_model(model, X, y, n_splits=5, seed=VAL_SEED):
-    """clf = lgb.LGBMClassifier(
-        n_threads=n_threads,
-        class_weight="balanced",
-        objective="binary",
-        random_state=seed,
-        verbosity=-1,  # Pour ne pas voir les logs
-    )"""
-
     folds = SkStratifiedKFold(
         n_splits=n_splits,
         shuffle=True,

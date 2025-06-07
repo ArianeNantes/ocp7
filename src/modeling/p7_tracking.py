@@ -1,33 +1,22 @@
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import os
-import shutil
-import gc
+
+# import gc
 import time
-import joblib
+
+# import joblib
 import subprocess
-import inspect
 import io
 from PIL import Image
 import json
-
-# from IPython.display import display
-# from plotly.io.kaleido import scope
-from collections import Counter
-from collections import defaultdict
-
-# import psycopg2
-# from psycopg2 import OperationalError
 import requests
+import shutil
 
 # import optuna
 # from optuna.storages import JournalStorage, JournalFileStorage, RDBStorage
-
 import mlflow
-import mlflow.pyfunc
 from mlflow.tracking import MlflowClient
-from mlflow.entities import ViewType
 
 from src.modeling.p7_secret import HOST_MLFLOW, PORT_MLFLOW
 
@@ -58,7 +47,7 @@ def start_mlflow_ui(host=HOST_MLFLOW, port=PORT_MLFLOW, mlflow_tracking_uri="./m
     # ui = User Interface (interface web de mlflow)
     mlflow_ui = f"http://{HOST_MLFLOW}:{PORT_MLFLOW}"
     if is_mlflow_ui_started(host=HOST_MLFLOW, port=PORT_MLFLOW, verbose=False):
-        print(f"L'interface web mlflow est déjà disponible à l'adresse {mlflow_ui}")
+        print(f"L'interface web mlflow est disponible à l'adresse {mlflow_ui}")
         return
     else:
         # uri = Uniform Resource Identifier, chemin vers l'endroit où mlflow stocke les donnée de suivi (runs, artifacts...) sur le disque
@@ -211,3 +200,36 @@ def log_features(X, artifact_path="features", filename="features.json"):
     # 3. Logger dans MLflow
     mlflow.log_text(json_buffer.read(), artifact_file=f"{artifact_path}/{filename}")
     return feature_dic
+
+
+# Supprime toutes les expériences mlflow qui commencent par un prefixe (dans l'interfacd web et sur le disque)
+def delete_experiments_with_prefix(prefix, artifacts_dir="mlflow_artifacts"):
+    client = MlflowClient()
+    # experiments = client.list_experiments()
+    experiments = mlflow.search_experiments(
+        view_type=mlflow.entities.ViewType.ACTIVE_ONLY
+    )
+
+    experiments_to_delete = [
+        experiment for experiment in experiments if experiment.name.startswith(prefix)
+    ]
+
+    experiment_ids_to_delete = [
+        experiment.experiment_id for experiment in experiments_to_delete
+    ]
+
+    experiment_names_to_delete = [
+        experiment.name for experiment in experiments_to_delete
+    ]
+    print(f"{len(experiment_names_to_delete)} expériences à supprimer dans mlflow :")
+    print(experiment_names_to_delete)
+
+    for id in experiment_ids_to_delete:
+        client.delete_experiment(id)
+
+    # On supprime également les artifacts sauvegardés sur disque correspondant aux exépriences
+    for name in experiment_names_to_delete:
+        dir_name = os.path.join(artifacts_dir, name)
+        shutil.rmtree(dir_name)
+
+    return experiment_names_to_delete

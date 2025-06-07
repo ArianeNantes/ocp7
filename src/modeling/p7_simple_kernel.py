@@ -48,6 +48,7 @@ from src.modeling.p7_util import reduce_memory_cudf
 from src.modeling.p7_preprocess import VarianceSelector, get_binary_features
 from src.modeling.p7_preprocess import train_test_split_nan
 from src.modeling.p7_file import make_dir
+from src.modeling.p7_util import read_pkl
 
 # from src.modeling.p7_regex import sel_var
 
@@ -55,7 +56,6 @@ warnings.simplefilter(action="ignore", category=FutureWarning)
 
 from src.modeling.p7_constantes import (
     DATA_CLEAN_DIR,
-    NUM_THREADS,
     DATA_BASE,
     DATA_INTERIM,
     MODEL_DIR,
@@ -92,7 +92,7 @@ class DataSimple:
         # self.features_oh_encoded = []
         # Features encodées en One_Hot
         self.features_oh_encoded = []
-        # liste des features provenant de la premère modalité des variables encodées OH
+        # liste des features provenant de la première modalité des variables encodées OH
         self._first_categories = []
         self.random_state = VAL_SEED
         self._device = "cuda"
@@ -104,7 +104,7 @@ class DataSimple:
     def public_attributes(self):
         return [k for k in self.__dict__.keys() if not k.startswith("_")]
 
-    def get_data(self):
+    def get_data(self, filename="application_train.csv"):
         if self.debug:
             print(f"DEBUG num_rows={self.n_rows}")
 
@@ -112,7 +112,7 @@ class DataSimple:
         self._first_categories = []
 
         with timer("Process Application"):
-            df = self.get_application()
+            df = self.get_application(filename=filename)
 
         with timer("Process bureau and bureau_balance"):
             bureau = self.get_bureau_and_balance()
@@ -161,17 +161,26 @@ class DataSimple:
         return df
 
     # Preprocess application_train.csv
-    def get_application(self):
+    def get_application(self, filename="application_train.csv"):
         # Read data, on ne lit pas application_test réservé à la compétition Kaggle. Nous recrérons un jeu de test avec target
         df = cudf.read_csv(
-            os.path.join(DATA_BASE, "application_train.csv"),
+            os.path.join(DATA_BASE, filename),
             nrows=self.n_rows,
             na_values=["XNA", "Unknown"],
             # Pour avoir des cuDF.NA partout (même si NaN dans le csv)
             keep_default_na=True,
         )
-        print("Nombre de lignes Application train + test: {}".format(len(df)))
-        # self.clear_target_in_testset(df)
+        if filename == "application_train.csv":
+            print("Nombre de lignes Application train + test: {}".format(len(df)))
+
+        # Application_test ne possède pas de target. Il n'est pas utilisé pour la modélisation mais
+        # pour le data drift et l'API
+        elif filename == "application_test.csv":
+            print(
+                "Nombre de lignes pour les demandes de prêts récentes: {}".format(
+                    len(df)
+                )
+            )
 
         # Optional: Remove 4 applications with XNA CODE_GENDER (train set)
         # Les valeurs manquantes sont toutes des Non defaut
@@ -866,3 +875,97 @@ def get_available_memory(verbose=True, threshold=0.85):
     if verbose:
         print(f"RAM disponible au seuil de {threshold:.0%} : {memory_available_gb} Go")
     return memory_available_gb
+
+
+# On ne pensait pas au départ que nous devions utiliser application_test,
+# or cela est utile pour l'API, et surtout pour le data drift.
+# il est trop tard pour le prévoir dès la classe DataSimple.
+# Heureusement on peut construire ces données a posteriori grâce à la classe DataSimple
+def build_X_new_loans(directory="", features=[], dic_dtype=None):
+    if not directory:
+        directory = MODEL_DIR
+    # Par défaut nous voulons les features de notre meilleur modèle
+    if not features:
+        features_path = os.path.join(directory, "features_rfecv_lightgbm")
+        features = read_pkl(directory=directory, filename="features_rfecv_lightgbm")
+
+    data_builder = DataSimple()
+
+    # On ne supprime pas les première catégories car celles_ci sont identifiées quand on construit le train.
+    data_builder.init_config(debug=False, drop_first=False, na_value=np.nan)
+    data_builder.print_config()
+
+    # On agrège les données comme pour le train et le test
+    with timer(f"Pipeline d'agrégation des données sur {data_builder._device.upper()}"):
+        cu_df_new_loans = data_builder.get_data("application_test.csv")
+
+    print("\nRenommage des colonnes et Traitement des valeurs inf")
+    # On fait subir les mêmes traitements basiques que les données du train
+    cu_df_new_loans = cu_df_new_loans.rename(
+        columns=lambda x: re.sub("[^A-Za-z0-9_]+", "", x)
+    )
+    cu_df_new_loans = data_builder.inf_to_nan(cu_df_new_loans)
+
+    # On supprime les features en trop (Etapes drop_first, variance nulle, VIF, RFECV)
+    features_to_drop = [
+        f
+        for f in cu_df_new_loans.columns
+        if f not in features + ["TARGET", "SK_ID_CURR"]
+    ]
+    cu_df_new_loans = cu_df_new_loans.drop(columns=features_to_drop)
+    cu_df_new_loans = data_builder.cast_and_optimize(cu_df_new_loans)
+
+    print(f"\n{len(features_to_drop)} features inutiles supprimées")
+
+    # Il pourrait manquer des features si dans application_test, il n'y avait pas toutes les catégories
+    # encodées en OHE pendant la construction du train.
+    # Pour notre meilleur modèle, il ne manque rien, mais on ne sait jamais.
+    missing_features = [f for f in features if f not in cu_df_new_loans.columns]
+    if missing_features:
+        print(
+            f"{len(missing_features)} features n'ont pas été créées dans le nouveau jeu de données"
+        )
+        print(
+            "On les crée avec la valeur 0 (= l'enregistrement n'est pas de cette catégorie"
+        )
+        cu_df_new_loans[missing_features] = 0
+    else:
+        print(
+            "Toutes les catégories des features encodées en OHE sont présentes dans le nouveau jeu de données"
+        )
+
+    # On place "SK_ID_CURR" en index et on le dit
+    cu_df_new_loans = cu_df_new_loans.set_index("SK_ID_CURR")
+    print("Indexation par 'SK_ID_CURR'")
+
+    # On transforme en pandas DataFrame
+    df_new_loans = cu_df_new_loans.to_pandas()
+
+    # Si un dictionnaire de types pour les features, on caste toutes les features avec ce dictionnaire
+    # Les clefs du dictionnaire doivent correspondre aux features présentes
+    if dic_dtype is not None:
+        # On met un warning si les clefs du dictionnaire ne correspondent pas aux features
+        features_in_dic_not_in_features = [
+            f for f in dic_dtype.keys() if f not in features
+        ]
+        features_in_features_not_in_dic = [
+            f for f in features if f not in dic_dtype.keys()
+        ]
+        if features_in_dic_not_in_features:
+            print(
+                f"WARNING : {len(features_in_dic_not_in_features)} features du dictionnaire dic_dtype ne figurent pas dans la liste des features"
+            )
+            print(features_in_dic_not_in_features)
+        if features_in_features_not_in_dic:
+            print(
+                f"WARNING : {len(features_in_features_not_in_dic)} features n'ont pas de type dans le dictionnaire dic_dtype"
+            )
+            print(features_in_features_not_in_dic)
+
+        # On effectue le cast selon le dictionnaire
+        df_new_loans = df_new_loans.astype(dic_dtype)
+
+    # On imprime les infos()
+    print("\nInfo new loans :")
+    print(df_new_loans.info())
+    return df_new_loans
