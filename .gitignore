@@ -528,6 +528,7 @@ celerybeat.pid
 .env
 .venv
 env/
+envapi/
 venv/
 ENV/
 env.bak/
@@ -567,7 +568,11 @@ cython_debug/
 ##################################################################################### custom
 data/
 models/
+# Sauf ces fichiers spécifiques
+!models/best_model_lgbm.pkl
+!models/explainer_lgbm.pkl
 mlartifacts/
+mlflow_artifacts/
 artifacts/
 mlruns/
 p7env/
