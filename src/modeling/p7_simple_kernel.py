@@ -100,6 +100,15 @@ class DataSimple:
         self._train_idx = None
         self._test_idx = None
 
+        # Dictionnaire utilisé pour les features non encodées en One Hot de la table Application,
+        # afin d'effectuer toujours les mêmes remplacements
+        self.mapping_dicts = {
+            "CODE_GENDER": {"M": 0, "F": 1, "XNA": -1},
+            "FLAG_OWN_CAR": {"N": 0, "Y": 1},
+            "FLAG_OWN_REALTY": {"N": 1, "Y": 0},
+            "EMERGENCYSTATE_MODE": {"No": 0, "Yes": 1},
+        }
+
     @property
     def public_attributes(self):
         return [k for k in self.__dict__.keys() if not k.startswith("_")]
@@ -188,14 +197,39 @@ class DataSimple:
 
         # Categorical features with Binary encode (0 or 1; two categories)
         # FLAG_OW_CAR et FLAG_OWN_REALTY n'ont aucune valeur manquante
-        # Nous n'aurons donc pas de valeur négative avec pd.factorize
-        for bin_feature in [
+        # On n'utilise pas factorize car l'ordre d'encodage dépend de l'ordre d'apparition des valeurs
+        # A la place on utilise un dictionnaire de remplacement qui sera toujours le même quelque soit le nouveau jeu de données.
+        """for bin_feature in [
             "CODE_GENDER",
             "FLAG_OWN_CAR",
             "FLAG_OWN_REALTY",
             "EMERGENCYSTATE_MODE",
         ]:
-            df[bin_feature], uniques = cudf.factorize(df[bin_feature])
+            df[bin_feature], uniques = cudf.factorize(df[bin_feature])"""
+
+        f"""or col, mapping in self.mapping_dicts.items():
+            df[col] = df[col].replace(mapping)"""
+
+        f"""or col, mapping in self.mapping_dicts.items():
+            if col in df.columns:
+                # Convertir les clés ET valeurs en str pour satisfaire cuDF
+                mapping_str = 
+
+                # Appliquer le remplacement
+                df[col] = df[col].replace(mapping_str)
+
+                # Convertir ensuite les résultats en int (pas possible en cudf de le faire immédiatement)
+                # En effet en contrairement à PAndas,cudf.Series.replace() ne supporte pas un mapping dict si les clés sont des chaînes (str) et
+                # les valeurs sont des entiers (int64). Il faut tout mettre en str (clés et valeurs puis convertir après coup)
+                if self.na_value is not np.nan and not df[col].isnull().any():
+                    df[col] = df[col].astype(
+                        "int64"
+                    )  # attention : .astype(np.int64) peut poser souci avec cudf"""
+        for col, mapping in self.mapping_dicts.items():
+            if col in df.columns:
+                df[col] = df[col].map(mapping)
+        df["CODE_GENDER"] = df["CODE_GENDER"].astype(int)
+
         # CODE_GENDER et EMERGENCYSTATE_MODE ont des NaN
         # si na_value est np.nan, elle est en float64. On ne remplace les valeurs -1 issus de factorize par des na_value
         # si na_value est cudf.NA, les na sont très bien gérés dans les cudf même pour les bool (pas de type mixte ni object dans les cudf),

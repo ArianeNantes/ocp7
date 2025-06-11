@@ -242,3 +242,139 @@ def highlight_selected_columns(row, cols, color_pos, color_neg):
         else:
             styles.append("")
     return styles
+
+
+# Renvoie le texte expliquant pour un non staticien le graphique d'explication locale (SHAP Local Explanation)
+def local_explanation_jargon(base_value, df_local_importance, proba_client):
+    text = "Le graphique 'SHAP Waterfall plot' montre comment le modèle évalue le risque d'insolvabilité pour un client donné.\n"
+    text += "Il indique quelles informations (appelées 'caractéristiques' ou 'features') ont eu le plus d'impact sur la prédiction du modèle.\n"
+    text += "\t* Plus la barre est longue, plus l'influence de la caractéristique est forte,\n"
+    text += f"\t* Chaque barre, par sa couleur et son orientation, indique si l'information augmente ou diminue le risque d'insolvabilité pour ce client.\n\n"
+
+    text += "Comment lire le graphique plus en détail ?\n"
+    text += f"1) En bas du graphique, on voit une valeur de base, notée 'E[f(X)] = {base_value:.3f}'.\n"
+    text += "C'est le risque moyen d'insolvabilité pour un client 'type', lorsqu'on ne connaît aucune information personnelle sur lui.\n"
+    text += f"2) En haut, on trouve la prédiction du modèle pour ce client, notée 'f(x)={proba_client:.2f}'\n"
+    text += f"C'est le risque calculé par le modèle en tenant compte des caractéristiques personnelles du client.\n"
+    text += f"3) Entre ces deux étapes, les barres montrent l'impact des différentes caractéristiques sur le risque. Par exemple :\n"
+    feature = df_local_importance.head(1)["feature"].item()
+    value_client = df_local_importance.loc[
+        df_local_importance["feature"] == feature, "valeur_client"
+    ].item()
+    text += f"Dans les données du client choisi, on sait que {feature} a une valeur de {value_client:.3f}.\n"
+    # text += f"La caractéristique {feature} a une valeur de {df_local_importance.loc[df_local_importance['feature'] == feature, 'valeur_client'].item():.3f} pour ce client.\n"
+    local_importance = df_local_importance.loc[
+        df_local_importance["feature"] == feature, "Importance_locale"
+    ].item()
+    effect_str = ""
+    influence_str = ""
+    if local_importance > 0:
+        effect_str = f"Cette information concernant le client a fait augmenter son risque de {local_importance:.2f} (notée dans la barre, le signe '+' indique une augmentation du risque).\n"
+        influence_str = "La caractéristique ayant augmenté le risque, elle a influencé la prédiction du modèle vers un refus du prêt.\n"
+    else:
+        effect_str = f"Cette information concernant le client a fait diminuer le risque de {local_importance:.2f} (notée dans la barre, le signe '-' indique une diminution du risque).\n"
+        influence_str = "La caractéristique ayant diminué le risque, elle a influencé la prédiction du modèle vers un accord du prêt.\n"
+
+    text += effect_str
+    text += influence_str
+    text += "4 - Nota Bene) En additionnant la valeur de base et toutes les influences (avec leur signe d'augmentation ou de diminution du risque), on obtient le risque calculé par le modèle pour le client choisi."
+    # text += "Les caractéristiques son classées de haut en bas selon la force de leur influence."
+    return text
+
+
+# Pour plus d'inclusivité, renvoie le texte de remplacement des éléments visuels 'imagés' contenus dans le graphique SHAP Local Explanation
+def local_explanation_replacement(
+    base_value, df_local_importance, proba_client, top_local_features
+):
+    text = f"Les {len(top_local_features)} caractéristiques qui impactent le plus la décision pour le client sont :\n"
+
+    for f in top_local_features:
+        mask = df_local_importance["feature"] == f
+        detail = f"\tInfluence ({df_local_importance.loc[mask, 'Importance_locale'].item():.2f}) "
+        if df_local_importance.loc[mask, "Importance_locale"].item() > 0:
+            detail += "vers le REFUS du prêt"
+        else:
+            detail += "vers l'ACCORD du prêt"
+        text += f"{f}{detail}\n"
+
+    text += (
+        f"\nLa valeur de base (sans connaissance du client) est de {base_value:.3f}\n"
+    )
+    text += f"La prédiction du risque d'insolvabilité pour ce client (connaissant ses informations) est de {proba_client:.2f}."
+    return text
+
+
+def gauge_replacement(client_id, proba_client, threshold):
+    # Texte à afficher si le crédit est accordé
+    text_gauge_safe = f"Le crédit est accordé pour le client {client_id}.\n"
+    text_gauge_safe += (
+        f"Le risque d'insolvabilité du client est de {proba_client:.2f}, "
+    )
+    text_gauge_safe += f"ce risque est tolérable pour la banque qui accèpte jusqu'à {threshold:.2f} de risque."
+
+    # Texte à afficher si le crédit est refusé
+    text_gauge_risk = f"Le crédit est refusé pour le client {client_id}.\n"
+    text_gauge_risk += (
+        f"Le risque d'insolvabilité du client est de {proba_client:.2f}, "
+    )
+    text_gauge_risk += f"ce risque est supérieur au risque que la banque peut tolérer ({threshold:.2f})."
+
+    if proba_client > threshold:
+
+        text = text_gauge_risk
+
+    else:
+        text = text_gauge_safe
+    return text
+
+
+# REnvoie le texte de remplacement des éléments graphiques pour une boîte à moustaches croisée avec une feature catégorielle
+def boxplot_bivariate_replacement(df, client, numeric_feature, category_feature):
+    # Si toutes les données nécessaires sont connues pour le client
+    if client[numeric_feature] is not None and client[category_feature] is not None:
+        text = f"Le client {client.name} appartient à la catégorie {client[category_feature].astype(int)} de {category_feature}.\n"
+        median_value = (
+            df.loc[df[category_feature] == client[category_feature], numeric_feature]
+            .dropna()
+            .median()
+        )
+        text += f"Au sein de cette catégorie :\n"
+        text += f"\tla médiane de {numeric_feature} est de {median_value:.2f}.\n"
+        if client[numeric_feature] > median_value:
+            text += f"\tLe client {client.name} se situe en dessus de la médiane ({numeric_feature} = {client[numeric_feature]:.2f}).\n"
+        else:
+            text += f"\tLe client {client.name} se situe au dessous de la médiane ({numeric_feature} = {client[numeric_feature]:.2f}).\n"
+
+        q1 = (
+            df.loc[df[category_feature] == client[category_feature], numeric_feature]
+            .dropna()
+            .quantile(0.25)
+        )
+        q3 = (
+            df.loc[df[category_feature] == client[category_feature], numeric_feature]
+            .dropna()
+            .quantile(0.75)
+        )
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+
+        if (
+            client[numeric_feature] < lower_bound
+            or client[numeric_feature] > upper_bound
+        ):
+            text += f"\tLe client {client.name} est atypique par rapport à la population pour la caractérisitique {numeric_feature}."
+        else:
+            text += f"\tLe client {client.name} n'est pas atypique par rapport à la population pour la caractérisitique {numeric_feature}."
+
+    # Si on ne connait pas la catégorie mais on connait la feature numerique
+    elif client[category_feature] is None and client[numeric_feature] is not None:
+        text = f"La catégorie du client {client.name} est inconnue pour la caractéristique {category_feature}."
+        text += f"La valeur de {numeric_feature} = {client[numeric_feature]:.2f}"
+    elif client[category_feature] is not None and client[numeric_feature] is None:
+        text = (
+            f"La valeur de {numeric_feature} est inconnue pour le client {client.name}."
+        )
+    else:
+        text = f"Les valeurs de {numeric_feature} et de {category_feature} sont inconnues pour le client {client.name}."
+    return text

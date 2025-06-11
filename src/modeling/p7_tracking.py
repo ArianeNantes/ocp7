@@ -18,7 +18,7 @@ import shutil
 import mlflow
 from mlflow.tracking import MlflowClient
 
-from src.modeling.p7_secret import HOST_MLFLOW, PORT_MLFLOW
+from src.modeling.p7_constantes import HOST_MLFLOW, PORT_MLFLOW
 
 
 # Renvoie True si la connexion à l'interface web est ok, False sinon.

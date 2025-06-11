@@ -35,5 +35,8 @@ EARLY_STOPPING = 100
 # Taille max du df X pour une réelle parallélisation des threads (optuna)
 MAX_SIZE_PARA = 640
 
+PORT_MLFLOW = "5000"
+HOST_MLFLOW = "127.0.0.1"
+
 # Tolérance numérique
 EPSILON = 1e-10
