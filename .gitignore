@@ -567,10 +567,13 @@ cython_debug/
 
 ##################################################################################### custom
 data/
+!data/cleaned/X_new_loans_lgbm.csv
+!data/cleaned/dtypes_lgbm.pkl
 models/
 # Sauf ces fichiers spécifiques
 !models/best_model_lgbm.pkl
 !models/explainer_lgbm.pkl
+!models/best_threshold_lgbm.pkl
 mlartifacts/
 mlflow_artifacts/
 artifacts/
