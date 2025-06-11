@@ -77,5 +77,5 @@ jobs:
         id: deploy-to-webapp
         with:
           app-name: 'credit-score'
-          slot-name: 'Production'
+          slot-name: 'production'
           
