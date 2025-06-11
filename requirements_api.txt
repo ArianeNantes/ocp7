@@ -1,24 +1,11 @@
-# Framework web
-fastapi==0.110.0
-fastapi[all]==0.110.0
-
-# Pydantic : fastapi 0.110.0 utilise encore pydantic v1.x
-pydantic<2.0
-
-# Pour Evidently (outil de monitoring ML)
-evidently==0.4.13
-
-# Pour les requêtes HTTP
-requests
-
-# Pour l'exécution ASGI
+fastapi[all]
 uvicorn[standard]
-
-# Pour Streamlit (interface web interactive)
-streamlit
-
-# Outils classiques de data science
+gunicorn
+pydantic>=1.10,<2.0  # FastAPI 0.110.0 utilise encore Pydantic v1
+requests
 pandas
 scikit-learn
 numpy
 matplotlib
+streamlit
+
