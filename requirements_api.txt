@@ -1,6 +1,6 @@
 # Framework web
-fastapi==0.110.0
-fastapi[all]==0.110.0
+# fastapi==0.110.0
+fastapi[all]
 
 # Pydantic : fastapi 0.110.0 utilise encore pydantic v1.x
 pydantic>=2.0
