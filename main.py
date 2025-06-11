@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+import uvicorn
 
 # from src.api.routes import router as prediction_router
 # from src.api.predictor import load_model, load_data_test, load_threshold
