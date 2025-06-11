@@ -3,7 +3,7 @@ fastapi==0.110.0
 fastapi[all]==0.110.0
 
 # Pydantic : fastapi 0.110.0 utilise encore pydantic v1.x
-pydantic<2.0
+pydantic>=2.0
 
 # Pour Evidently (outil de monitoring ML)
 # evidently==0.4.13
