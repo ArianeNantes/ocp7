@@ -23,7 +23,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v1
         with:
-          python-version: '3.12'
+          python-version: '3.9'
 
       - name: Create and activate venv, install dependencies
         run: |
@@ -35,9 +35,9 @@ jobs:
       - name: Azure Login
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.CLIENT_ID }}
-          tenant-id: ${{ secrets.TENANT_ID }}
-          subscription-id: ${{ secrets.SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_8F311FDBE0BE4CD6A8F73C11D5B7A5BF }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_E0E5AFF3290E45DF9D1AD036ED723687 }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_D43F728E790444E6B5443CE4AEB43DE3 }}
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v2
