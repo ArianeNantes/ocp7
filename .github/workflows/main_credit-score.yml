@@ -11,72 +11,39 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
 
     steps:
-      - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      - name: Set up Python version
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.9'
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
 
-      - name: Create and activate virtual environment + install manually
-        run: |
-          python -m venv antenv
-          source antenv/bin/activate
-          python -m pip install --upgrade pip
-          pip install --target="./.python_packages/lib/site-packages" -r requirements_api.txt
-          pip install fastapi uvicorn
-          echo "uvicorn version:"
-          uvicorn --version
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements_api.txt
 
-      - name: Zip artifact for deployment
-        run: zip release.zip ./* -r
+    - name: Archive app for deployment
+      run: |
+        zip -r release.zip . -x "venv/*" ".git/*" "*.pyc" "__pycache__/*"
 
-      - name: Upload artifact for deployment jobs
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-app
-          path: |
-            release.zip
-            !antenv/
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_8F311FDBE0BE4CD6A8F73C11D5B7A5BF }}
+        tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_E0E5AFF3290E45DF9D1AD036ED723687 }}
+        subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_D43F728E790444E6B5443CE4AEB43DE3 }}
 
+    - name: Deploy to Azure Web App
+      uses: azure/webapps-deploy@v3
+      with:
+        app-name: 'credit-score'
+        package: 'release.zip'
 
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build
-    environment:
-      name: 'Production'
-      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
-    permissions:
-      id-token: write #This is required for requesting the JWT
-      contents: read #This is required for actions/checkout
-
-    steps:
-      - name: Download artifact from build job
-        uses: actions/download-artifact@v4
-        with:
-          name: python-app
-
-      - name: Unzip artifact for deployment
-        run: unzip release.zip
-
-      
-      - name: Login to Azure
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_8F311FDBE0BE4CD6A8F73C11D5B7A5BF }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_E0E5AFF3290E45DF9D1AD036ED723687 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_D43F728E790444E6B5443CE4AEB43DE3 }}
-
-      - name: 'Deploy to Azure Web App'
-        uses: azure/webapps-deploy@v3
-        id: deploy-to-webapp
-        with:
-          app-name: 'credit-score'
-          slot-name: 'Production'
-          
