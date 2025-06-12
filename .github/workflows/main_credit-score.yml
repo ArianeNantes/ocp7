@@ -14,7 +14,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
@@ -24,15 +24,15 @@ jobs:
         with:
           python-version: '3.9'
 
-      - name: Create and start virtual environment
+      - name: Create and activate virtual environment + install manually
         run: |
           python -m venv antenv
           source antenv/bin/activate
-      
-      - name: Install dependencies
-        run: pip install -r requirements_api.txt
-        
-      # Optional: Add step to run tests here (PyTest, Django test suites, etc.)
+          python -m pip install --upgrade pip
+          pip install --target="./.python_packages/lib/site-packages" -r requirements_api.txt
+          pip install fastapi uvicorn
+          echo "uvicorn version:"
+          uvicorn --version
 
       - name: Zip artifact for deployment
         run: zip release.zip ./* -r
@@ -44,6 +44,7 @@ jobs:
           path: |
             release.zip
             !antenv/
+
 
   deploy:
     runs-on: ubuntu-latest
