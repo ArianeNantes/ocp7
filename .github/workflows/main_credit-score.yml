@@ -2,7 +2,7 @@
 # More GitHub Actions for Azure: https://github.com/Azure/actions
 # More info on Python, GitHub Actions, and Azure App Service: https://aka.ms/python-webapps-actions
 
-name: Build and deploy Python app to Azure Web App - credit-score
+name: Build and deploy FastAPI app to Azure Web App - credit-score
 
 on:
   push:
@@ -24,20 +24,20 @@ jobs:
         with:
           python-version: '3.9'
 
-      - name: Create virtualenv and install dependencies
+      - name: Install dependencies
+        working-directory: ./api
         run: |
           python -m venv antenv
           source antenv/bin/activate
           pip install --upgrade pip
-          pip install -r requirements_api.txt
-          pip freeze  # <== pour logs (optionnel)
-          which uvicorn  # <== test que uvicorn est bien installé
+          pip install -r requirements.txt
 
-      - name: Zip code including virtualenv
+      - name: Zip application content only
         run: |
-          zip -r release.zip . -x "**/__pycache__/*"
+          cd api
+          zip -r ../release.zip .
 
-      - name: Upload artifact
+      - name: Upload artifact for deployment
         uses: actions/upload-artifact@v4
         with:
           name: python-app
@@ -50,8 +50,8 @@ jobs:
       name: 'Production'
       url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
     permissions:
-      id-token: write
       contents: read
+      id-token: write
 
     steps:
       - name: Download artifact
@@ -59,8 +59,8 @@ jobs:
         with:
           name: python-app
 
-      - name: Unzip
-        run: unzip release.zip
+      - name: Unzip artifact
+        run: unzip release.zip -d .
 
       - name: Login to Azure
         uses: azure/login@v2
