@@ -23,4 +23,4 @@ def startup_event():"""
 
 @app.get("/")
 def root():
-    return {"message": "API OK"}
+    return {"message": "API OK avec GitHub action"}
