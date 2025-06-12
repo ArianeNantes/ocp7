@@ -19,20 +19,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python version
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.9'
 
-      - name: Create and activate virtualenv + install dependencies
+      - name: Create virtualenv and install dependencies
         run: |
           python -m venv antenv
           source antenv/bin/activate
           pip install --upgrade pip
           pip install -r requirements_api.txt
+          pip freeze  # <== pour logs (optionnel)
+          which uvicorn  # <== test que uvicorn est bien installé
 
-      - name: Zip artifact (including venv)
-        run: zip -r release.zip . -x "**/__pycache__/*"
+      - name: Zip code including virtualenv
+        run: |
+          zip -r release.zip . -x "**/__pycache__/*"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -56,7 +59,7 @@ jobs:
         with:
           name: python-app
 
-      - name: Unzip artifact
+      - name: Unzip
         run: unzip release.zip
 
       - name: Login to Azure

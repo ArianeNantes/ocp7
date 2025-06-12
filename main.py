@@ -22,5 +22,5 @@ def startup_event():"""
 
 
 @app.get("/")
-def read_root():
-    return "Hello Azure"
+def root():
+    return {"message": "API OK"}
