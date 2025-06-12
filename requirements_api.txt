@@ -1,11 +1,7 @@
-fastapi[all]
-uvicorn[standard]
-gunicorn
-pydantic>=1.10,<2.0  # FastAPI 0.110.0 utilise encore Pydantic v1
-requests
-pandas
-scikit-learn
-numpy
-matplotlib
-streamlit
+fastapi==0.115.12
+uvicorn==0.34.2
+pydantic==2.11.4
+requests==2.32.3
+pandas==2.2.3
+numpy==2.0.2
 
