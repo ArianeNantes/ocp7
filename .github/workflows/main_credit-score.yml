@@ -43,7 +43,7 @@ jobs:
           name: python-app
           path: |
             release.zip
-            !venv/
+            !antenv/
 
   deploy:
     runs-on: ubuntu-latest
