@@ -13,7 +13,7 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write         # requis pour l’action azure/login en mode OIDC
+      id-token: write         #  requis pour l’action azure/login en mode OIDC
       contents: read
 
     steps:
