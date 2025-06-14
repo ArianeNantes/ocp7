@@ -2,35 +2,44 @@
 # More GitHub Actions for Azure: https://github.com/Azure/actions
 # More info on Python, GitHub Actions, and Azure App Service: https://aka.ms/python-webapps-actions
 
-name: Build and deploy FastAPI app to Azure
+name: Build, push Docker image and deploy to Azure
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write         # requis pour azure/login en mode OIDC
-      contents: read
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v3
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Check Docker login to GHCR
+        run: docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
         with:
-          python-version: '3.9'
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check Oryx version (to confirm it’s available)
-        run: oryx --version
-
-      - name: Run Oryx build manually
+      - name: Build Docker image
         run: |
-          oryx build ./api -o output --platform python --platform-version 3.9
+          docker build -t ghcr.io/${{ github.repository_owner }}/credit-score:latest .
+
+      - name: Push Docker image to GHCR
+        run: |
+          docker push ghcr.io/${{ github.repository_owner }}/credit-score:latest
 
       - name: Azure Login
         uses: azure/login@v2
@@ -39,11 +48,9 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_E0E5AFF3290E45DF9D1AD036ED723687 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_D43F728E790444E6B5443CE4AEB43DE3 }}
 
-      - name: Deploy to Azure Web App
+      - name: Deploy to Azure Web App (Linux Container)
         uses: azure/webapps-deploy@v2
         with:
           app-name: 'credit-score'
           slot-name: 'Production'
-          package: './output'
-          startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
-
+          images: 'ghcr.io/${{ github.repository_owner }}/credit-score:latest'

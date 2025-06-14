@@ -567,6 +567,7 @@ cython_debug/
 
 ##################################################################################### custom
 data/
+data/
 !data/cleaned/X_new_loans_lgbm.csv
 !data/cleaned/dtypes_lgbm.pkl
 models/
