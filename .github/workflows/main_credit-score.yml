@@ -18,17 +18,23 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v1
+        uses: actions/setup-python@v5
         with:
           python-version: '3.9'
 
-      - name: Install dependencies for API
+      - name: Install Oryx
         run: |
-          pip install --upgrade pip
-          pip install -r api/requirements.txt  # installe les requirements du dossier api/
+          curl -L https://github.com/microsoft/Oryx/releases/latest/download/oryx-linux-x64.tar.gz | tar -xz -C /tmp
+          sudo cp /tmp/oryx /usr/local/bin/oryx
+
+      - name: Run Oryx build manually
+        run: |
+          oryx build ./api -o output \
+            --platform python \
+            --platform-version 3.9
 
       - name: Azure Login
         uses: azure/login@v2
@@ -42,5 +48,5 @@ jobs:
         with:
           app-name: 'credit-score'
           slot-name: 'Production'
-          package: './api'  # Ne déploie que le contenu du dossier api/
+          package: './output'  
           startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
