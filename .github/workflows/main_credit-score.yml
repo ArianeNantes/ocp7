@@ -27,7 +27,8 @@ jobs:
 
       - name: Install Oryx
         run: |
-          curl -L https://github.com/microsoft/Oryx/releases/latest/download/oryx-linux-x64.tar.gz | tar -xz -C /tmp
+          curl -L -o oryx-linux-x64.tar.gz https://github.com/microsoft/Oryx/releases/latest/download/oryx-linux-x64.tar.gz
+          tar -xzvf oryx-linux-x64.tar.gz -C /tmp
           sudo cp /tmp/oryx /usr/local/bin/oryx
 
       - name: Run Oryx build manually
