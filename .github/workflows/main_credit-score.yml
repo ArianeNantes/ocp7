@@ -13,7 +13,7 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write         #  requis pour l’action azure/login en mode OIDC
+      id-token: write         # requis pour azure/login en mode OIDC
       contents: read
 
     steps:
@@ -25,19 +25,12 @@ jobs:
         with:
           python-version: '3.9'
 
-      - name: Install Oryx
-      # bonne url trouvable sur https://github.com/microsoft/Oryx/releases, lien de téléchargement du .tar.gz
-        run: |
-          curl -L -o oryx_linux_x64.tar.gz https://github.com/microsoft/Oryx/releases/download/20240408.1/oryx_linux_x64.tar.gz
-          tar -xzvf oryx_linux_x64.tar.gz
-          ls -l
-          sudo cp oryx_linux_x64/oryx /usr/local/bin/oryx
+      - name: Check Oryx version (to confirm it’s available)
+        run: oryx --version
 
       - name: Run Oryx build manually
         run: |
-          oryx build ./api -o output \
-            --platform python \
-            --platform-version 3.9
+          oryx build ./api -o output --platform python --platform-version 3.9
 
       - name: Azure Login
         uses: azure/login@v2
@@ -51,5 +44,6 @@ jobs:
         with:
           app-name: 'credit-score'
           slot-name: 'Production'
-          package: './output'  
+          package: './output'
           startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
+
