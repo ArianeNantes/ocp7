@@ -44,5 +44,5 @@ jobs:
         with:
           app-name: 'credit-score'
           slot-name: 'Production'
-          package: '.' 
+          package: './api'  # Ne déploie que le contenu du dossier api/
           startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
