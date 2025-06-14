@@ -35,11 +35,11 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t ghcr.io/${{ github.repository_owner | toLowerCase }}/credit-score:latest .
+          docker build -t ghcr.io/arianenantes/credit-score:latest .
 
       - name: Push Docker image to GHCR
         run: |
-          docker push ghcr.io/${{ github.repository_owner }}/credit-score:latest
+          docker push ghcr.io/arianenantes/credit-score:latest
 
       - name: Azure Login
         uses: azure/login@v2
@@ -53,4 +53,4 @@ jobs:
         with:
           app-name: 'credit-score'
           slot-name: 'Production'
-          images: 'ghcr.io/${{ github.repository_owner }}/credit-score:latest'
+          images: 'ghcr.io/arianenantes/credit-score:latest'
