@@ -2,18 +2,10 @@
 # More GitHub Actions for Azure: https://github.com/Azure/actions
 # More info on Python, GitHub Actions, and Azure App Service: https://aka.ms/python-webapps-actions
 
-name: Build and deploy FastAPI app to Azure
-
-on:
-  push:
-    branches: [ main ]
-  workflow_dispatch:
-
-jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
+      id-token: write         # requis pour l’action azure/login en mode OIDC
       contents: read
 
     steps:
@@ -25,12 +17,12 @@ jobs:
         with:
           python-version: '3.9'
 
-      - name: Install dependencies for API
+      - name: Create and activate venv, install dependencies
         run: |
+          python -m venv venv
+          source venv/bin/activate
           pip install --upgrade pip
           pip install -r requirements.txt
-          echo "uvicorn version:"
-          uvicorn --version
 
       - name: Azure Login
         uses: azure/login@v2
@@ -41,8 +33,9 @@ jobs:
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v2
+
         with:
           app-name: 'credit-score'
           slot-name: 'Production'
-          #package: '.'
+          package: '.' 
           startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
