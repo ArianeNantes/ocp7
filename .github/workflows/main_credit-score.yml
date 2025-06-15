@@ -2,40 +2,40 @@
 # More GitHub Actions for Azure: https://github.com/Azure/actions
 # More info on Python, GitHub Actions, and Azure App Service: https://aka.ms/python-webapps-actions
 
-  build-and-deploy:
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write         # requis pour l’action azure/login en mode OIDC
-      contents: read
+build-and-deploy:
+  runs-on: ubuntu-latest
+  permissions:
+    id-token: write         # requis pour l’action azure/login en mode OIDC
+    contents: read
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v1
-        with:
-          python-version: '3.9'
+    - name: Set up Python
+      uses: actions/setup-python@v1
+      with:
+        python-version: '3.9'
 
-      - name: Create and activate venv, install dependencies
-        run: |
-          python -m venv venv
-          source venv/bin/activate
-          pip install --upgrade pip
-          pip install -r requirements.txt
+    - name: Create and activate venv, install dependencies
+      run: |
+        python -m venv venv
+        source venv/bin/activate
+        pip install --upgrade pip
+        pip install -r requirements.txt
 
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_8F311FDBE0BE4CD6A8F73C11D5B7A5BF }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_E0E5AFF3290E45DF9D1AD036ED723687 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_D43F728E790444E6B5443CE4AEB43DE3 }}
+    - name: Azure Login
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_8F311FDBE0BE4CD6A8F73C11D5B7A5BF }}
+        tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_E0E5AFF3290E45DF9D1AD036ED723687 }}
+        subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_D43F728E790444E6B5443CE4AEB43DE3 }}
 
-      - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v2
+    - name: Deploy to Azure Web App
+      uses: azure/webapps-deploy@v2
 
-        with:
-          app-name: 'credit-score'
-          slot-name: 'Production'
-          package: '.' 
-          startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
+      with:
+        app-name: 'credit-score'
+        slot-name: 'Production'
+        package: '.' 
+        startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
