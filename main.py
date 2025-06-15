@@ -21,9 +21,9 @@ app = FastAPI(
 
 # Chemin absolu vers le modèle (dans models/ car le dossier api/ est déployé à la racine)
 model_path = os.path.join(os.path.dirname(__file__), "models", "best_model_lgbm.pkl")
-# model = joblib.load(model_path)
+model = joblib.load(model_path)
 
 
 @app.get("/")
 def root():
-    return {"model_path": model_path}
+    return {"model_path": model_path, "model_class": model.__class__.__name__}
