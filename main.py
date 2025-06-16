@@ -14,7 +14,7 @@ app = FastAPI(
 
 model = load_model()
 threshold = load_threshold()
-# load_data_test()
+load_data_test()
 
 # Ajouter les routes
 # app.include_router(prediction_router)
