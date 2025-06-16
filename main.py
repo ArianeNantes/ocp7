@@ -2,7 +2,7 @@ from fastapi import FastAPI
 import joblib
 import os
 
-# from src.api.routes import router as prediction_router
+from src.api.routes import router as prediction_router
 from src.api.predictor import load_model, load_data_test, load_threshold
 
 app = FastAPI(
@@ -17,7 +17,7 @@ threshold = load_threshold()
 load_data_test()
 
 # Ajouter les routes
-# app.include_router(prediction_router)
+app.include_router(prediction_router)
 
 # Chemin absolu vers le modèle (/home/site/wwwroot/models/best_model_lgbm.pkl)
 # model_path = os.path.join(os.path.dirname(__file__), "models", "best_model_lgbm.pkl")
