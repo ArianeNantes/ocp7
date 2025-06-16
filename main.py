@@ -14,7 +14,7 @@ app = FastAPI(
 
 model = load_model()
 threshold = load_threshold()
-load_data_test()
+df = load_data_test()
 
 # Ajouter les routes
 app.include_router(prediction_router)
@@ -24,6 +24,10 @@ app.include_router(prediction_router)
 # model = joblib.load(model_path)
 
 
-# @app.get("/")
-# def root():
-#    return {"model_class": model.__class__.__name__, "threshold": threshold}
+@app.get("/")
+def root():
+    return {
+        "model_class": model.__class__.__name__,
+        "threshold": threshold,
+        "shape df": df.shape,
+    }
