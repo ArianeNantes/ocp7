@@ -44,7 +44,7 @@ def read_features(client_id: int):
 #        threshold=threshold,
 #    )
 # avec les schémas pydantic correspondant.
-@router.post("/predict", response_model=PredictionResponse)
+"""@router.post("/predict", response_model=PredictionResponse)
 def predict(request: PredictionRequest):
     features = get_features_from_id(request.client_id)
     if features is None:
@@ -56,6 +56,27 @@ def predict(request: PredictionRequest):
 
     return PredictionResponse(
         client_id=request.client_id,
+        features=features,
+        proba=proba,
+        prediction=prediction,
+        threshold=threshold,
+    )"""
+
+
+@router.post("/predict", response_model=PredictionResponse)
+def predict(request: PredictionRequest):
+    # features = get_features_from_id(request.client_id)
+    client_id = request.client_id
+    features = request.features
+    if features is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Impossible de faire la prédiction - Données client inconnues.",
+        )
+    proba, prediction, threshold = predict_from_features(features)
+
+    return PredictionResponse(
+        client_id=client_id,
         features=features,
         proba=proba,
         prediction=prediction,
