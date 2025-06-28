@@ -8,6 +8,13 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'src/api/**'
+      - 'src/constantes.py'
+      - 'models/best_model_lgbm.pkl'
+      - 'models/best_trheshold_lgbm.pkl'
+      - 'models/dtypes_lgbm.pkl'
+      - 'data/cleaned/X_new_loans_lgbm.csv'
   workflow_dispatch:
 
 jobs:
