@@ -423,6 +423,8 @@ parts/
 sdist/
 var/
 wheels/
+share/
+**/labextensions/
 share/python-wheels/
 *.egg-info/
 .installed.cfg

@@ -1,26 +1,24 @@
+import sys
 import os
-import matplotlib
-import matplotlib.pyplot as plt
+
+sys.path.append(os.path.abspath("."))
+
 import pandas as pd
-from shap.plots.colors import light_blue_rgb, light_red_rgb
 import streamlit as st
-import plotly.express as px
+
 import requests
-import plotly.graph_objects as go
-import numpy as np
+
+
 import shap
 import streamlit.components.v1 as components
 import joblib
 
-# from src_api.services import predictor
-from fastapi import FastAPI
 
 # from src_api.routes.prediction_routes import router as prediction_router
 from src.dashboard.charts import (
     gauge_plt,
     shap_waterfall,
     shap_force,
-    shap_summary_dot,
     boxplot_by_categorical,
     histogram_by_categorical,
     plot_scatter,
@@ -30,7 +28,6 @@ from src.dashboard.charts import (
     histogram_univariate,
 )
 from src.dashboard.util import (
-    st_new_filter,
     st_filters_loop,
     client_from_response,
     pred_from_response,
@@ -725,10 +722,6 @@ def plot_bivariate_scatter():
         )
 
     st.write(" ")
-
-    # points = px.scatter(df3, x=feature_x, y=feature_y, size="PROBA")
-    # points = px.scatter(df3, x=feature_x, y=feature_y)
-    # points["layout"].update(title=f"Relation entre {feature_x} et {feature_y}")
 
     colors = {
         "color_safe": color_safe,

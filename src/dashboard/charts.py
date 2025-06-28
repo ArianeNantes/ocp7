@@ -6,12 +6,12 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 from matplotlib.patches import Wedge, Circle, FancyBboxPatch, Rectangle, FancyArrow
 from matplotlib.colors import LinearSegmentedColormap, ListedColormap
-import nbformat
+
+# import nbformat
 import streamlit as st
 import shap
-import kaleido
 
-print(nbformat.__version__)
+# print(nbformat.__version__)
 
 DEFAULT_SHAP_COLOR_SAFE = (
     "#008bfb"  # Couleur par défaut de la catégorie 0 (rembousement OK pour SHAP)
@@ -530,22 +530,6 @@ def histo(
     for trace in fig.data:
         if isinstance(trace, go.Histogram):
             y_max = max(y_max, max(trace.y) if trace.y is not None else 0)
-
-    """y_max = max(
-        max(trace.y)
-        for trace in fig.dataHistogram
-        if isinstance(trace, go.Histogram) and trace.y is not None
-        tout est à None
-    )"""
-
-    # On force le calcul complet des axes et traces, puis on récupère y_max (nécessite l'install de kaleido et ne fonctionne pas mieux)
-    """fig = fig.full_figure_for_development(warn=False)
-    # Récupérer ymax parmi toutes les traces d’histogramme
-    y_max = max(
-        max(t.y) if t.y is not None else 0
-        for t in fig.data
-        if isinstance(t, go.Histogram)
-    )"""
 
     # calcul de y_max très arbitraire :
     y_max = df_all[numeric_feature].shape[0] * 0.1

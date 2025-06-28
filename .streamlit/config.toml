@@ -3,9 +3,6 @@ headless = true
 port = 8501
 enableCORS = false
 
-[python]
-importPaths = ["src"]
-
 [theme]
 base = "light"
 
