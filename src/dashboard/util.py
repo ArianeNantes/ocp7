@@ -33,8 +33,6 @@ def pred_from_response(response):
         st.text(f"Détails : {e}")
         return
 
-    return
-
 
 def client_from_response(response, extract_results=True):
 
@@ -254,14 +252,22 @@ def local_explanation_jargon(base_value, df_local_importance, proba_client):
     text += "Comment lire le graphique plus en détail ?\n"
     text += f"1) En bas du graphique, on voit une valeur de base, notée 'E[f(X)] = {base_value:.3f}'.\n"
     text += "C'est le risque moyen d'insolvabilité pour un client 'type', lorsqu'on ne connaît aucune information personnelle sur lui.\n"
-    text += f"2) En haut, on trouve la prédiction du modèle pour ce client, notée 'f(x)={proba_client:.2f}'\n"
+    proba_client = round(proba_client, 3)
+    text += f"2) En haut, on trouve la prédiction du modèle pour ce client, notée 'f(x)={proba_client:g}'\n"
     text += f"C'est le risque calculé par le modèle en tenant compte des caractéristiques personnelles du client.\n"
     text += f"3) Entre ces deux étapes, les barres montrent l'impact des différentes caractéristiques sur le risque. Par exemple :\n"
     feature = df_local_importance.head(1)["feature"].item()
     value_client = df_local_importance.loc[
         df_local_importance["feature"] == feature, "valeur_client"
     ].item()
-    text += f"Dans les données du client choisi, on sait que {feature} a une valeur de {value_client:.3f}.\n"
+    if value_client:
+        # On affiche la valeur avec au plus 3 décimales, le format g n'affichera pas les décimales non significatives
+        value_client = round(value_client, 3)
+        text += f"Dans les données du client choisi, on sait que {feature} a une valeur de {value_client:g}.\n"
+    else:
+        text += (
+            f"Dans les données du client choisi, la valeur de {feature} est inconnue.\n"
+        )
     # text += f"La caractéristique {feature} a une valeur de {df_local_importance.loc[df_local_importance['feature'] == feature, 'valeur_client'].item():.3f} pour ce client.\n"
     local_importance = df_local_importance.loc[
         df_local_importance["feature"] == feature, "Importance_locale"
@@ -300,7 +306,7 @@ def local_explanation_replacement(
     text += (
         f"\nLa valeur de base (sans connaissance du client) est de {base_value:.3f}\n"
     )
-    text += f"La prédiction du risque d'insolvabilité pour ce client (connaissant ses informations) est de {proba_client:.2f}."
+    text += f"La prédiction du risque d'insolvabilité pour ce client (connaissant ses informations) est de {proba_client:.3f}."
     return text
 
 
@@ -310,7 +316,7 @@ def gauge_replacement(client_id, proba_client, threshold):
     text_gauge_safe += (
         f"Le risque d'insolvabilité du client est de {proba_client:.2f}, "
     )
-    text_gauge_safe += f"ce risque est tolérable pour la banque qui accèpte jusqu'à {threshold:.2f} de risque."
+    text_gauge_safe += f"ce risque est tolérable pour la banque qui accepte jusqu'à {threshold:.2f} de risque."
 
     # Texte à afficher si le crédit est refusé
     text_gauge_risk = f"Le crédit est refusé pour le client {client_id}.\n"
@@ -326,6 +332,43 @@ def gauge_replacement(client_id, proba_client, threshold):
     else:
         text = text_gauge_safe
     return text
+
+
+def gauge_jargon(client_id, proba_client, threshold):
+    # Risk
+    text_gauge = "Le risque est la probabilité (prédite par le modèle) que le client ne puisse pas rembourser l'emprunt.\n"
+    text_gauge += (
+        f"Une probabilité de {proba_client:.2f} peut s'interpréter en pourcentage :\n"
+    )
+    text_gauge += f" Le client a {proba_client:.0%} de 'chances' sur 100 d'avoir des difficultés de remboursement.\n"
+
+    text_gauge += f"\nEnsuite, la banque a un seuil stratégique de décision, ici {threshold:.2f}.\n"
+    text_gauge += "Si le risque est en dessous de seuil, elle accorde le prêt,"
+    text_gauge += "si le risque est trop grand, elle le refuse.\n"
+    text_gauge += "Ce seuil de risque tolérable est optimisé de manière à ce que la banque perde le moins d'argent possible. Il n'est pas forcément à 0.5.\n"
+    text_gauge += f"Ici, le seuil de risque tolérable est {threshold:.2f}"
+
+    """# Texte à afficher si le crédit est accordé
+    text_gauge_safe = f"Le crédit est accordé pour le client {client_id}.\n"
+    text_gauge_safe += (
+        f"Le risque d'insolvabilité du client est de {proba_client:.2f}, "
+    )
+    text_gauge_safe += f"ce risque est tolérable pour la banque qui accepte jusqu'à {threshold:.2f} de risque."
+
+    # Texte à afficher si le crédit est refusé
+    text_gauge_risk = f"Le crédit est refusé pour le client {client_id}.\n"
+    text_gauge_risk += (
+        f"Le risque d'insolvabilité du client est de {proba_client:.2f}, "
+    )
+    text_gauge_risk += f"ce risque est supérieur au risque que la banque peut tolérer ({threshold:.2f})."
+
+    if proba_client > threshold:
+
+        text = text_gauge_risk
+
+    else:
+        text = text_gauge_safe"""
+    return text_gauge
 
 
 # REnvoie le texte de remplacement des éléments graphiques pour une boîte à moustaches croisée avec une feature catégorielle

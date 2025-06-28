@@ -37,65 +37,120 @@ from src.dashboard.util import (
     local_explanation_jargon,
     local_explanation_replacement,
     gauge_replacement,
+    gauge_jargon,
     boxplot_bivariate_replacement,
 )
 from src.dashboard.util import highlight_selected_columns
-from src.api.predictor import load_data_test, load_model, load_threshold
-from src.constantes import DATA_CLEAN_DIR, MODEL_DIR
+from src.constantes import (
+    MODEL_DIR,
+    DATA_CLEAN_DIR,
+    BEST_DTYPES_NAME,
+    NEW_LOANS_NAME,
+    EXPLAINER_NAME,
+    SAMPLE_TRAIN_NAME,
+    GLOBAL_IMPORTANCES_NAME,
+)
 
-THRESHOLD_PROB = 0.48
+# THRESHOLD_PROB = 0.48
 DEFAULT_LOANER_ID = 0
 DEFAULT_COLOR_LOANER = "#F4E921"
 DEFAULT_COLOR_RISK = "#7200CA"
 DEFAULT_COLOR_SAFE = "#A1DE92"
 
 
-# Chargement des données
-# @st.cache_resource
-model = load_model()
+# Chargement des données et des ressources
 
-# @st.cache_data
-X_test = load_data_test()
 
-THRESHOLD = load_threshold()
+@st.cache_data
+def load_new_loan_ids():
+    # On remonte de deux crans et on descend dans data/cleaned
+    data_dir = os.path.join(os.path.dirname(__file__), "..", "..", DATA_CLEAN_DIR)
+
+    # Chemin du fichier contenant les nouveaux emprunts (en provenance de application_test)
+    df_path = os.path.join(data_dir, NEW_LOANS_NAME)
+    df_path = os.path.abspath(df_path)
+    if not os.path.exists(df_path):
+        raise FileNotFoundError(
+            f"Le fichier de données des nouveaux emprunts '{df_path}' est introuvable."
+        )
+
+    # Nous n'avons pas besoin de lire le fichier entier mais uniquement des index,
+    # on lit la première colonne et on récupère les index
+    first_column = pd.read_csv(df_path, usecols=[0], index_col=0).sort_index()
+    ids = first_column.index.astype(int).tolist()
+    return ids
 
 
 @st.cache_data
 def load_train():
+    # On remonte de deux crans et on descend dans data/cleaned
+    data_dir = os.path.join(os.path.dirname(__file__), "..", "..", DATA_CLEAN_DIR)
 
-    dtypes = joblib.load(os.path.join(DATA_CLEAN_DIR, "dtypes_lgbm.pkl"))
-    X_train = pd.read_csv(
-        os.path.join(DATA_CLEAN_DIR, "X_sampled_train_lgbm.csv"), dtype=dtypes
-    )
-    if "TARGET" in X_train.columns:
-        X_train = X_train.drop(columns=["TARGET"])
-    if "SK_ID_CURR" in X_train.columns:
-        X_train = X_train.set_index("SK_ID_CURR")
+    # Chemin pour le fichier de données d'entraînement
+    train_path = os.path.join(data_dir, SAMPLE_TRAIN_NAME)
+    train_path = os.path.abspath(train_path)
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(
+            f"Le fichier de données d'entrainement '{train_path}' est introuvable."
+        )
 
-    features = X_train.columns.to_list()
+    # Chemin pour le dictionnaire utilisé afin de caster les colonnes
+    dtypes_path = os.path.join(data_dir, BEST_DTYPES_NAME)
+    dtypes_path = os.path.abspath(dtypes_path)
+    if not os.path.exists(dtypes_path):
+        raise FileNotFoundError(
+            f"Le fichier dictionnaire de features '{dtypes_path}' est introuvable."
+        )
 
-    train = X_train
+    dtypes = joblib.load(dtypes_path)
 
-    # On sélectionne toutes les lignes et la probabilité d'appartenir à la classe 1
-    proba_train = model.predict_proba(X_train)[:, 1]
-    # On ajoute cette prédiction de risque de défaut (proba) au df
-    train["PROBA"] = proba_train
-    # On calule l'appartenance à une classe (0= 'remboursement ok'ou 1='défaut', en fonction du seuil de proba)
-    train["PREDICTION"] = train["PROBA"].apply(lambda x: 1 if x > THRESHOLD else 0)
+    train = pd.read_csv(train_path, dtype=dtypes)
+
+    if "TARGET" in train.columns:
+        train = train.drop(columns=["TARGET"])
+    if "SK_ID_CURR" in train.columns:
+        train = train.set_index("SK_ID_CURR")
+
+    features = [
+        f
+        for f in train.columns.to_list()
+        if f not in ["SK_ID_CURR", "PROBA", "PREDICTION"]
+    ]
 
     return train, features
 
 
-@st.cache_data
-def load_global_shap_values():
-    shap_values = joblib.load(os.path.join(MODEL_DIR, "shap_values_lgbm.pkl"))
-    return shap_values
-
-
 @st.cache_resource
 def load_explainer():
-    explainer = joblib.load(os.path.join(MODEL_DIR, "explainer_lgbm.pkl"))
+    # On remonte de deux crans et on descend dans models
+    model_dir = os.path.join(os.path.dirname(__file__), "..", "..", MODEL_DIR)
+
+    # Chemin pour l'explainer
+    explainer_path = os.path.join(model_dir, EXPLAINER_NAME)
+    explainer_path = os.path.abspath(explainer_path)
+    if not os.path.exists(explainer_path):
+        raise FileNotFoundError(
+            f"Le fichier modèle '{explainer_path}' est introuvable."
+        )
+    explainer = joblib.load(explainer_path)
+
     return explainer
+
+
+@st.cache_data
+def load_global_importances():
+    # On remonte de deux crans et on descend dans models
+    model_dir = os.path.join(os.path.dirname(__file__), "..", "..", MODEL_DIR)
+
+    # Chemin pour le dataframe des importances globales
+    path_importances = os.path.join(model_dir, GLOBAL_IMPORTANCES_NAME)
+    path_importances = os.path.abspath(path_importances)
+    if not os.path.exists(path_importances):
+        raise FileNotFoundError(
+            f"Le fichier des importances globales '{path_importances}' est introuvable."
+        )
+    df = pd.read_csv(path_importances)
+    return df
 
 
 # plots
@@ -114,7 +169,6 @@ n_features_default = 10
 color_default_safe = DEFAULT_COLOR_SAFE
 color_default_risk = DEFAULT_COLOR_RISK
 color_default_loaner = DEFAULT_COLOR_LOANER
-threshold_prob = THRESHOLD_PROB
 decision_explanation = False
 
 
@@ -168,12 +222,9 @@ st.markdown(
     "<style>div.block-container{padding-top:2rem}</style>", unsafe_allow_html=True
 )
 
-model = load_model()
-train, features = load_train()
-# [debug]
-# st.write("features", features)
-# st.write("head df_all", df_all.head(1))
 
+train, features = load_train()
+new_loans_ids = load_new_loan_ids()
 
 # Sidebar
 with st.sidebar:
@@ -225,8 +276,7 @@ with st.sidebar:
     # st.sidebar.header(":material/Query_Stats: Prédiction", divider="gray")
 
     # Crée un sélecteur basé sur l'index du df client
-    # selected_id = int(st.selectbox("Choisir un ID client :", X_test.index))
-    client_id = int(st.selectbox("Sélectionnez un ID client :", X_test.index))
+    client_id = int(st.selectbox("Sélectionnez un ID client :", new_loans_ids))
 
     # Crée un slider pour le nombre de features à afficher dans les graphs SHAP et le df correspondant
     n_features = st.slider(
@@ -242,13 +292,23 @@ with st.sidebar:
 proba_client = None
 prediction_client = None
 response = None
-url_predict = "http://127.0.0.1:8000/predict/"
-input_json = {"client_id": client_id}
+
+url_get = f"https://credit-score2-ejgde3bqeaa7axgn.canadacentral-01.azurewebsites.net/features/{client_id}"
+# url_get = f"http://127.0.0.1:8000/features/{client_id}"
+response_get = requests.get(url_get)
+# [DEBUG] st.write("Reponse GET", response_get.json())
+
+# url_predict = "http://127.0.0.1:8000/predict"
+url_predict = (
+    "https://credit-score2-ejgde3bqeaa7axgn.canadacentral-01.azurewebsites.net/predict"
+)
+# input_json = {"client_id": client_id}
+input_json = response_get.json()
 response = requests.post(url_predict, json=input_json)
 
 if response.status_code == 200:
     client = client_from_response(response, extract_results=True)
-    X_client = client[model.feature_name_]
+    X_client = client[features]
     proba_client, prediction_client, threshold = pred_from_response(response)
     proba, prediction, threshold = pred_from_response(response)
     # st.success(f"Risque de défaut : {proba_client:.2f}")
@@ -266,12 +326,12 @@ col_gauge, col_local_explanation = st.columns([1.2, 2])
 with col_gauge:
     if proba_client:
         decision_str = "Crédit "
-        decision_str += "Accordé" if proba_client < threshold_prob else "Refusé"
+        decision_str += "Accordé" if proba_client < threshold else "Refusé"
         plotly_style_title(f"{decision_str}")
         with st.expander("", expanded=True):
             fig_plt = gauge_plt(
                 proba=proba_client,
-                threshold_prob=THRESHOLD_PROB,
+                threshold_prob=threshold,
                 title="",
                 colors=[color_safe, color_risk],
             )
@@ -283,14 +343,20 @@ with col_gauge:
         st.text(
             text_gauge_replacement,
         )
-        with st.expander(f"Réponse à la requête pour le client {client_id}"):
+
+        with st.expander(f"Réponse à la requête POST pour le client {client_id}"):
             st.write(response.json())
         with st.expander(f"Données du client {client_id}"):
 
             st.write(client.T)
+        with st.expander("Jargon Jauge"):
+            st.text(
+                gauge_jargon(
+                    client_id=client_id, proba_client=proba, threshold=threshold
+                ),
+            )
 
 # Colonne pour le dataframe shap values locales
-
 with col_local_explanation:
     if proba_client:
         shap_values_client = explainer(X_client)
@@ -352,20 +418,11 @@ with col_local_explanation:
         with st.expander(f"Aide technique/jargon (compréhension du graphique)"):
             st.text(text_local_jargon)
 
-        # On sélectionne les features avant de les styler :
+        # On copie le df des importances avant de l'afficher car l'affichage permet le tri par l'utilisateur.
+        # Si l'utilisateur trie le df alors le df orrignal ne serait plus trié correctement.
         # 1. Sélectionner les colonnes avant de styler
-        df_to_display = shap_df_local[
-            ["feature", "valeur_client", "Importance_locale"]
-        ].copy()
+        df_to_display = shap_df_local.copy()
 
-        # Si on colore toute la ligne, c'est rtès laid
-        # styled_df = df_to_display.style.apply(
-        #    lambda row: color_rows(row, colors=[color_safe, color_risk]), axis=1
-        # )
-        # Donc on ne colore que la colonne contribution
-        # styled_df = shap_df_sorted.style.applymap(
-        #    color_contribution, subset=["contribution"]
-        # )
         # === Application du style
         styled_df = df_to_display.style.apply(
             lambda row: highlight_selected_columns(
@@ -391,40 +448,29 @@ with col_local_explanation:
 ############################################### Explication globale Avec SHAP
 st.divider()
 st.subheader("Pour la population")
-shap_values_train = load_global_shap_values()
 
-# On suppose shap_values_global est un shap.Explanation avec .values et .feature_names
-# L'importance globale est la moyenne des valeurs absolues des shap values pour chaque features
-shap_df_global = pd.DataFrame(
-    {
-        "feature": shap_values_train.feature_names,
-        "importance": np.abs(shap_values_train.values).mean(axis=0),
-        "signed_mean": shap_values_train.values.mean(axis=0),
-    }
-)
-# Ajoute une colonne pour la couleur (basée sur le signe)
-shap_df_global["impact_direction"] = np.where(
-    shap_df_global["signed_mean"] > 0, "Tire vers défaut", "Tire vers remboursement"
-)
-# Trier par importance décroissante
-shap_df_global = shap_df_global.sort_values(by="importance", ascending=False)
+global_importances = load_global_importances()
+
 
 plotly_style_title(
     f"Top {n_features} des caratéristiques les plus influentes globalement"
 )
 with st.expander("", expanded=True):
     fig = global_importance_barh(
-        shap_df_global, max_display=n_features, plot_others=True
+        # shap_df_global, max_display=n_features, plot_others=True
+        global_importances,
+        max_display=n_features,
+        plot_others=True,
     )
     st.plotly_chart(fig, use_container_with=True)
 
 
-df_to_display_global = shap_df_global[
-    ["feature", "importance", "signed_mean", "impact_direction"]
-].copy()
-
 # === Application du style
-styled_df_global = df_to_display_global.style.apply(
+# On copie le df des importances avant de l'afficher car l'affichage permet le tri par l'utilisateur.
+# Si l'utilisateur trie le df alors le df orrignal ne serait plus trié correctement.
+
+df_global_to_display = global_importances.copy()
+styled_df_global = df_global_to_display.style.apply(
     lambda row: highlight_selected_columns(
         row, ["signed_mean"], color_risk, color_safe
     ),
@@ -471,7 +517,9 @@ features_safe = (
 
 client_serie = client.squeeze()
 with col_safe:
-
+    # On modifie le flux standard de calcul de streamlit, de façon à ne pas tout recalculer depuis le haut du dasboard jusqu'en bas
+    # (concernant les autres parties), si une option choisie concernant uniquement la colonne 'Caractérisitiques diminuant le risque'.
+    # Cela améliore les temps de réponse du dashboard.
     @st.fragment
     def plot_safe_univariate():
         selected_safe = st.selectbox(
@@ -501,7 +549,9 @@ with col_safe:
     plot_safe_univariate()
 
 with col_risk:
-
+    # On modifie le flux standard de calcul de streamlit, de façon à ne pas tout recalculer depuis le haut du dasboard
+    # (concernant les autres parties), si une option choisie concernant uniquement la colonne 'Caractérisitiques augmentant le risque'.
+    # Cela améliore les temps de réponse du dashboard.
     @st.fragment
     def plot_risk_univariate():
         selected_risk = st.selectbox(
@@ -514,7 +564,7 @@ with col_risk:
                 st.plotly_chart(fig_pie_risk)
                 if client_serie[selected_risk] is not None:
                     text_to_display = f"Le client {client_serie.name} appartient à la catégorie {client_serie[selected_risk].astype(int)} de {selected_risk}\n"
-                    text_to_display += f"Cela joue en sa défaveur pour ontenir le prêt"
+                    text_to_display += f"Cela joue en sa défaveur pour obtenir le prêt"
                 else:
                     text_to_display = f"La valeur de {selected_risk} est inconnue pour le client {client_serie.name}"
                 st.text(text_to_display)
@@ -538,147 +588,161 @@ st.divider()
 ################################################################ Bivariée - Graph plotly
 st.subheader("Bivariée - Caractéristique numérique par catégories")
 
-# plotly_style_title("Sélection des caractéristiques")
-col_feature_num, col_feature_cat = st.columns(2)
-with col_feature_num:
-    selected_numeric = st.selectbox(
-        "Caractéristique numérique", numeric_features, index=0
-    )
-with col_feature_cat:
-    selected_category = st.selectbox(
-        "Croisée par",
-        categorical_features,
-        index=categorical_features.index("PREDICTION"),
-    )
-# Détection du cas où la variable catégorielle est binaire et doit avoir des couleurs fixées
-# Si on ne fait pas ça, les couleurs sont rangées non pas dans l'ordre 0 ou 1 de prédiction,
-# Si le premoier trouvé est 1 alors color_safe serait appliqué à la target 0 !
-if selected_category in ["PREDICTION", "TARGET"]:
-    category_order = [0, 1]
-    color_map = {0: color_safe, 1: color_risk}
-# Si la variable catégorielle choisie n'est pas la prédiction, on laisse Plotly choisir les couleurs
-else:
-    category_order = sorted(train[selected_category].dropna().unique())
-    color_map = None
 
-st.write(" ")
-col_box, col_hist = st.columns([1, 2], gap="large")
+# On modifie le flux standard de calcul de streamlit, de façon à ne pas tout recalculer depuis le haut du dasboard
+# (concernant les autres parties), si une option choisie concernant uniquement les boxplots est modifiée.
+# Cela améliore énormément les temps de réponse du dashboard.
+@st.fragment
+def plot_bivariate_boxplot():
+    # plotly_style_title("Sélection des caractéristiques")
+    col_feature_num, col_feature_cat = st.columns(2)
+    with col_feature_num:
+        selected_numeric = st.selectbox(
+            "Caractéristique numérique", numeric_features, index=0
+        )
+    with col_feature_cat:
+        selected_category = st.selectbox(
+            "Croisée par",
+            categorical_features,
+            index=categorical_features.index("PREDICTION"),
+        )
+    # Détection du cas où la variable catégorielle est binaire et doit avoir des couleurs fixées
+    # Si on ne fait pas ça, les couleurs sont rangées non pas dans l'ordre 0 ou 1 de prédiction,
+    # Si le premoier trouvé est 1 alors color_safe serait appliqué à la target 0 !
+    if selected_category in ["PREDICTION", "TARGET"]:
+        category_order = [0, 1]
+        color_map = {0: color_safe, 1: color_risk}
+    # Si la variable catégorielle choisie n'est pas la prédiction, on laisse Plotly choisir les couleurs
+    else:
+        category_order = sorted(train[selected_category].dropna().unique())
+        color_map = None
 
+    st.write(" ")
+    col_box, col_hist = st.columns([1, 2], gap="large")
 
-# Boxplot
-with col_box:
-    plotly_style_title(f"Boxplot {selected_numeric} par {selected_category}")
-    # use_log = st.checkbox("Utiliser une échelle logarithmique sur l'axe Y", value=False)
-    use_log = False
-    # show_outliers = st.checkbox("Afficher les outliers", value=True)
+    # Boxplot
+    with col_box:
+        plotly_style_title(f"Boxplot {selected_numeric} par {selected_category}")
+        # use_log = st.checkbox("Utiliser une échelle logarithmique sur l'axe Y", value=False)
+        use_log = False
+        # show_outliers = st.checkbox("Afficher les outliers", value=True)
 
-    fig_boxplot = boxplot_by_categorical(
-        df=train,
-        client=client.squeeze(),
-        numeric_feature=selected_numeric,
-        category_feature=selected_category,
-        colors=[color_safe, color_risk, color_loaner],
-    )
-    st.plotly_chart(
-        fig_boxplot,
-        use_container_width=True,
-    )
+        fig_boxplot = boxplot_by_categorical(
+            df=train,
+            client=client.squeeze(),
+            numeric_feature=selected_numeric,
+            category_feature=selected_category,
+            colors=[color_safe, color_risk, color_loaner],
+        )
+        st.plotly_chart(
+            fig_boxplot,
+            use_container_width=True,
+        )
 
+    # Histogramme
+    with col_hist:
 
-# Histogramme
-with col_hist:
+        # with st.expander("Graph plotly", expanded=True):
+        plotly_style_title(f"Histogramme {selected_numeric} par {selected_category}")
+        fig_histo = histogram_by_categorical(
+            train,
+            client=client.squeeze(),
+            numeric_feature=selected_numeric,
+            category_feature=selected_category,
+            colors=[color_safe, color_risk, color_loaner],
+        )
+        st.plotly_chart(fig_histo, theme="streamlit", use_container_width=True)
 
-    # with st.expander("Graph plotly", expanded=True):
-    plotly_style_title(f"Histogramme {selected_numeric} par {selected_category}")
-    fig_histo = histogram_by_categorical(
+    text_bivariate_replacement = boxplot_bivariate_replacement(
         train,
-        client=client.squeeze(),
+        client.squeeze(),
         numeric_feature=selected_numeric,
         category_feature=selected_category,
-        colors=[color_safe, color_risk, color_loaner],
     )
-    st.plotly_chart(fig_histo, theme="streamlit", use_container_width=True)
+    st.text(text_bivariate_replacement)
 
-text_bivariate_replacement = boxplot_bivariate_replacement(
-    train,
-    client.squeeze(),
-    numeric_feature=selected_numeric,
-    category_feature=selected_category,
-)
-st.text(text_bivariate_replacement)
+
+plot_bivariate_boxplot()
 
 #######################
-# st.subheader("Filtrer les données")
-# On construit la liste des features principales constitués des principales features SHAP globale et
-# des principales features SHAP locale
-main_global_features = shap_df_global["feature"].to_list()[:n_features]
-main_local_features = shap_df_local["feature"].to_list()[:n_features]
-main_features = (
-    main_local_features
-    + [f for f in main_global_features if f not in main_local_features]
-    + ["PROBA", "PREDICTION"]
-)
-
-main_features.sort()
-features_left = main_features.copy()
-# st.write("debug df_all", train.head(1))
-df_main = train[main_features]
-
-st.subheader("Bivariée - Nuage de points coloré par le risque d'insolvabilité")
 
 
-######################## Filtres dynamiques (nombre dynamique)
-# plotly_style_title("Filtrer les données")
-df_filtered, selected_filters = st_filters_loop(
-    df=df_main,
-    features=main_features,
-    min_sample_size=50,
-    show_output_size=True,
-)
-
-
-# df_filtered, selected_filters = st_filters_loop_button(
-# df=df_main,
-# features=main_features,
-# min_sample_size=50,
-# )
-# st.write("debug boucle nombre de filtres dynamique FINI")
-# st.write(df_filtered.head())
-
-df3 = df_filtered
-# plotly_style_title("Sélection des caractéristiques")
-col_num_y, col_num_x = st.columns(2)
-with col_num_y:
-
-    feature_y = st.selectbox(
-        "Caractéristique pour y",
-        df3.select_dtypes(include="number").columns.to_list(),
-        index=1,
-    )
-with col_num_x:
-    feature_x = st.selectbox(
-        "En fonction de (carastéristique pour x)",
-        df3.select_dtypes(include="number").columns.to_list(),
-        index=0,
+# On modifie le flux standar de calcul de streamlit, de façon à ne pas tout recalculer depuis le haut du dasboard
+# (concernant les autres parties), si une option choisie concernant uniquement le nuage de points est modifiée.
+# Cela améliore énormément les temps de réponse du dashboard.
+@st.fragment
+def plot_bivariate_scatter():
+    # st.subheader("Filtrer les données")
+    # On construit la liste des features principales constitués des principales features SHAP globale et
+    # des principales features SHAP locale
+    main_global_features = global_importances["feature"].to_list()[:n_features]
+    main_local_features = shap_df_local["feature"].to_list()[:n_features]
+    main_features = (
+        main_local_features
+        + [f for f in main_global_features if f not in main_local_features]
+        + ["PROBA", "PREDICTION"]
     )
 
-st.write(" ")
+    main_features.sort()
+    features_left = main_features.copy()
+    # st.write("debug df_all", train.head(1))
+    df_main = train[main_features]
 
-# points = px.scatter(df3, x=feature_x, y=feature_y, size="PROBA")
-# points = px.scatter(df3, x=feature_x, y=feature_y)
-# points["layout"].update(title=f"Relation entre {feature_x} et {feature_y}")
+    st.subheader("Bivariée - Nuage de points coloré par le risque d'insolvabilité")
+
+    ######################## Filtres dynamiques (nombre dynamique)
+    # plotly_style_title("Filtrer les données")
+    df_filtered, selected_filters = st_filters_loop(
+        df=df_main,
+        features=main_features,
+        min_sample_size=50,
+        show_output_size=True,
+    )
+
+    # df_filtered, selected_filters = st_filters_loop_button(
+    # df=df_main,
+    # features=main_features,
+    # min_sample_size=50,
+    # )
+    # st.write("debug boucle nombre de filtres dynamique FINI")
+    # st.write(df_filtered.head())
+
+    df3 = df_filtered
+    # plotly_style_title("Sélection des caractéristiques")
+    col_num_y, col_num_x = st.columns(2)
+    with col_num_y:
+
+        feature_y = st.selectbox(
+            "Caractéristique pour y",
+            df3.select_dtypes(include="number").columns.to_list(),
+            index=1,
+        )
+    with col_num_x:
+        feature_x = st.selectbox(
+            "En fonction de (carastéristique pour x)",
+            df3.select_dtypes(include="number").columns.to_list(),
+            index=0,
+        )
+
+    st.write(" ")
+
+    # points = px.scatter(df3, x=feature_x, y=feature_y, size="PROBA")
+    # points = px.scatter(df3, x=feature_x, y=feature_y)
+    # points["layout"].update(title=f"Relation entre {feature_x} et {feature_y}")
+
+    colors = {
+        "color_safe": color_safe,
+        "color_risk": color_risk,
+        "color_loaner": color_loaner,
+        "threshold_prob": threshold,
+    }
+
+    plotly_style_title(f"{feature_y} en fonction de {feature_x}")
+    points, text_to_display = plot_scatter(
+        df3, feature_x, feature_y, client.squeeze(), colors=colors
+    )
+    st.plotly_chart(points)
+    st.text(text_to_display)
 
 
-colors = {
-    "color_safe": color_safe,
-    "color_risk": color_risk,
-    "color_loaner": color_loaner,
-    "threshold_prob": THRESHOLD_PROB,
-}
-
-plotly_style_title(f"{feature_y} en fonction de {feature_x}")
-points, text_to_display = plot_scatter(
-    df3, feature_x, feature_y, client.squeeze(), colors=colors
-)
-st.plotly_chart(points)
-st.text(text_to_display)
+plot_bivariate_scatter()

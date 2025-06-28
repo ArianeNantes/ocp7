@@ -27,3 +27,15 @@ VAL_SEED = 42
 
 # Tolérance numérique
 EPSILON = 1e-10
+
+# Informations sur le meilleur modèle (enregistrées dans MODEL_DIR)
+BEST_MODEL_NAME = "best_model_lgbm.pkl"
+BEST_THRESHOLD_NAME = "best_threshold_lgbm.pkl"
+BEST_DTYPES_NAME = "dtypes_lgbm.pkl"
+EXPLAINER_NAME = "explainer_lgbm.pkl"
+GLOBAL_IMPORTANCES_NAME = "global_importances.csv"
+
+# Nom du fichier contenant les nouveaux emprunts (en provenance de application_test)
+NEW_LOANS_NAME = "X_new_loans_lgbm.csv"
+# Nom du fichier échantillon représentatif de la population d'entrainement
+SAMPLE_TRAIN_NAME = "sampled_train_lgbm.csv"

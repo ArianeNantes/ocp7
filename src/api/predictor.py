@@ -4,7 +4,14 @@ import os
 import numpy as np
 from pathlib import Path
 import pandas as pd
-from src.constantes import MODEL_DIR, DATA_CLEAN_DIR
+from src.constantes import (
+    MODEL_DIR,
+    DATA_CLEAN_DIR,
+    BEST_MODEL_NAME,
+    BEST_THRESHOLD_NAME,
+    BEST_DTYPES_NAME,
+    NEW_LOANS_NAME,
+)
 
 # Chargement du modèle
 """# On remonte d'un cran, puis on redescend vers models/
@@ -20,29 +27,35 @@ model = joblib.load(model_path)
 
 model = None  # Défini plus tard
 
-# On a tout mis dans test_api
 # On remonte de deux crans et on descend dans models
 model_dir = os.path.join(os.path.dirname(__file__), "..", "..", MODEL_DIR)
 # On remonte de deux crans et on descend dans data/cleaned
 data_dir = os.path.join(os.path.dirname(__file__), "..", "..", DATA_CLEAN_DIR)
-# input_dir = os.path.join(os.path.dirname(__file__), "..", "..", "test_api")
 
 
 # Service qui charge le modèle et le jdd de test
 def load_model():
     global model
-    model_path = os.path.join(model_dir, "best_model_lgbm.pkl")
+    model_path = os.path.join(model_dir, BEST_MODEL_NAME)
     model_path = os.path.abspath(model_path)
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Le fichier modèle '{model_path}' est introuvable.")
     model = joblib.load(model_path)
     return model
 
 
 def load_data_test():
     global df
-    df_path = os.path.join(data_dir, "X_new_loans_lgbm.csv")
+    df_path = os.path.join(data_dir, NEW_LOANS_NAME)
     df_path = os.path.abspath(df_path)
-    dtypes_path = os.path.join(data_dir, "dtypes_lgbm.pkl")
+    if not os.path.exists(df_path):
+        raise FileNotFoundError(f"Le fichier de données '{df_path}' est introuvable.")
+    dtypes_path = os.path.join(data_dir, BEST_DTYPES_NAME)
     dtypes_path = os.path.abspath(dtypes_path)
+    if not os.path.exists(dtypes_path):
+        raise FileNotFoundError(
+            f"Le fichier dictionnaire de features '{dtypes_path}' est introuvable."
+        )
     dic_dtypes = joblib.load(dtypes_path)
     df = pd.read_csv(df_path, dtype=dic_dtypes)
     if "SK_ID_CURR" in df.columns:
@@ -75,7 +88,11 @@ def get_features_from_id(client_id: int):
 
 def load_threshold():
     global threshold
-    path_threshold = os.path.join(model_dir, "best_threshold_lgbm.pkl")
+    path_threshold = os.path.join(model_dir, BEST_THRESHOLD_NAME)
+    if not os.path.exists(path_threshold):
+        raise FileNotFoundError(
+            f"Le fichier Seuil de décision '{path_threshold}' est introuvable."
+        )
     threshold = joblib.load(path_threshold)
     return threshold
 
