@@ -1,0 +1,14 @@
+[server]
+headless = true
+port = 8501
+enableCORS = false
+
+[python]
+importPaths = ["src"]
+
+[theme]
+base = "light"
+
+[global]
+# Optionnel, juste pour l’exécution propre
+logLevel = "info"
