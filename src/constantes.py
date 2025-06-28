@@ -14,12 +14,6 @@ DATA_CLEAN_DIR = "data/cleaned/"
 
 MODEL_DIR = "models/"
 
-# Style et palette de base SNS pour les plots
-STYLE = "whitegrid"  # Style de base pour graphiques sns
-PALETTE_HIGH = "cool"  # graphiques avec cmap - différences de couleurs intenses
-PALETTE_LOW = "muted"  # Diagrammes en barres etc.
-
-
 VAL_SEED = 42
 
 # NUM_FOLDS = 5
