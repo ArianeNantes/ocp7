@@ -65,7 +65,8 @@ jobs:
           mkdir -p deploy_api/data/cleaned
           mkdir -p deploy_api/src/api/
           cp main.py deploy_api/
-          cp -r src/api deploy_api/src/api/
+          cp -r src/api/* deploy_api/src/api/
+          cp -r src/api/.* deploy_api/src/api/ || true
           cp src/constantes.py deploy_api/src/
           cp src/__init__.py deploy_api/src/
           cp models/best_model_lgbm.pkl deploy_api/models/
