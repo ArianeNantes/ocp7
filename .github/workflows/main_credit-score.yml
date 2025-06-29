@@ -66,15 +66,22 @@ jobs:
       # Pour ne copier que le nécessaire au lieu du dépôt entier (sinon trop gros)
       - name: Prepare deploy directory
         run: |
-          mkdir deploy_api
+          mkdir -p deploy_api/models
+          mkdir -p deploy_api/data/cleaned
+          mkdir -p deploy_api/src/api/
           cp main.py deploy_api/
-          cp -r src/api deploy_api/
-          cp src/constantes.py deploy_api/
-          cp models/best_model_lgbm.pkl deploy_api/
-          cp models/best_threshold_lgbm.pkl deploy_api/
-          cp data/cleaned/dtypes_lgbm.pkl deploy_api/
-          cp data/cleaned/X_new_loans_lgbm.csv deploy_api/
+          cp -r src/api deploy_api/api/
+          cp src/constantes.py deploy_api/src/
+          cp models/best_model_lgbm.pkl deploy_api/models/
+          cp models/best_threshold_lgbm.pkl deploy_api/models/
+          cp data/cleaned/dtypes_lgbm.pkl deploy_api/data/cleaned/
+          cp data/cleaned/X_new_loans_lgbm.csv deploy_api/data/cleaned/
           cp requirements.txt deploy_api/
+          python -m venv deploy_api/antenv
+          source deploy_api/antenv/bin/activate
+          pip install --upgrade pip
+          pip install -r deploy_api/requirements.txt
+          pip install fastapi uvicorn
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v2
