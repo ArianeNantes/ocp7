@@ -8,8 +8,8 @@ requests
 scikit-learn
 pytest
 httpx
-#streamlit
-#matplotlib
-#plotly
-#shap
-#numpy
+streamlit
+matplotlib
+plotly
+shap
+numpy
