@@ -67,6 +67,7 @@ jobs:
       - name: Prepare deploy directory
         run: |
           mkdir deploy_api
+          cp main.py deploy_api/
           cp -r src/api deploy_api/
           cp src/constantes.py deploy_api/
           cp models/best_model_lgbm.pkl deploy_api/
