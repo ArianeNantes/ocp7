@@ -1,8 +1,3 @@
-import os
-import sys
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
-
 from fastapi import FastAPI
 from src.api.routes import router as prediction_router
 
