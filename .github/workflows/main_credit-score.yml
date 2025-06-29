@@ -82,5 +82,5 @@ jobs:
           app-name: 'credit-score2'
           slot-name: 'Production'
           package: './deploy_api'
-          
+          startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
 
