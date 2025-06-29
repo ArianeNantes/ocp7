@@ -23,7 +23,7 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write         # requis pour l’action azure/login en mode OIDC
+      id-token: write
       contents: read
 
     steps:
@@ -57,22 +57,33 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Etape ajoutée pour éviter conflits 409
+      # Etape ajoutée pour éviter conflit 409
       - name: Stop Azure Web App before deploy
         uses: azure/cli@v2
         with:
           inlineScript: az webapp stop --name credit-score2 --resource-group p7
 
+      # Pour ne copier que le nécessaire au lieu du dépôt entier (sinon trop gros)
+      - name: Prepare deploy directory
+        run: |
+          mkdir deploy_api
+          cp -r src/api deploy_api/
+          cp src/constantes.py deploy_api/
+          cp models/best_model_lgbm.pkl deploy_api/
+          cp models/best_threshold_lgbm.pkl deploy_api/
+          cp models/dtypes_lgbm.pkl deploy_api/
+          cp data/cleaned/X_new_loans_lgbm.csv deploy_api/
+          cp requirements.txt deploy_api/
+
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v2
-
         with:
           app-name: 'credit-score2'
           slot-name: 'Production'
-          package: '.' 
+          package: './deploy_api'
           startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
 
-      # Etape ajoutée pour éviter conflits 409
+      # Etape ajoutée pour éviter conflit 409
       - name: Restart Azure Web App after deploy
         uses: azure/cli@v2
         with:

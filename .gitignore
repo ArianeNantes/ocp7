@@ -577,7 +577,6 @@ models/
 !models/best_model_lgbm.pkl
 !models/explainer_lgbm.pkl
 !models/best_threshold_lgbm.pkl
-!models/explainer_lgbm.pkl
 !models/global_importances.csv
 mlartifacts/
 mlflow_artifacts/
@@ -588,6 +587,7 @@ cuenv/
 apienv/
 envapi/
 unused/
+deploy_api/
 .vscode/
 .wp7/
 *.csv
