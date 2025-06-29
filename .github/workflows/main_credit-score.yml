@@ -33,6 +33,9 @@ jobs:
           pip install fastapi uvicorn
           pytest src/api/tests_api.py
 
+      - name: Make startup script executable
+        run: chmod +x startup.sh
+
       - name: Azure Login
         uses: azure/login@v2
         with:
@@ -45,5 +48,6 @@ jobs:
         with:
           app-name: 'credit-score2'
           slot-name: 'Production'
-          package: '.'  # Déploie tout le dépôt racine
-          startup-command: '/home/site/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000'
+          package: '.'
+          startup-command: './startup.sh'
+
