@@ -14,7 +14,7 @@ jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write         # requis pour l’action azure/login en mode OIDC
+      id-token: write
       contents: read
 
     steps:
@@ -26,19 +26,11 @@ jobs:
         with:
           python-version: '3.9'
 
-      - name: Create and activate venv, install dependencies
+      - name: Install dependencies and run tests
         run: |
-          python -m venv antenv
-          source antenv/bin/activate
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install fastapi uvicorn
-          echo "uvicorn version:"
-          uvicorn --version
-
-      - name: Run unit tests with pytest
-        run: |
-          source antenv/bin/activate
           pytest src/api/tests_api.py
 
       - name: Azure Login
@@ -50,9 +42,8 @@ jobs:
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v2
-
         with:
           app-name: 'credit-score2'
           slot-name: 'Production'
-          package: '.' 
-          startup-command: 'PYTHONPATH=/home/site/wwwroot python -m uvicorn main:app --host 0.0.0.0 --port 8000'
+          package: '.'  # Déploie tout le dépôt racine
+          startup-command: '/home/site/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000'
