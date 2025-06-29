@@ -61,7 +61,7 @@ jobs:
       - name: Stop Azure Web App before deploy
         uses: azure/cli@v2
         with:
-          inlineScript: az webapp stop --name credit-score2 --resource-group TON_RESOURCE_GROUP
+          inlineScript: az webapp stop --name credit-score2 --resource-group p7
 
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v2
@@ -76,4 +76,4 @@ jobs:
       - name: Restart Azure Web App after deploy
         uses: azure/cli@v2
         with:
-          inlineScript: az webapp start --name credit-score2 --resource-group TON_RESOURCE_GROUP
+          inlineScript: az webapp start --name credit-score2 --resource-group p7
