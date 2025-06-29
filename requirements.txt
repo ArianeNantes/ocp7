@@ -11,5 +11,5 @@ httpx
 streamlit
 matplotlib
 plotly
-shap
+#shap
 numpy
