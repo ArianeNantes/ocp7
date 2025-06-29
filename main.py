@@ -1,6 +1,10 @@
-from fastapi import FastAPI
-import joblib
 import os
+import sys
+
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from fastapi import FastAPI
+from src.api.routes import router as prediction_router
 
 from src.api.routes import router as prediction_router
 from src.api.predictor import load_model, load_data_test, load_threshold
@@ -18,10 +22,6 @@ df = load_data_test()
 
 # Ajouter les routes
 app.include_router(prediction_router)
-
-# Chemin absolu vers le modèle (/home/site/wwwroot/models/best_model_lgbm.pkl)
-# model_path = os.path.join(os.path.dirname(__file__), "models", "best_model_lgbm.pkl")
-# model = joblib.load(model_path)
 
 
 @app.get("/")

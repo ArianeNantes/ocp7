@@ -17,6 +17,7 @@ on:
       - 'data/cleaned/X_new_loans_lgbm.csv'
       - '.github/workflows/main_credit-score.yml'
       - 'requirements.txt'
+      - 'main.py'
   workflow_dispatch:
 
 jobs:
