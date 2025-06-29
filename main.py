@@ -9,11 +9,7 @@ from src.api.routes import router as prediction_router
 from src.api.routes import router as prediction_router
 from src.api.predictor import load_model, load_data_test, load_threshold
 
-app = FastAPI(
-    # title="API Prédiction Client",
-    # description="API pour prédire un résultat à partir de l'ID client",
-    # version="1.0.0",
-)
+app = FastAPI()
 
 
 model = load_model()
