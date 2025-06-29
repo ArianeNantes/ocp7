@@ -7,16 +7,9 @@ on:
     paths:
       - 'src/dashboard/**'
       - '.streamlit/**'
-      - 'src/constantes.py'
-      - 'models/best_model_lgbm.pkl'
-      - 'models/best_trheshold_lgbm.pkl'
-      - 'models/dtypes_lgbm.pkl'
       - 'models/explainer_lgbm.pkl'
       - 'models/global_importances.csv'
-      - 'data/cleaned/X_new_loans_lgbm.csv'
-      - 'data/cleaned/sampled_train_lgbm.csv'
-      - '.github/workflows/**'     
-      - 'requirements.txt'
+      - 'data/cleaned/sampled_train_lgbm.csv'  
 
 jobs:
   test-and-deploy:

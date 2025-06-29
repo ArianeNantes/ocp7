@@ -16,9 +16,6 @@ MODEL_DIR = "models/"
 
 VAL_SEED = 42
 
-# NUM_FOLDS = 5
-
-
 # Tolérance numérique
 EPSILON = 1e-10
 
