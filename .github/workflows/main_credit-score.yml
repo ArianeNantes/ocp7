@@ -16,6 +16,7 @@ on:
       - 'models/dtypes_lgbm.pkl'
       - 'data/cleaned/X_new_loans_lgbm.csv'
       - '.github/workflows/main_credit-score.yml'
+      - 'requirements.txt'
   workflow_dispatch:
 
 jobs:
