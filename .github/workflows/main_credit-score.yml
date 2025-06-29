@@ -49,4 +49,5 @@ jobs:
           app-name: 'credit-score2'
           slot-name: 'Production'
           package: '.'
+          startup-command: './startup.sh'
 
