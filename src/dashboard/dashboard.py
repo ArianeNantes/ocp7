@@ -412,7 +412,7 @@ with col_local_explanation:
             "Aide visuelle (texte de remplacement des principaux éléments graphiques)"
         ):
             st.text(text_local_explanation)
-        with st.expander(f"Aide technique/jargon (compréhension du graphique)"):
+        with st.expander(f"Aide technique/jargon"):
             st.text(text_local_jargon)
 
         # On copie le df des importances avant de l'afficher car l'affichage permet le tri par l'utilisateur.
