@@ -8,23 +8,13 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'src/api/**'
-      - 'src/constantes.py'
-      - 'models/best_model_lgbm.pkl'
-      - 'models/best_threshold_lgbm.pkl'
-      - 'models/dtypes_lgbm.pkl'
-      - 'data/cleaned/X_new_loans_lgbm.csv'
-      - '.github/workflows/main_credit-score.yml'
-      - 'requirements.txt'
-      - 'main.py'
   workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
+      id-token: write         # requis pour l’action azure/login en mode OIDC
       contents: read
 
     steps:
@@ -58,29 +48,11 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      
-      # Pour ne copier que le nécessaire au lieu du dépôt entier (sinon trop gros)
-      - name: Prepare deploy directory
-        run: |
-          mkdir -p deploy_api/models
-          mkdir -p deploy_api/data/cleaned
-          mkdir -p deploy_api/src/api/
-          cp main.py deploy_api/
-          cp -r src/api/* deploy_api/src/api/
-          cp -r src/api/.* deploy_api/src/api/ || true
-          cp src/constantes.py deploy_api/src/
-          cp src/__init__.py deploy_api/src/
-          cp models/best_model_lgbm.pkl deploy_api/models/
-          cp models/best_threshold_lgbm.pkl deploy_api/models/
-          cp data/cleaned/dtypes_lgbm.pkl deploy_api/data/cleaned/
-          cp data/cleaned/X_new_loans_lgbm.csv deploy_api/data/cleaned/
-          cp requirements.txt deploy_api/
-
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v2
+
         with:
           app-name: 'credit-score2'
           slot-name: 'Production'
-          package: './deploy_api'
+          package: '.' 
           startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
-
