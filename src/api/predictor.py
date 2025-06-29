@@ -33,7 +33,7 @@ model_dir = os.path.join(os.path.dirname(__file__), "..", "..", MODEL_DIR)
 data_dir = os.path.join(os.path.dirname(__file__), "..", "..", DATA_CLEAN_DIR)
 
 
-# Service qui charge le modèle et le jdd de test
+# Service qui charge le modèle
 def load_model():
     global model
     model_path = os.path.join(model_dir, BEST_MODEL_NAME)
@@ -44,6 +44,7 @@ def load_model():
     return model
 
 
+# Charge le jeu de données concernant les nouveaux clients (application_test)
 def load_data_test():
     global df
     df_path = os.path.join(data_dir, NEW_LOANS_NAME)
