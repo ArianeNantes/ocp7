@@ -12,7 +12,7 @@ on:
       - 'src/api/**'
       - 'src/constantes.py'
       - 'models/best_model_lgbm.pkl'
-      - 'models/best_trheshold_lgbm.pkl'
+      - 'models/best_threshold_lgbm.pkl'
       - 'models/dtypes_lgbm.pkl'
       - 'data/cleaned/X_new_loans_lgbm.csv'
       - '.github/workflows/main_credit-score.yml'
