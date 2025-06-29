@@ -17,7 +17,7 @@ MODEL_DIR = "models/"
 VAL_SEED = 42
 
 # Tolérance numérique
-EPSILON = 1e-10
+EPSILON = 1e-8
 
 # Informations sur le meilleur modèle (enregistrées dans MODEL_DIR)
 BEST_MODEL_NAME = "best_model_lgbm.pkl"

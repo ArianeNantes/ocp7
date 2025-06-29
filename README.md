@@ -1,6 +1,5 @@
 # Projet de Crédit Scoring
 
-[![Streamlit Dashboard](https://github.com/ArianeNantes/ocp7/actions/workflows/streamlit-deploy.yml/badge.svg)](https://github.com/ArianeNantes/ocp7/actions/workflows/streamlit-deploy.yml)
 [![API Azure](https://github.com/ArianeNantes/ocp7/actions/workflows/main_credit-score.yml/badge.svg)](https://github.com/ArianeNantes/ocp7/actions/workflows/main_credit-score.yml)
 
 Ce projet comprend :
