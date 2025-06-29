@@ -71,7 +71,7 @@ jobs:
           cp src/constantes.py deploy_api/
           cp models/best_model_lgbm.pkl deploy_api/
           cp models/best_threshold_lgbm.pkl deploy_api/
-          cp models/dtypes_lgbm.pkl deploy_api/
+          cp data/cleaned/dtypes_lgbm.pkl deploy_api/
           cp data/cleaned/X_new_loans_lgbm.csv deploy_api/
           cp requirements.txt deploy_api/
 
