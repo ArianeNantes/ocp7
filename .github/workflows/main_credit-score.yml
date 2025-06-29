@@ -57,7 +57,7 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # Etape ajoutée pour viter conflits 409
+      # Etape ajoutée pour éviter conflits 409
       - name: Stop Azure Web App before deploy
         uses: azure/cli@v2
         with:
@@ -72,7 +72,7 @@ jobs:
           package: '.' 
           startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
 
-      # Etape ajoutée pour viter conflits 409
+      # Etape ajoutée pour éviter conflits 409
       - name: Restart Azure Web App after deploy
         uses: azure/cli@v2
         with:
