@@ -569,15 +569,16 @@ cython_debug/
 
 ##################################################################################### custom
 data/
-!data/cleaned/X_new_loans_lgbm.csv
-!data/cleaned/dtypes_lgbm.pkl
-!data/cleaned/sampled_train_lgbm.csv
+!api/data/
+!api/model/best_model_lgbm.pkl
+!api/data/X_new_loans_lgbm.csv
+!dashboard/data/
+!dashboard/data/dtypes_lgbm.pkl
+!dashboard/data/explainer_lgbm.pkl
+!dashboard/data/global_importances.csv
+!dashboard/data/sampled_train_lgbm.csv
+!dashboard/data/X_new_loans_lgbm.csv
 models/
-# Sauf ces fichiers spécifiques
-!models/best_model_lgbm.pkl
-!models/explainer_lgbm.pkl
-!models/best_threshold_lgbm.pkl
-!models/global_importances.csv
 mlartifacts/
 mlflow_artifacts/
 artifacts/
@@ -590,15 +591,11 @@ unused/
 deploy_api/
 .vscode/
 .wp7/
-*.csv
 *.db
 *.jpg
 *.jpeg
 *.png
 *.html
-test*.py
-!src/api/tests_api.py
-!src/dashboard/tests_dashboard.py
 test*.ipynb
 gitignore_old
 p7_secret.py

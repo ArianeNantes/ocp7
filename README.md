@@ -12,9 +12,9 @@ Ce projet comprend :
 
 ### Lancer l’API :
 ```bash
-uvicorn main:app --reload
+uvicorn api.main:app --reload
 ```
 ### Lancer le dashboard
 ```bash
-PYTHONPATH=. streamlit run src/dashboard/dashboard.py
+PYTHONPATH=. streamlit run streamlit run run_dashboard.py
 ```

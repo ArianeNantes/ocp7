@@ -8,6 +8,8 @@ on:
   push:
     branches:
       - main
+    paths:
+      - 'api/**'
   workflow_dispatch:
 
 jobs:
@@ -27,6 +29,7 @@ jobs:
           python-version: '3.9'
 
       - name: Create and activate venv, install dependencies
+        working-directory: api
         run: |
           python -m venv antenv
           source antenv/bin/activate
@@ -37,9 +40,10 @@ jobs:
           uvicorn --version
 
       - name: Run unit tests with pytest
+        working-directory: api
         run: |
           source antenv/bin/activate
-          pytest src/api/tests_api.py
+          pytest tests/tests_api.py
 
       - name: Azure Login
         uses: azure/login@v2
@@ -54,5 +58,5 @@ jobs:
         with:
           app-name: 'credit-score2'
           slot-name: 'Production'
-          package: '.' 
+          package: 'api' 
           startup-command: 'python -m uvicorn main:app --host 0.0.0.0 --port 8000'
