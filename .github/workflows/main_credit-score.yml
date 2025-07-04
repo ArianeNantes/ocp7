@@ -45,6 +45,11 @@ jobs:
           source antenv/bin/activate
           pytest tests/
 
+      - name: Prepare deployment package (zip api/)
+        run: |
+          cd api
+          zip -r ../api.zip .
+
       - name: Azure Login
         uses: azure/login@v2
         with:
@@ -58,5 +63,5 @@ jobs:
         with:
           app-name: 'credit-score2'
           slot-name: 'Production'
-          package: 'api/' 
+          package: 'api.zip' 
           startup-command: 'python -m uvicorn api.main:app --host 0.0.0.0 --port 8000'
