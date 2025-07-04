@@ -1,11 +1,11 @@
 from fastapi import APIRouter, HTTPException
-from .shema import (
+from shema import (
     FeaturesResponse,
     PredictionRequest,
     PredictionResponse,
     ProbaResponse,
 )
-from .predictor import (
+from predictor import (
     get_features_from_id,
     predict_from_features,
 )

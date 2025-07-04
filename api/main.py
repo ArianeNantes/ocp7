@@ -1,6 +1,6 @@
 from fastapi import FastAPI
-from api.routes import router as prediction_router
-from api.predictor import load_model, load_data_test, load_threshold
+from routes import router as prediction_router
+from predictor import load_model, load_data_test, load_threshold
 
 
 app = FastAPI()
