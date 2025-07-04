@@ -11,7 +11,7 @@ from sklearn.exceptions import NotFittedError
 # Chemin vers le dosser contenant les données 'api/data/ (il faut remonter d'un cran avant de resdescendre)
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 DTYPES_NAME = "dtypes_lgbm.pkl"
-from predictor import load_model, load_data_test
+from api.predictor import load_model, load_data_test
 
 
 ##################################################### Test des routes
