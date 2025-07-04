@@ -1,17 +1,16 @@
 import pytest
 from fastapi.testclient import TestClient
-
-
-from main import app
 import os
 import joblib
 from sklearn.utils.validation import check_is_fitted
 from sklearn.exceptions import NotFittedError
 
+from api.main import app
+from api.predictor import load_model, load_data_test
+
 # Chemin vers le dosser contenant les données 'api/data/ (il faut remonter d'un cran avant de resdescendre)
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 DTYPES_NAME = "dtypes_lgbm.pkl"
-from api.predictor import load_model, load_data_test
 
 
 ##################################################### Test des routes
