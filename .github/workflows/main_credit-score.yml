@@ -43,7 +43,7 @@ jobs:
         working-directory: api
         run: |
           source antenv/bin/activate
-          pytest tests/tests_api.py
+          pytest tests/test_api.py
 
       - name: Azure Login
         uses: azure/login@v2
